@@ -2098,3 +2098,20 @@ class WindowsPathPreflightTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# Isolated fork CI dispatcher for target-environment discovery. This is not
+# part of #567's product change or a claim of completed native acceptance.
+if sys.platform == "darwin" and os.environ.get("GITHUB_ACTIONS") == "true":
+    class MacOSDesktopEnvironmentProbeTests(unittest.TestCase):
+        def test_records_native_desktop_automation_prerequisites(self):
+            import shutil
+            import subprocess
+            repository = Path(__file__).resolve().parents[2]
+            node = shutil.which("node")
+            self.assertIsNotNone(node, "macOS probe requires the workflow Node runtime")
+            output = repository / "macos-native-evidence" / "environment.json"
+            result = subprocess.run([node, str(repository / "client/e2e/macos-desktop-probe.cjs"), str(output)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=150)
+            print(result.stdout, flush=True)
+            self.assertEqual(result.returncode, 0, "Native macOS environment probe did not execute")
