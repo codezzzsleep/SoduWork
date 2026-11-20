@@ -12,12 +12,14 @@ import logging
 import re
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import automation_models as am, models, repository_issue_models  # register catalog subscription metadata
 from ..connectors import get_connector
 from . import code_creds, resource_leases, scm_support
+from .workdirs import validate_repo_local_dir
+from ..timestamps import iso_utc
 
 
 def _text(value, limit: int) -> str:
@@ -53,7 +55,7 @@ def _catalog_api(row: am.ScmRepository) -> dict:
         "defaultBranch": row.default_branch, "visibility": row.visibility,
         "archived": bool(row.archived), "active": bool(row.active),
         "fingerprint": row.fingerprint,
-        "lastSeenAt": row.last_seen_at.isoformat() if row.last_seen_at else None,
+        "lastSeenAt": iso_utc(row.last_seen_at) if row.last_seen_at else None,
     }
 
 
@@ -315,10 +317,21 @@ async def branches(session: AsyncSession, row: am.ScmRepository, *,
     return sorted({str(value).strip() for value in values or [] if str(value).strip()})
 
 
+async def lock_mapping_project(session: AsyncSession, pid: str) -> models.Project | None:
+    """Serialize repository additions with project deletion until commit.
+
+    An UPDATE also acquires a write lock on SQLite, which ignores FOR UPDATE.
+    """
+    return await session.scalar(update(models.Project).where(models.Project.id == pid)
+                                .values(id=models.Project.id).returning(models.Project)
+                                .execution_options(populate_existing=True, synchronize_session=False))
+
+
 async def create_mapping(session: AsyncSession, project: models.Project,
                          source: am.ScmRepository, body: dict) -> models.Repo:
     scm_support.require_active(source.provider)
     scm_support.require_active(body)
+    local = validate_repo_local_dir(body.get("localDir"))
     branch = _text(body.get("branch") or source.default_branch or "main", 120)
     target = _text(body.get("mergeBranch") or branch, 120)
     use_ssh = bool(body.get("useSsh"))
@@ -332,6 +345,9 @@ async def create_mapping(session: AsyncSession, project: models.Project,
                                 "sourceRepositoryId": str(source.id),
                                 "branch": branch})
     try:
+        project = await lock_mapping_project(session, project.id)
+        if project is None:
+            raise ValueError("Target project no longer exists")
         existing = (await session.execute(select(models.Repo).where(
             models.Repo.project_id == project.id,
             models.Repo.source_repository_id == source.id,
@@ -344,8 +360,8 @@ async def create_mapping(session: AsyncSession, project: models.Project,
             source_repository_id=source.id, name=name,
             kind=_text(body.get("kind") or "other", 16), git_url=git_url,
             default_branch=branch, merge_branch=target,
-            local_dir=_text(body.get("localDir") or _slug(
-                f"{source.display_name or source.full_name}-{branch}"), 200),
+            local_dir=validate_repo_local_dir(_text(local or _slug(
+                f"{source.display_name or source.full_name}-{branch}"), 200)),
             note=_text(body.get("note"), 4000),
             scm="git",
             dev_flow=dict(body.get("devFlow") or {}),
@@ -368,6 +384,7 @@ async def copy_mapping(session: AsyncSession, source: models.Repo,
                        project: models.Project, body: dict) -> models.Repo:
     scm_support.require_active(source)
     scm_support.require_active(body)
+    local = validate_repo_local_dir(body.get("localDir"))
     branch = _text(body.get("branch") or source.default_branch or "main", 120)
     target = _text(body.get("mergeBranch") or branch, 120)
     identity = _mapping_identity(source)
@@ -377,6 +394,9 @@ async def copy_mapping(session: AsyncSession, source: models.Repo,
                                 "sourceRepoId": str(source.id),
                                 "branch": branch})
     try:
+        project = await lock_mapping_project(session, project.id)
+        if project is None:
+            raise ValueError("Target project no longer exists")
         duplicate = select(models.Repo).where(
             models.Repo.project_id == project.id,
             models.Repo.default_branch == branch)
@@ -392,8 +412,8 @@ async def copy_mapping(session: AsyncSession, source: models.Repo,
             source_repository_id=source.source_repository_id,
             name=_text(body.get("name") or source.name, 120), kind=source.kind,
             git_url=source.git_url, default_branch=branch, merge_branch=target,
-            local_dir=_text(body.get("localDir") or _slug(
-                f"{source.name}-{project.name}-{branch}"), 200),
+            local_dir=validate_repo_local_dir(_text(local or _slug(
+                f"{source.name}-{project.name}-{branch}"), 200)),
             note=source.note, scm=source.scm, gerrit_base=source.gerrit_base,
             dev_flow=dict(source.dev_flow or {}),
             route_keywords=list(source.route_keywords or []),

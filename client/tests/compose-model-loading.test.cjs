@@ -11,15 +11,16 @@ function fixture() {
     classList: { add() {}, remove() {}, contains: () => false },
     setAttribute() {}, addEventListener(name, listener) { this[name] = listener; } });
   const nodes = { cpModelBtn: element(), cpModelPop: element(), cpModelName: element(), wrap: element() };
-  function request(kind) {
+  function request(kind, options) {
     let resolve, reject;
     const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
-    requests.push({ kind, owner, agent, location, resolve, reject }); return promise;
+    requests.push({ kind, owner, agent, location, options, resolve, reject }); return promise;
   }
   const bridge = { runtimeModels: () => request('native'), onModelsChanged: fn => { listeners.set('models-changed', fn); return () => listeners.delete('models-changed'); } };
   const context = vm.createContext({
     document: { getElementById: id => nodes[id] || null, querySelector: () => nodes.wrap },
-    SoduWorkAPI: { taskStorageKey: () => owner, myModels: () => request('managed') },
+    SoduWorkAPI: { taskStorageKey: () => owner, myModels: options => request('managed', options) },
+    SoduWorkModelChoice: require('../core/model-choice'),
     ComposeRuntime: { value: () => agent, location: () => location, catalog: () => [
       { id: 'pi', modelMode: 'managed' }, { id: 'qwen', modelMode: 'managed' },
       { id: 'codex', modelMode: 'account' },
@@ -40,6 +41,12 @@ function fixture() {
   vm.runInContext(source, context);
   const picker = context.ComposeModelPicker;
   return { picker, requests, nodes, notices, changed: () => listeners.get('models-changed')?.(),
+    runtimeReset(handler) { context.ComposeRuntime.resetNewDraft = handler; },
+    directoryPreferences(workspace = { direct: true, dir: '/isolated-project' }) {
+      vm.runInContext(fs.readFileSync(path.join(__dirname, '../components/panels/compose-directory-preferences.js'), 'utf8'), context);
+      context.ComposeDirectoryPreferences.bind({ workspace: () => workspace });
+      return context.ComposeDirectoryPreferences;
+    },
     start() { picker.bind({ api: () => bridge, onChange: value => notices.push(value) }); },
     remount() { for (const id of Object.keys(nodes)) nodes[id] = element(); },
     agent(value) { agent = value; }, location(value) { location = value; },
@@ -89,20 +96,190 @@ test('managed picker shows protocol and warns on an incompatible selected defaul
   assert.match(f.nodes.cpModelPop.innerHTML, /role="note">企业模型/);
 });
 
-test('device-local models stay available only in local Pi and never enter the Hub image route', async () => {
+test('unknown alias thinking is service-controlled while explicit and canonical fixed-thinking models select legal low', async () => {
+  const map = { off: null, minimal: null, low: 'low', medium: null, high: 'high', xhigh: null, max: 'max' };
+  for (const [model, expected] of [
+    [{ name: 'gateway-model', label: 'GLM 5.3', config: { thinkingMode: 'auto' } }, ''],
+    [{ name: 'local:model-' + 'b'.repeat(32), modelName: 'gateway-model', label: 'GLM 5.3', config: { thinkingMode: 'auto' } }, ''],
+    [{ name: 'gateway-model', config: { thinkingMode: 'always', thinkingFormat: 'zai', thinkingLevelMap: map } }, 'low'],
+    [{ name: 'local:model-' + 'a'.repeat(32), modelName: 'glm_5.3_flash', config: { thinkingMode: 'auto' } }, 'low'],
+    [{ name: 'glm-5.3', config: { thinkingMode: 'auto' } }, 'low'],
+    [{ name: 'ordinary-model', config: { thinkingMode: 'none' } }, ''],
+  ]) {
+    const f = fixture(); f.start();
+    f.requests[0].resolve({ usable: [model], defaultModels: { pi: model.name } });
+    await f.picker.ready(); f.choose(model.name);
+    assert.equal(f.picker.value().thinkingLevel, expected, model.name);
+    if (expected === 'low') {
+      assert.match(f.nodes.cpModelPop.innerHTML, /模型固定思考/);
+      assert.match(f.nodes.cpModelPop.innerHTML, /data-thinking-toggle disabled/);
+    } else if (model.config.thinkingMode === 'auto') {
+      assert.match(f.nodes.cpModelPop.innerHTML, /由服务决定 · 未确认/);
+      assert.doesNotMatch(f.nodes.cpModelPop.innerHTML, /不支持|已关闭|data-thinking-toggle/);
+    } else assert.match(f.nodes.cpModelPop.innerHTML, /不支持/);
+  }
+});
+
+test('declared alias protocols expose thinking controls while explicit off policies remain authoritative', async () => {
+  for (const [config, supported] of [
+    [{ thinkingMode: 'auto', thinkingFormat: 'zai' }, true],
+    [{ thinkingMode: 'none', thinkingFormat: 'zai' }, false],
+    [{ thinkingMode: 'auto', thinkingFormat: 'zai', reasoning: false }, false],
+  ]) {
+    const f = fixture(); f.start();
+    f.requests[0].resolve({ usable: [{ name: 'local:model-' + 'b'.repeat(32), modelName: 'gateway-model', config }] }); await f.picker.ready();
+    assert.equal(f.nodes.cpModelPop.innerHTML.includes('data-thinking-toggle'), supported);
+    assert.doesNotMatch(f.nodes.cpModelPop.innerHTML, /由服务决定 · 未确认/);
+  }
+});
+
+test('restored fixed-thinking selections retain valid high and max rather than resetting to low', async () => {
+  const f = fixture(); f.start();
+  f.requests[0].resolve({ usable: [{ name: 'glm-5.3', config: { thinkingMode: 'auto' } }] });
+  await f.picker.ready();
+  for (const level of ['high', 'max', 'low', 'off', 'medium', '']) {
+    assert.equal(await f.picker.restoreSelection({ adapterId: 'pi', modelName: 'glm-5.3', thinkingLevel: level }), true);
+    const expected = ['high', 'max', 'low'].includes(level) ? level : 'low';
+    assert.equal(f.picker.value().thinkingLevel, expected);
+    f.choose('glm-5.3');
+    assert.equal(f.picker.value().thinkingLevel, expected);
+  }
+});
+
+test('device-local models stay available to every local managed runtime and never enter cloud routes', async () => {
   const catalog = { usable: [{ name: 'managed-model' }, { name: 'local:private:model', localOnly: true }],
     defaultModels: { pi: 'managed-model', qwen: 'managed-model' },
     mediaUsable: { image: [{ providerId: 'private', name: 'local:private:image', localOnly: true }] } };
   const f = fixture(); f.start(); f.requests[0].resolve(catalog); await f.picker.ready();
   assert.match(f.nodes.cpModelPop.innerHTML, /local:private:model/);
-  assert.doesNotMatch(f.nodes.cpModelPop.innerHTML, /local:private:image/);
+  assert.match(f.nodes.cpModelPop.innerHTML, /local:private:image/);
   f.choose('local:private:model'); assert.equal(f.picker.value().modelName, 'local:private:model');
   f.location('cloud'); const cloud = f.picker.refresh(); f.requests[1].resolve(catalog); await cloud;
   assert.doesNotMatch(f.nodes.cpModelPop.innerHTML, /local:private:/);
   assert.equal(f.picker.value().modelName, 'managed-model');
   f.location('local'); f.agent('qwen'); const other = f.picker.refresh(); f.requests[2].resolve(catalog); await other;
-  assert.doesNotMatch(f.nodes.cpModelPop.innerHTML, /local:private:/);
-  assert.equal(f.picker.value().modelName, 'managed-model');
+  assert.match(f.nodes.cpModelPop.innerHTML, /local:private:model/);
+  assert.equal(f.picker.value().modelName, 'local:private:model');
+});
+
+test('a new local-only composer selects its sole model when the default is unavailable', async () => {
+  const catalog = { usable: [{ name: 'local:private:model', localOnly: true, label: 'Private model' }],
+    defaultModels: {}, defaultModelErrors: { qwen: 'Hub default unavailable' } };
+  const f = fixture(); f.agent('qwen'); f.start();
+  const pending = f.picker.refresh();
+  f.requests[0].resolve(catalog); await pending;
+  assert.match(f.nodes.cpModelPop.innerHTML, /local:private:model/);
+  assert.equal(f.picker.value().modelName, 'local:private:model');
+  assert.equal(await f.picker.ready(), true);
+});
+
+test('missing draft choices select the first local model regardless of Agent defaults and preserve valid manual choices', async () => {
+  const f = fixture(); f.start();
+  const usable = [{ name: 'hub-first' }, { name: 'local:first', localOnly: true }, { name: 'local:second', localOnly: true }];
+  f.requests[0].resolve({ usable, defaultModels: { pi: 'gone' }, defaultModelErrors: { pi: 'Gone' } });
+  assert.equal(await f.picker.ready(), true);
+  assert.equal(f.picker.value().modelName, 'local:first');
+  f.choose('hub-first');
+  const kept = f.picker.refresh(true); f.requests[1].resolve({ usable }); await kept;
+  assert.equal(f.picker.value().modelName, 'hub-first');
+  const failed = f.picker.refresh(true); f.requests[2].reject(Error('Secure storage unavailable')); await failed;
+  assert.equal(f.picker.value().modelName, 'hub-first');
+  const removed = f.picker.refresh(true); f.requests[3].resolve({ usable: usable.slice(1) }); await removed;
+  assert.equal(f.picker.value().modelName, 'local:first');
+  const reset = f.picker.resetNewDraft();
+  f.requests[4].resolve({ usable, defaultModels: { pi: 'local:second' } }); await reset;
+  assert.equal(f.picker.value().modelName, 'local:first');
+});
+
+test('deleting a local Agent default selects an available replacement while cloud choices stay independent', async () => {
+  const f = fixture(); f.start();
+  f.requests[0].resolve({ usable: [{ name: 'local:default', localOnly: true }, { name: 'local:other', localOnly: true }],
+    defaultModels: { pi: 'local:default' } });
+  await f.picker.ready();
+  assert.equal(f.picker.value().modelName, 'local:default');
+  f.choose('local:default');
+  assert.equal(await f.picker.ready(), true);
+  const refresh = f.picker.refresh(true);
+  f.requests[1].resolve({ usable: [{ name: 'local:other', localOnly: true }], defaultModels: { pi: 'local:default' },
+    defaultModelErrors: { pi: '原本地默认模型已删除或不可用' } }); await refresh;
+  assert.equal(f.picker.value().modelName, 'local:other'); assert.equal(await f.picker.ready(), true);
+  f.location('cloud'); const cloud = f.picker.refresh();
+  assert.equal(f.requests[2].options.localDefaults, false);
+  f.requests[2].resolve({ usable: [{ name: 'hub-model' }], defaultModels: { pi: 'hub-model' } }); await cloud;
+  assert.equal(f.picker.value().modelName, 'hub-model'); assert.equal(await f.picker.ready(), true);
+  f.location('local'); const local = f.picker.refresh();
+  f.requests[3].resolve({ usable: [{ name: 'local:other', localOnly: true }], defaultModels: { pi: 'local:default' },
+    defaultModelErrors: { pi: '原本地默认模型已删除或不可用' } }); await local;
+  assert.equal(await f.picker.ready(), true);
+  f.choose('local:other'); assert.equal(await f.picker.ready(), true);
+});
+
+test('a partial or rejected directory cannot replace a selected Hub model but permits explicit local choices', async () => {
+  const f = fixture(); f.start(); f.reply(0, 'hub-selected'); await f.picker.ready();
+  const partial = { usable: [{ name: 'local:first', localOnly: true }], managedCatalogUnavailable: true };
+  let refresh = f.picker.refresh(true); f.requests[1].resolve(partial); await refresh;
+  assert.equal(f.picker.value().modelName, 'hub-selected');
+  assert.equal(await f.picker.ready(), false);
+  assert.equal(f.nodes.cpModelName.textContent, 'hub-selected');
+  refresh = f.picker.refresh(true); f.requests[2].resolve({ ok: false, usable: partial.usable }); await refresh;
+  assert.equal(f.picker.value().modelName, 'hub-selected');
+  f.choose('local:first'); assert.equal(await f.picker.ready(), true);
+  refresh = f.picker.resetNewDraft(); f.requests[3].resolve(partial); await refresh;
+  assert.equal(f.picker.value().modelName, 'local:first'); assert.equal(await f.picker.ready(), true);
+});
+
+test('a first managed directory failure cannot release Send with an empty implicit model', async () => {
+  for (const malformed of [false, true]) {
+    const f = fixture(); f.start(); const ready = f.picker.ready();
+    if (malformed) f.requests[0].resolve({ ok: false, usable: [{ name: 'untrusted' }] });
+    else f.requests[0].reject(Error('Secure storage unavailable'));
+    assert.equal(await ready, false);
+    assert.equal(f.picker.value().modelName, '');
+  }
+});
+
+for (const source of ['local', 'Hub']) test('a fresh composer chooses its sole ' + source + ' model instead of an inherited deleted default', async () => {
+  const f = fixture(), name = source === 'local' ? 'local:only-model' : 'only-hub-model'; f.start();
+  f.requests[0].resolve({ usable: [{ name, label: 'Sole available model', localOnly: source === 'local' }],
+    defaultModels: { pi: 'local:deleted-default' }, defaultModelErrors: { pi: 'Deleted local default' } });
+  assert.equal(await f.picker.ready(), true);
+  assert.equal(f.picker.value().modelName, name);
+  assert.equal(f.picker.label(), 'Sole available model');
+  f.choose(name);
+  const refresh = f.picker.refresh(true);
+  f.requests[1].resolve({ usable: [{ name: 'replacement', label: 'Replacement model' }], defaultModels: { pi: 'replacement' } }); await refresh;
+  assert.equal(f.picker.value().modelName, 'replacement', 'a deleted explicit choice selects an available replacement');
+  assert.equal(await f.picker.ready(), true);
+});
+
+test('an inherited default can recover to a sole model after a failed initial catalog without replacing a manual draft choice', async () => {
+  const f = fixture(); f.start();
+  f.requests[0].resolve({ usable: [], defaultModels: { pi: 'local:deleted-default' }, defaultModelErrors: { pi: 'Deleted default' } });
+  assert.equal(await f.picker.ready(), false);
+  const refresh = f.picker.refresh(true);
+  f.requests[1].resolve({ usable: [{ name: 'only-hub', label: 'Only Hub' }], defaultModels: { pi: 'local:deleted-default' },
+    defaultModelErrors: { pi: 'Deleted default' } }); await refresh;
+  assert.equal(await f.picker.ready(), true); assert.equal(f.picker.value().modelName, 'only-hub');
+});
+
+test('ordinary refresh replaces a deleted draft choice and a new conversation resets draft state', async () => {
+  const f = fixture(); f.start(); f.reply(0, 'local:old'); await f.picker.ready(); f.choose('local:old');
+  const removed = f.picker.refresh(true);
+  f.requests[1].resolve({ usable: [{ name: 'sole-new', label: 'Sole new model' }] }); await removed;
+  assert.equal(await f.picker.ready(), true); assert.equal(f.picker.value().modelName, 'sole-new');
+  await f.picker.refresh();
+  assert.equal(await f.picker.ready(), true); assert.equal(f.picker.value().modelName, 'sole-new');
+  const created = f.picker.resetNewDraft(); f.reply(2, 'sole-new'); await created;
+  assert.equal(await f.picker.ready(), true); assert.equal(f.picker.value().modelName, 'sole-new');
+});
+
+test('a prior draft catalog response cannot overwrite the new conversation sole selection', async () => {
+  const f = fixture(); f.start();
+  const created = f.picker.resetNewDraft();
+  f.reply(1, 'new-conversation-model'); await created;
+  f.reply(0, 'previous-draft-model'); await tick();
+  assert.equal(f.picker.value().modelName, 'new-conversation-model');
+  assert.equal(await f.picker.ready(), true);
 });
 
 test('binding after preference paint reuses the pending directory and a new draft refreshes completed data', async () => {
@@ -307,4 +484,89 @@ test('model changes refresh an already-mounted composer, preserve its explicit c
   assert.match(f.nodes.cpModelPop.innerHTML, /New model/);
   f.reply(1, 'obsolete'); await tick();
   assert.equal(f.picker.value().modelName, 'chosen'); assert.equal(f.picker.label(), 'Renamed choice');
+});
+
+test('restored directory models stay visibly unavailable through refresh until explicitly replaced', async () => {
+  const f = fixture(); f.start(); f.reply(0, 'fallback'); await f.picker.ready();
+  assert.equal(await f.picker.restoreSelection({ adapterId: 'pi', modelName: 'saved-model' }), false);
+  assert.equal(f.picker.value().modelName, 'saved-model'); assert.equal(await f.picker.ready(), false);
+  assert.match(f.picker.label(), /不可用/);
+  const refreshed = f.picker.refresh(true); f.reply(1, 'fallback'); await refreshed;
+  assert.equal(f.picker.value().modelName, 'saved-model'); assert.equal(await f.picker.ready(), false);
+  f.choose('fallback'); assert.equal(f.picker.value().modelName, 'fallback');
+  assert.equal(await f.picker.ready(), true);
+});
+
+test('restoring a managed directory model refuses local-only names in a cloud scope', async () => {
+  const f = fixture(); f.location('cloud'); f.start();
+  f.requests[0].resolve({ usable: [{ name: 'hub-model' }, { name: 'local:private:model', localOnly: true }] });
+  await f.picker.ready();
+  assert.equal(await f.picker.restoreSelection({ adapterId: 'pi', modelName: 'local:private:model' }), false);
+  assert.equal(await f.picker.ready(), false);
+  assert.doesNotMatch(f.nodes.cpModelPop.innerHTML, /data-model="local:private:model"/);
+});
+
+test('a stale directory model restore cannot overwrite a new account or explicit selection', async () => {
+  const f = fixture(); f.start(); let current = true;
+  const restoring = f.picker.restoreSelection({ adapterId: 'pi', modelName: 'old-directory' }, () => current);
+  f.owner('hub-b/device/user-b'); current = false;
+  f.reply(1, 'new-account'); await f.picker.ready(); f.choose('new-account');
+  f.reply(0, 'old-directory'); assert.equal(await restoring, false);
+  assert.equal(f.picker.value().modelName, 'new-account');
+});
+
+test('Codex directory preferences restore model effort and retain a missing model through refresh', async () => {
+  const f = fixture(); f.agent('codex'); f.start();
+  f.requests[0].resolve({ ok: true, models: [{ id: 'first', label: 'First', reasoningLevels: ['medium', 'high'] },
+    { id: 'saved', label: 'Saved', reasoningLevels: ['medium', 'high'] }] });
+  await f.picker.ready();
+  assert.equal(await f.picker.restoreSelection({ adapterId: 'codex', modelName: 'saved', reasoningEffort: 'high' }), true);
+  assert.equal(f.picker.value().modelName, 'saved'); assert.equal(f.picker.value().reasoningEffort, 'high');
+  const removed = f.picker.refresh(true); f.reply(1, 'first'); await removed;
+  assert.equal(f.picker.value().modelName, 'saved'); assert.equal(await f.picker.ready(), false);
+  f.choose('first', true); assert.equal(await f.picker.ready(), true);
+});
+
+test('directory restoration preserves the cloud model on a local round trip but a new conversation clears it', async () => {
+  const f = fixture(), preferences = f.directoryPreferences();
+  const cloudCatalog = { usable: [{ name: 'cloud-default' }, { name: 'cloud-picked' }] };
+  const localCatalog = { usable: [{ name: 'local:private:first', localOnly: true }, { name: 'local:private:picked', localOnly: true }] };
+  f.location('cloud'); f.start(); f.requests[0].resolve(cloudCatalog); await f.picker.ready();
+  f.choose('cloud-picked'); await preferences.begin();
+  assert.equal(f.picker.value().modelName, 'cloud-picked');
+
+  f.location('local'); const local = preferences.begin(); await tick();
+  f.requests[1].resolve(localCatalog); await local; f.choose('local:private:picked');
+  assert.equal(f.picker.value().modelName, 'local:private:picked');
+  f.location('cloud'); await preferences.sync();
+  const returned = f.picker.refresh(); f.requests[2].resolve(cloudCatalog); await returned;
+  assert.equal(f.picker.value().modelName, 'cloud-picked', 'a local directory refresh does not delete the cloud draft model');
+  assert.doesNotMatch(f.nodes.cpModelPop.innerHTML, /local:private/);
+
+  f.location('local'); const newSession = preferences.begin({ newSession: true }); await tick();
+  f.requests[3].resolve(localCatalog); await newSession;
+  assert.equal(f.picker.value().modelName, 'local:private:first', 'a new conversation resets the local draft choice');
+  f.location('cloud'); await preferences.sync();
+  const freshCloud = f.picker.refresh(); f.requests[4].resolve(cloudCatalog); await freshCloud;
+  assert.equal(f.picker.value().modelName, 'cloud-default', 'a new conversation also resets the old cloud draft choice');
+  f.choose('cloud-picked');
+  const cloudNewSession = preferences.begin({ newSession: true }); await tick();
+  f.requests[5].resolve(cloudCatalog); await cloudNewSession;
+  assert.equal(f.picker.value().modelName, 'cloud-default', 'an explicitly new cloud conversation also resets its model');
+});
+
+test('a new conversation clears the old cloud model before a delayed local Agent probe can be cancelled', async () => {
+  const f = fixture(), preferences = f.directoryPreferences();
+  const catalog = { usable: [{ name: 'default' }, { name: 'previous-cloud-choice' }] };
+  f.location('cloud'); f.start(); f.requests[0].resolve(catalog); await f.picker.ready();
+  f.choose('previous-cloud-choice'); await preferences.begin();
+  let release; f.runtimeReset(() => new Promise(resolve => { release = resolve; }));
+  f.location('local'); const opening = preferences.begin({ newSession: true }); await tick();
+  assert.equal(typeof release, 'function', 'local Agent probe is still in progress');
+  f.location('cloud'); await preferences.sync();
+  const currentModels = f.picker.refresh();
+  f.requests.slice(1).forEach(row => row.resolve(catalog)); await currentModels;
+  assert.equal(f.picker.value().modelName, 'default', 'the new conversation cannot inherit an old cloud selection while local probing waits');
+  release(true); await opening;
+  assert.equal(f.picker.value().modelName, 'default', 'the cancelled probe cannot restore the previous selection later');
 });

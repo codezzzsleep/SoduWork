@@ -2,9 +2,9 @@
 
 """
 from datetime import datetime, timezone
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from .models import Client, Task
 
@@ -108,8 +108,8 @@ class TaskCreate(BaseModel):
     visibility: str = "related"
     workScenarioName: str = ""
     workRouting: dict[str, Any] = Field(default_factory=dict)
-    title: str = "未命名"
-    source: str = ""
+    title: str = Field(default="未命名", max_length=200)
+    source: str = Field(default="", max_length=120)
     note: str = ""
     status: str = "todo"
     urgent: Optional[bool] = None
@@ -138,6 +138,17 @@ class TaskCreate(BaseModel):
     deps: list[str] = Field(default_factory=list)  # Prerequisite task IDs; all must complete before this task is ready.
 
 
+class TaskSyncCreate(TaskCreate):
+    """Replay pre-validation desktop outboxes and undo completed deletes losslessly.
+
+    PUT cannot distinguish an unsent legacy task from a new client-generated ID.
+    Its text fields intentionally retain the old contract; POST and PATCH enforce
+    current input limits. Ownership and managed-source checks still apply to PUT.
+    """
+    title: str = "未命名"
+    source: str = ""
+
+
 class TaskUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
     kind: Optional[str] = None
@@ -149,8 +160,8 @@ class TaskUpdate(BaseModel):
     requirementVersion: Optional[int] = None
     workScenarioName: Optional[str] = None
     workRouting: Optional[dict[str, Any]] = None
-    title: Optional[str] = None
-    source: Optional[str] = None
+    title: Optional[str] = Field(default=None, max_length=200)
+    source: Optional[str] = Field(default=None, max_length=120)
     note: Optional[str] = None
     status: Optional[str] = None
     urgent: Optional[bool] = None
@@ -243,9 +254,12 @@ class Envelope(BaseModel):
     reporter: Optional[str] = None        # Requester who receives the completion notification.
 
 
+AdminName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
+
+
 class IntegrationCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    name: str
+    name: AdminName
     type: str = "generic"
     config: dict = {}                    # GitLab configuration stores base_url and project; tokens remain in environment variables.
 
@@ -273,27 +287,27 @@ class AssignBody(BaseModel):
 
 class OrgCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    name: str
+    name: AdminName
     parentId: Optional[str] = None
     sort: int = 0
 
 
 class OrgUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    name: Optional[str] = None
+    name: Optional[AdminName] = None
     parentId: Optional[str] = None
     sort: Optional[int] = None
 
 
 class RoleCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    name: str
+    name: AdminName
     permissions: list[str] = []
 
 
 class RoleUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    name: Optional[str] = None
+    name: Optional[AdminName] = None
     permissions: Optional[list[str]] = None
 
 
@@ -311,7 +325,7 @@ class UserCreate(BaseModel):
     orgId: Optional[str] = None
     roleId: Optional[str] = None
     positions: Optional[list] = None
-    domains: Optional[list] = None
+    domains: Optional[list[str]] = None
     tokenQuota: Optional[UserTokenQuota] = None
 
 
@@ -323,7 +337,7 @@ class UserUpdate(BaseModel):
     isActive: Optional[bool] = None
     password: Optional[str] = None
     positions: Optional[list] = None
-    domains: Optional[list] = None
+    domains: Optional[list[str]] = None
     tokenQuota: Optional[UserTokenQuota] = None
 
 

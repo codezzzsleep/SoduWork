@@ -70,10 +70,11 @@ async def _resolve_catalog(session, client, model_name="", modality="chat", *, a
         conf = await resolver(session, client, model_name, modality)
     if getattr(client, "user_ref", None):
         if conf:
-            personal_chat = modality == "chat" and getattr(client, "_proxy_quota_runtime", "") == "pi"
+            from ..services import model_quota
+            personal_chat = modality == "chat" and bool(model_quota.managed_runtime(
+                getattr(client, "_proxy_quota_runtime", "")))
             conf = {**conf, "quotaScope": conf.get("fundingScope", "platform")
                     if personal_chat else "platform"}
-            from ..services import model_quota
             prior_binding = getattr(client, "_proxy_quota_binding", "")
             if personal_chat and prior_binding and prior_binding != model_quota.binding(conf):
                 raise HTTPException(409, "模型凭据已变化，请重新选择模型后继续")
@@ -103,7 +104,7 @@ def _upstream_message(status: int, detail: str, *, responses: bool = False) -> s
         return "模型服务当前繁忙或额度受限，请稍后重试"
     hint = {
         401: "密钥不对或已过期",
-        403: "这把密钥没有这个模型的权限",
+        403: "模型请求被拒绝",
         404: "网关地址、模型名或接口不对" if responses else "网关地址或模型名不对",
         405: "当前模型网关尚未开放 Responses 接口",
     }.get(status, "")
@@ -120,6 +121,11 @@ def _err(status: int, msg: str, upstream: str = "") -> JSONResponse:
     if billing:
         body["error"] = {"message": model_errors.billing_message(billing),
                          "type": "soduwork_proxy_error", "status": status, **billing}
+    elif status in (400, 422) and model_errors.output_limit_exceeded(diagnostic):
+        # SDKs may retain only message, so keep the safe classification there too.
+        body["error"] = {"message": "Output token limit exceeded (output_token_limit_exceeded).",
+                         "type": "soduwork_proxy_error", "status": status,
+                         "code": "output_token_limit_exceeded"}
     elif status in (400, 413, 422) and local_context_policy.OVERFLOW.search(diagnostic):
         window = local_context_policy.error_window(diagnostic)
         message = "Context length exceeded."
@@ -416,14 +422,21 @@ def _proxy_error(exc, *, responses=False):
                   _error_message(exc, responses=responses), exc.body)
     delay = getattr(exc, "retry_after", 0)
     payload = json.loads(result.body)
+    trace = str(getattr(exc, "diagnostic_id", ""))
+    headers = {}
+    if re.fullmatch(r"[a-f0-9]{32}", trace):
+        payload["error"]["diagnosticId"] = trace
+        payload["error"]["message"] += f" [soduwork-trace:{trace}]"
+        request_id = getattr(exc, "upstream_request_id", "")
+        if request_id:
+            payload["error"]["upstreamRequestId"] = request_id
     if (payload.get("error", {}).get("code") != "upstream_billing_error"
             and isinstance(delay, (int, float)) and 0 < delay <= 86400):
         payload["error"]["retry_after_ms"] = int(delay * 1000)
         # Preserve the hint for SDKs that retain only error.message.
         payload["error"]["message"] += f" Retry after {delay:g} seconds."
-        result = JSONResponse(status_code=result.status_code, content=payload,
-                              headers={"Retry-After": str(delay)})
-    return result
+        headers["Retry-After"] = str(delay)
+    return JSONResponse(status_code=result.status_code, content=payload, headers=headers)
 
 
 async def _release_catalog_connection(session):
@@ -453,8 +466,10 @@ async def _client_by_bearer(
             if not settings.device_auth_compat:
                 raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         else:
+            from ..services.model_quota import managed_runtime
             await enforce_client_quota(session, client,
-                conf={"quotaScope": "personal"} if getattr(client, "_proxy_quota_runtime", "") == "pi" else None)
+                conf={"quotaScope": "personal"} if managed_runtime(
+                    getattr(client, "_proxy_quota_runtime", "")) else None)
             return client
         dev, _, sec = raw.partition(":")
         dev, sec = dev.strip(), sec.strip()
@@ -503,9 +518,8 @@ async def proxy_config(
     want = str(model or "").strip() or (
         "" if custom_acp or ignore_preference else model_catalog.agent_model(client, cli)
     )
-    # Only Pi implements per-call funding receipts. Other runtimes and old
-    # proxy tickets retain platform admission until they negotiate that contract.
-    client._proxy_quota_runtime = "pi" if cli == "pi" else ""
+    # Signed proxy tickets and usage receipts bind funding to this exact runtime.
+    client._proxy_quota_runtime = cli
     usable = await model_catalog.usable(session, client)
     if want and not any(item["name"] == want for item in usable):
         return {"ok": False, "path": PROXY_PATH,
@@ -523,7 +537,7 @@ async def proxy_config(
     video_models = await model_catalog.usable(session, client, "video")
     from ..services import model_quota
     proxy_key, expires_in = device_auth.issue_proxy_ticket(client, quota_runtime=cli,
-        quota_binding=model_quota.binding(conf) if cli == "pi" else "")
+        quota_binding=model_quota.binding(conf))
     mcp_key, mcp_expires_in = device_auth.issue_mcp_ticket(client)
     image_routing = model_catalog.normalize_image_routing(conf.get("imageRouting"))
     # Catalog values may come from an administrator-edited JSON payload. Keep
@@ -553,8 +567,8 @@ async def proxy_config(
         thinking_fields["thinkingAlwaysOn"] = True
     return {"ok": True, "path": PROXY_PATH,
             "quotaVersion": model_quota.VERSION, "quotaScope": conf.get("quotaScope", "platform"),
-            "personalQuotaSupported": cli == "pi",
-            **({"quotaUsageToken": model_quota.usage_token(client, conf)} if cli == "pi" else {}),
+            "personalQuotaSupported": True,
+            "quotaUsageToken": model_quota.usage_token(client, conf, cli),
             "key": proxy_key, "expiresIn": expires_in,
             "mcpKey": mcp_key, "mcpExpiresIn": mcp_expires_in,
             "model": conf["model"],
@@ -568,6 +582,7 @@ async def proxy_config(
             "maxOutputTokens": conf.get("maxOutputTokens") or model_capabilities.DEFAULT_OUTPUT,
             "configRevision": conf.get("configRevision") or "",
             "runtimeRevision": conf.get("runtimeRevision") or "",
+            "compatibility": model_capabilities.compatibility(conf.get("compatibility")),
             "label": hit.get("label") or conf["model"],
             "providerName": hit.get("providerName") or conf.get("provider") or "",
             "keyFrom": conf.get("keyFrom") or "",

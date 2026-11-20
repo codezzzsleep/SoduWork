@@ -492,6 +492,9 @@ async def create_task(
     stamp_actual(t, None, t.status)
     default_requester(t, cid, cname)   # Use the creator as requester for delegated-task receipts.
     session.add(t)
+    await session.flush()
+    from . import requirement_timeline
+    await requirement_timeline.record_definition(session, t)
     # Record who delegated the work; omit redundant events for personal local tasks.
     if origin != "local":
         from . import task_events
@@ -535,7 +538,7 @@ async def put_local_task(session: AsyncSession, owner_id: str, tid: str, data: d
     if current is not None:
         if not task_access.is_owner(current, client) or current.origin != "local":
             return None
-        return await update_task(session, owner_id, tid, data)
+        return await update_task(session, owner_id, tid, data, preserve_sync_text=True)
     try:
         return await create_task(session, owner_id, data, origin="local", task_id=tid)
     except IntegrityError:  # Another window may have inserted this ID during concurrent PUT replay.
@@ -548,10 +551,11 @@ async def put_local_task(session: AsyncSession, owner_id: str, tid: str, data: d
             raise
         if not task_access.is_owner(current, client) or current.origin != "local":
             return None
-        return await update_task(session, owner_id, tid, data)
+        return await update_task(session, owner_id, tid, data, preserve_sync_text=True)
 
 
-async def update_task(session: AsyncSession, owner_id: str, tid: str, patch: dict) -> dict | None:
+async def update_task(session: AsyncSession, owner_id: str, tid: str, patch: dict,
+                      *, preserve_sync_text: bool = False) -> dict | None:
     from . import task_access
     await task_access.reserve_task_write(session, tid, owner_id)
     client = await session.get(models.Client, owner_id)
@@ -567,6 +571,9 @@ async def update_task(session: AsyncSession, owner_id: str, tid: str, patch: dic
             return None
         return await task_requirements.update_shared(session, client, candidate, dict(patch or {}))
     prev_status = t.status
+    from . import requirement_timeline
+    previous_definition = requirement_timeline.definition(t)
+    previous_definition_version = int(t.requirement_version or 1)
     patch = dict(patch or {})
     from . import task_requirements
     if patch.get("status") == "cancel" and t.status != "cancel":
@@ -577,7 +584,8 @@ async def update_task(session: AsyncSession, owner_id: str, tid: str, patch: dic
     requirement_edit = "requirementVersion" in patch
     from . import requirement_projects
     await requirement_projects.prepare_update(session, client, t, patch)
-    edit_facts = await task_requirements.apply(session, client, t, patch)
+    edit_facts = await task_requirements.apply(session, client, t, patch,
+                                              preserve_title=preserve_sync_text)
     if requirement_edit and t.requirement_content:
         content = dict(t.requirement_content)
         for key in {"title", "note"}.intersection(patch):
@@ -652,6 +660,7 @@ async def update_task(session: AsyncSession, owner_id: str, tid: str, patch: dic
     # execution PATCH updates such as status, progress or orchestration.
     if not requirement_edit and set(patch) & _REQ_CONTENT_KEYS:
         t.requirement_version = int(t.requirement_version or 1) + 1
+    await requirement_timeline.record_definition(session, t, previous_definition, previous_definition_version)
     event_arrival, event_by, assignment_notice = "", "", None
     if t.assignee_user_id and t.assignee_user_id != prev_assignee:
         owner_uid, actor_name = await owner_user(session, owner_id)

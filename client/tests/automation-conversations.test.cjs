@@ -52,6 +52,145 @@ test('automation opens and sends an ordinary chat, with complete materials and n
   await worker.tick(); assert.equal(f.calls.length, 2);
 });
 
+test('automation injects the locally stored model only after Hub claim', async () => {
+  const f = fixture();
+  f.input.scheduleId = 'schedule-1';
+  f.deps.request = async (_identity, route, body) => {
+    if (route.endsWith('/inbox')) return { items: [{ id: f.input.runId }] };
+    if (route.endsWith('/claim')) return { ok: true, input: f.input, scheduleId: f.input.scheduleId };
+    f.acks.push(body); return { ok: true };
+  };
+  f.deps.localModelOf = async (_identity, scheduleId) => {
+    assert.equal(scheduleId, 'schedule-1');
+    return 'local:model-0123456789abcdef0123456789abcdef';
+  };
+  await createWorker(f.deps).tick();
+  assert.equal(f.calls[0][1].modelName, 'local:model-0123456789abcdef0123456789abcdef');
+});
+
+test('automation executes a deleted managed selection with its resolved local replacement without uploading it', async () => {
+  const f = fixture(), replacement = 'local:model-' + 'a'.repeat(32);
+  f.input.modelSource = 'managed';
+  f.input.modelName = 'deleted-hub-model';
+  f.deps.selectModel = async (identity, adapter, selected) => {
+    assert.equal(identity, f.identity);
+    assert.equal(adapter, 'pi');
+    assert.equal(selected, 'deleted-hub-model');
+    return replacement;
+  };
+  await createWorker(f.deps).tick();
+  assert.equal(f.calls[0][1].modelName, replacement);
+  assert.equal(f.input.modelName, 'deleted-hub-model');
+  assert.equal(JSON.stringify(f.acks).includes(replacement), false);
+  assert.equal(JSON.stringify([...f.store.values()]).includes(replacement), false);
+  f.finish({ ok: true });
+});
+
+test('automation checks the account again after asynchronous model selection before opening a chat', async () => {
+  const f = fixture();
+  let identity = f.identity;
+  f.deps.identityOf = async () => identity;
+  f.deps.selectModel = async () => {
+    identity = { ...f.identity, clientId: 'another-device' };
+    return 'replacement-model';
+  };
+  await createWorker(f.deps).tick();
+  assert.equal(f.calls.length, 0);
+});
+
+test('missing device-owned mapping cannot invoke model fallback', async () => {
+  const f = fixture();
+  f.input.modelSource = 'device';
+  f.deps.request = async (_identity, route, body) => {
+    if (route.endsWith('/inbox')) return { items: [{ id: f.input.runId }] };
+    if (route.endsWith('/claim')) return { ok: true, input: f.input, scheduleId: 'schedule' };
+    f.acks.push(body); return { ok: true };
+  };
+  f.deps.localModelOf = async () => { throw Error('unverified ownership'); };
+  f.deps.selectModel = async () => { assert.fail('unowned mappings must not choose a replacement'); };
+  await createWorker(f.deps).tick();
+  assert.equal(f.calls.length, 0);
+});
+
+test('a verified device selection whose model was removed uses the next local model at execution', async () => {
+  const f = fixture(), removed = 'local:model-' + 'a'.repeat(32), replacement = 'local:model-' + 'b'.repeat(32);
+  f.input.modelSource = 'device';
+  f.deps.request = async (_identity, route, body) => {
+    if (route.endsWith('/inbox')) return { items: [{ id: f.input.runId }] };
+    if (route.endsWith('/claim')) return { ok: true, input: f.input, scheduleId: 'schedule' };
+    f.acks.push(body); return { ok: true };
+  };
+  f.deps.localModelOf = async () => removed;
+  f.deps.selectModel = require('../main/automation-model-selection.cjs').createSelector({
+    localCatalog: () => ({ usable: [{ name: replacement }] }),
+    request() { assert.fail('a local replacement must not query Hub'); },
+  });
+  await createWorker(f.deps).tick();
+  assert.equal(f.calls[0][1].modelName, replacement);
+  assert.equal(JSON.stringify(f.acks).includes('local:model-'), false);
+  f.finish({ ok: true });
+});
+
+test('automation fails closed when a saved local model selection disappears', async () => {
+  const f = fixture();
+  f.input.scheduleId = 'schedule-1';
+  f.deps.request = async (_identity, route, body) => {
+    if (route.endsWith('/inbox')) return { items: [{ id: f.input.runId }] };
+    if (route.endsWith('/claim')) return { ok: true, input: f.input, scheduleId: f.input.scheduleId };
+    f.acks.push(body); return { ok: true };
+  };
+  f.deps.localModelOf = async () => { throw Error('本地模型选择不可用，请在自动化设置中重新选择'); };
+  await createWorker(f.deps).tick();
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.record.state, 'failed');
+  assert.match(f.record.error, /本地模型选择不可用/);
+});
+
+test('a legacy managed schedule with no local mapping retains its explicit runtime default', async () => {
+  const f = fixture();
+  f.deps.request = async (_identity, route, body) => {
+    if (route.endsWith('/inbox')) return { items: [{ id: f.input.runId }] };
+    if (route.endsWith('/claim')) return { ok: true, input: f.input, scheduleId: 'schedule-1' };
+    f.acks.push(body); return { ok: true };
+  };
+  f.deps.localModelOf = async (_identity, _scheduleId, source) => {
+    if (source === 'device') throw Error('An explicit device source requires a saved mapping');
+    return '';
+  };
+  await createWorker(f.deps).tick();
+  assert.equal(f.calls[0][1].modelName, '');
+  assert.equal(f.record.phase, 'sending');
+});
+
+test('device-owned automation refuses an old claim without schedule identity', async () => {
+  const f = fixture();
+  f.input.modelSource = 'device';
+  f.deps.request = async (_identity, route) => {
+    if (route.endsWith('/inbox')) return { items: [{ id: f.input.runId }] };
+    if (route.endsWith('/claim')) return { ok: true, input: f.input };
+    f.acks.push({}); return { ok: true };
+  };
+  f.deps.localModelOf = async () => { throw Error('must not read an unscoped local mapping'); };
+  await createWorker(f.deps).tick();
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.record.state, 'failed');
+  assert.match(f.record.error, /升级 Hub/);
+});
+
+test('managed automation rejects wrapped local image references without leaking them in receipts', async () => {
+  for (const modelName of ['image::private::local:model-secret', 'image::device:private::local:model-secret']) {
+    const f = fixture();
+    f.input.modelSource = 'managed';
+    f.input.modelName = modelName;
+    await createWorker(f.deps).tick();
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.record.state, 'failed');
+    assert.match(f.record.error, /本地模型自动化协议不完整/);
+    assert.equal(JSON.stringify(f.acks).includes('model-secret'), false);
+    assert.equal(JSON.stringify(f.acks).includes('private'), false);
+  }
+});
+
 test('automation publishes the conversation as soon as the ordinary chat is created', async () => {
   const f = fixture();
   await createWorker(f.deps).tick();

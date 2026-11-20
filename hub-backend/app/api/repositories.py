@@ -8,12 +8,14 @@ from ..deps import require_perm
 from ..models import User
 from ..services import audit, rbac, repository_catalog as catalog
 from ..services.resource_leases import LeaseBusy as resource_busy
+from ..services.workdirs import InvalidRepositoryDirectory
 
 router = APIRouter(prefix="/api/v1/admin", tags=["repository-catalog"])
 
 
 def _conflict(exc: Exception) -> HTTPException:
-    return HTTPException(status_code=409, detail=str(exc))
+    return HTTPException(status_code=400 if isinstance(exc, InvalidRepositoryDirectory) else 409,
+                         detail=str(exc))
 
 
 async def _scope(session: AsyncSession, user: User) -> set[str] | None:

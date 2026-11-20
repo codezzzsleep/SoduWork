@@ -7,7 +7,7 @@ from fastapi import HTTPException
 
 from test_model_runtime import IsolatedDatabase
 from app.models import Client, ModelDef, ModelProvider
-from app.api import admin, config, tasks, model_runtime as runtime_api
+from app.api import admin, config, personal_models, tasks, model_runtime as runtime_api
 from app.services import model_catalog, model_config_guard as guard, model_runtime
 
 
@@ -29,7 +29,9 @@ class ModelConfigTests(IsolatedDatabase):
         await super().asyncSetUp()
         async with self.sessions() as session, session.begin():
             session.add_all([
-                Client(id="device", user_ref="user", config={"theme": "light"}),
+                Client(id="device", user_ref="user", config={"theme": "light", "modelProviders": [
+                    {"id": "custom-provider", "name": "Personal", "baseUrl": "https://personal.invalid/v1", "personal": True},
+                    {"id": "custom-other", "name": "Other personal", "baseUrl": "https://other-personal.invalid/v1", "personal": True}]}),
                 ModelProvider(id="provider", name="fixture", api_key="private-key", base_url="https://fixture.invalid/v1"),
                 ModelProvider(id="other", name="other", api_key="another-key", base_url="https://other.invalid/v1"),
                 ModelDef(id="provider:model", provider_id="provider", name="model"),
@@ -44,7 +46,7 @@ class ModelConfigTests(IsolatedDatabase):
             stale = await right.get(Client, "device")
             revision = guard.revision(first)
             await tasks.put_my_models({"expectedRevision": revision, "models": [
-                {"providerId": "provider", "name": "fresh"}]}, first, left)
+                {"providerId": "custom-provider", "name": "fresh"}]}, first, left)
             with self.assertRaises(HTTPException) as error:
                 await tasks.put_my_models({"expectedRevision": revision, "models": []}, stale, right)
             self.assertEqual(error.exception.status_code, 409)
@@ -65,11 +67,11 @@ class ModelConfigTests(IsolatedDatabase):
         async with self.sessions() as left, self.sessions() as right:
             first, second = await left.get(Client, "device"), await right.get(Client, "device")
             await asyncio.gather(
-                tasks.put_my_models({"keys": {"provider": "left"}}, first, left),
-                tasks.put_my_models({"keys": {"other": "right"}}, second, right))
+                tasks.put_my_models({"keys": {"custom-provider": "left"}}, first, left),
+                tasks.put_my_models({"keys": {"custom-other": "right"}}, second, right))
         async with self.sessions() as session:
             client = await session.get(Client, "device")
-            self.assertEqual(client.model_keys, {"provider": "left", "other": "right"})
+            self.assertEqual(client.model_keys, {"custom-provider": "left", "custom-other": "right"})
             result = await tasks.my_models(client, session)
             self.assertIn("revision", result)
             self.assertNotIn("private-key", json.dumps(result))
@@ -79,11 +81,11 @@ class ModelConfigTests(IsolatedDatabase):
         async with self.sessions() as left, self.sessions() as right:
             first, stale = await left.get(Client, "device"), await right.get(Client, "device")
             await tasks.put_my_models({"expectedRevision": guard.revision(first), "providers": [
-                {"id": "provider", "name": "Managed", "baseUrl": "http://localhost:9999/v1"}]}, first, left)
+                {"id": "custom-provider", "name": "Personal", "baseUrl": "http://localhost:9999/v1"}]}, first, left)
             saved = await config.put_config({"theme": "dark"}, stale, right)
             self.assertEqual(saved["theme"], "dark")
             self.assertNotIn("modelProviders", saved)
-            self.assertEqual(stale.config["modelProviders"][0]["id"], "provider")
+            self.assertEqual(stale.config["modelProviders"][0]["id"], "custom-provider")
             # Old clients echo this server-owned field: ignore it without
             # rejecting their unrelated preferences or overwriting the catalog.
             echoed = await config.put_config({"modelProviders": [], "theme": "light"}, stale, right)
@@ -91,8 +93,29 @@ class ModelConfigTests(IsolatedDatabase):
             self.assertNotIn("modelProviders", echoed)
         async with self.sessions() as session:
             current = await session.get(Client, "device")
-            self.assertEqual(current.config["modelProviders"][0]["id"], "provider")
+            self.assertEqual(current.config["modelProviders"][0]["id"], "custom-provider")
             self.assertNotIn("modelProviders", await config.get_config(current))
+
+    async def test_omitted_personal_provider_removes_only_its_key_without_key_patch(self):
+        providers = [{"id": "custom-" + name, "name": name,
+                      "baseUrl": "https://" + name + ".invalid/v1"} for name in ("remove", "keep")]
+        async with self.sessions() as session:
+            client = await session.get(Client, "device")
+            await personal_models.put_my_models({
+                "expectedRevision": guard.revision(client), "providers": providers,
+                "keys": {"custom-remove": "discarded-fixture", "custom-keep": "retained-fixture"},
+            }, client, session)
+        async with self.sessions() as session:
+            client = await session.get(Client, "device")
+            self.assertEqual(client.model_keys, {
+                "custom-remove": "discarded-fixture", "custom-keep": "retained-fixture"})
+            await personal_models.put_my_models({
+                "expectedRevision": guard.revision(client), "providers": [providers[1]], "keys": {},
+            }, client, session)
+        async with self.sessions() as session:
+            current = await session.get(Client, "device")
+            self.assertEqual(current.model_keys, {"custom-keep": "retained-fixture"})
+            self.assertEqual([row["id"] for row in current.config["modelProviders"]], ["custom-keep"])
 
     async def test_admin_model_edit_and_delete_require_current_revision(self):
         async with self.sessions() as session:

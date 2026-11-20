@@ -45,15 +45,16 @@ def should_write_last_seen(client_id: str, now: float | None = None) -> bool:
 
 
 class DeviceAuthError(ValueError):
-    def __init__(self, message: str, status: int = 401):
+    def __init__(self, message: str, status: int = 401, *, code="DEVICE_AUTH_REJECTED"):
         super().__init__(message)
         self.status = status
+        self.code = code
 
 
 def validate_device_id(value: str) -> str:
     device = str(value or "").strip()
     if not _DEVICE_RE.fullmatch(device):
-        raise DeviceAuthError("设备标识格式不正确", 422)
+        raise DeviceAuthError("设备标识格式不正确", 422, code="DEVICE_ID_INVALID")
     return device
 
 
@@ -114,10 +115,12 @@ def issue_session(client: Client) -> tuple[str, int]:
 def issue_proxy_ticket(client: Client, *, quota_runtime: str = "", quota_binding: str = "") -> tuple[str, int]:
     if client.auth_state != "active" or not client.user_ref:
         raise DeviceAuthError("这台 SoduWork 还没有被管理员激活", 403)
+    from .model_quota import managed_runtime
+    runtime = managed_runtime(quota_runtime)
     token = sign_claims(
         {"cid": client.id, "uid": client.user_ref, "ver": int(client.auth_version or 1),
-         **({"quotaRuntime": "pi", "quotaBinding": quota_binding}
-            if quota_runtime == "pi" and quota_binding else {})},
+         **({"quotaRuntime": runtime, "quotaBinding": quota_binding}
+            if runtime and quota_binding else {})},
         ttl_seconds=AGENT_TTL_SECONDS,
         token_type="ai-proxy",
     )
@@ -179,11 +182,11 @@ def issue_plugin_mcp_ticket(
 def _assert_active_binding_loaded(client: Client | None, owner: User | None,
                                   claims: dict) -> None:
     if client is None:
-        raise DeviceAuthError("这台 SoduWork 尚未登记", 401)
+        raise DeviceAuthError("这台 SoduWork 尚未登记", 401, code="DEVICE_NOT_REGISTERED")
     if client.auth_state != "active" or not client.user_ref:
-        raise DeviceAuthError("这台 SoduWork 尚未激活或已被停用", 403)
+        raise DeviceAuthError("这台 SoduWork 尚未激活或已被停用", 403, code="DEVICE_INACTIVE")
     if owner is None or not owner.is_active or owner.account_deleted_at:
-        raise DeviceAuthError("设备所属账号不存在或已停用", 403)
+        raise DeviceAuthError("设备所属账号不存在或已停用", 403, code="DEVICE_OWNER_INACTIVE")
     if int(claims.get("ver") or 0) != int(client.auth_version or 1):
         raise DeviceAuthError("设备授权已变更，请重新连接", 401)
     if not hmac.compare_digest(str(claims.get("uid") or ""), str(client.user_ref or "")):
@@ -305,7 +308,8 @@ async def client_from_secret(session: AsyncSession, device: str, secret: str, *,
     row = await _binding(session, validate_device_id(device), include_quota=include_quota)
     client = row[0] if row else None
     if client is None or not secret_matches(client, secret):
-        raise DeviceAuthError("设备身份或密钥不正确", 401)
+        raise DeviceAuthError("设备身份或密钥不正确", 401,
+                              code="DEVICE_NOT_REGISTERED" if client is None else "DEVICE_SECRET_MISMATCH")
     _assert_active_binding_loaded(client, row[1] if row else None, {
         "uid": client.user_ref,
         "ver": int(client.auth_version or 1),

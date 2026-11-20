@@ -184,6 +184,80 @@ class AdminProjectRouterTests(unittest.IsolatedAsyncioTestCase):
                 models.AuditLog.target_id == rid))).scalars().all()
             self.assertCountEqual(events, ["repo.create", "repo.update", "repo.delete"])
 
+    async def test_project_deletion_requires_removing_its_repository_mappings(self):
+        async with self.sessions() as session:
+            session.add_all([
+                models.Task(id="keep", title="Keep this task", owner_client_id="box", project_id="project"),
+                models.Repo(id="manual", project_id="project"),
+                models.Repo(id="mapped", project_id="project", source_repository_id="catalog"),
+                models.Repo(id="unrelated", project_id="hidden"),
+            ])
+            await session.commit()
+
+        denied = await self.request("DELETE", "/projects/project", who="outsider")
+        self.assertEqual(denied.status_code, 403)
+        for rid, count in (("manual", 2), ("mapped", 1)):
+            response = await self.request("DELETE", "/projects/project")
+            self.assertEqual(response.status_code, 409, response.text)
+            self.assertIn(f"{count} 个仓库", response.json()["detail"])
+            async with self.sessions() as session:
+                self.assertIsNotNone(await session.get(models.Project, "project"))
+                self.assertEqual((await session.get(models.Task, "keep")).project_id, "project")
+                self.assertEqual((await session.get(models.Repo, rid)).project_id, "project")
+            removed = await self.request("DELETE", "/repos/" + rid)
+            self.assertEqual(removed.status_code, 200, removed.text)
+
+        for _ in range(2):
+            response = await self.request("DELETE", "/projects/project")
+            self.assertEqual(response.json(), {"ok": True})
+        async with self.sessions() as session:
+            self.assertIsNone(await session.get(models.Project, "project"))
+            self.assertIsNone((await session.get(models.Task, "keep")).project_id)
+            self.assertEqual((await session.get(models.Repo, "unrelated")).project_id, "hidden")
+            deleted = await session.scalars(select(models.AuditLog.target_id).where(
+                models.AuditLog.action == "project.delete"))
+            self.assertEqual(deleted.all(), ["project"])
+
+    async def test_all_repository_writers_reject_nonrelative_directories(self):
+        from app import automation_models as am
+        from app.api import repositories
+        self.app.include_router(repositories.router)
+        async with self.sessions() as session:
+            session.add(am.ScmRepository(
+                id="catalog", integration_id="fixture", org_id="child", provider="gitlab",
+                external_id="1", full_name="fixture/repo", display_name="Repo",
+                clone_url="https://git.example.test/repo.git", default_branch="main"))
+            await session.commit()
+        created = await self.request("POST", "/projects/project/repos",
+                                     json={"name": "Repository", "localDir": "safe/repo"})
+        self.assertEqual(created.status_code, 200, created.text)
+        rid = created.json()["id"]
+        invalid = ["C:/x", "C:x", "D:/x", "a/C:/x", r"a\C:x", r"\rooted",
+                   r"\\server\share\x", "/absolute", "../escape", r"a\..\x",
+                   "a/.. /x", "a/./x", "a/file:stream", "a\x00b"]
+        for index, path in enumerate(invalid):
+            for method, endpoint, extra in (
+                ("POST", "/projects/project/repos", {"name": "Invalid"}),
+                ("PUT", "/repos/" + rid, {"name": "Must not persist"}),
+                ("POST", "/projects/project/repos/from-catalog", {"catalogId": "catalog"}),
+                ("POST", "/repos/" + rid + "/copy", {"projectId": "project", "branch": f"bad-{index}"}),
+            ):
+                with self.subTest(path=path, endpoint=endpoint):
+                    response = await self.request(method, endpoint, json={**extra, "localDir": path})
+                    self.assertEqual(response.status_code, 400, response.text)
+        listed = await self.request("GET", "/projects/project/repos")
+        self.assertEqual([(r["name"], r["localDir"]) for r in listed.json()],
+                         [("Repository", "safe/repo")])
+        for path, expected in [(r"src\backend", "src/backend"), ("", ""), (None, "")]:
+            response = await self.request("PUT", "/repos/" + rid, json={"localDir": path})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["localDir"], expected)
+        # Empty localDir must not turn an arbitrary display name into a raw path.
+        response = await self.request("POST", "/projects/project/repos",
+                                     json={"name": "C:/display-name", "localDir": ""})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["localDir"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

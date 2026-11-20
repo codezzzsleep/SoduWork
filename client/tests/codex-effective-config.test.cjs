@@ -264,7 +264,9 @@ function controlsFixture(api, initial = {}, settings = {}) {
   wrap.querySelector = selector => selector === 'button' ? button : selector === '.nmodel-pop' ? pop : null;
   el.querySelector = selector => selector === '#nchatQueue' ? queue : selector === '#nchatModel' ? wrap : null;
   const state = { ref: 'fixture-chat', adapterId: 'codex', ...initial }, notices = [];
-  const window = { ...node(), innerWidth: 1000, innerHeight: 800, soduWorkAPI: { conversationSession: api } };
+  const window = { ...node(), innerWidth: 1000, innerHeight: 800, setTimeout, clearTimeout,
+    soduWorkAPI: { conversationSession: api } };
+  if (settings.myModels) window.SoduWorkAPI = { myModels: settings.myModels };
   if (settings.native) window.ComposeModelPicker = { nativeEffort: {
     levels: model => model?.reasoningLevels || [], defaultLevel: model => model?.defaultReasoning || '',
     html: () => '', paint() {},
@@ -342,7 +344,9 @@ test('an effort rejection during an earlier runtime wait prevents Send from sile
 test('Send can finish waiting for an intentional Agent switch without a stale model or effort request', async t => {
   let release;
   const runtime = new Promise(resolve => { release = resolve; });
-  const ui = controlsFixture({}, {}, { runtimeWait: () => runtime });
+  const ui = controlsFixture({ runtimes: async () => ({ ok: true, runtimes: [{ id: 'qwen', modelMode: 'managed' }] }) },
+    { selection: { name: 'managed', model: { id: 'managed' } } },
+    { runtimeWait: () => runtime, myModels: async () => ({ usable: [{ name: 'managed' }] }) });
   t.after(() => ui.controls.destroy());
   const ready = ui.controls.waitForAccess();
   ui.state.adapterId = 'qwen'; ui.controls.render();

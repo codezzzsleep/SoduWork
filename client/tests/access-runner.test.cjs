@@ -39,3 +39,37 @@ test('approval IPC rejects a different window and forwards exact request only fo
  assert.equal((await handler({sender:{id:3}},'chat',{requestId:'a'})).ok,false);assert.equal(called,0);
  assert.equal((await handler({sender:{id:2}},'chat',{requestId:'a'})).ok,true);assert.equal(called,1);
 });
+
+for (const mode of ['standard', 'full', 'readonly']) test(`Runner questions require an explicit matching choice in ${mode} mode`, async t => {
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'soduwork-question-runner-'));
+ t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const accessPolicy=policy.create(mode,root), alias='question-'+mode;
+ const ref=_uuidV5('9af442c8-cd1d-4b91-a668-22da2b2635bf','chat:'+alias+':codex-harness');
+ const request={requestId:'question-1',policyRevision:1,action:'native.question',title:'Which one?',
+  options:[{optionId:'q0_opt_0',name:'First',kind:'allow_once'},{optionId:'q0_opt_1',name:'Second',kind:'allow_once'},
+   {optionId:'q0_skip',name:'Skip',kind:'reject_once'}]};
+ const answers=[];let answered=false;
+ const adapter=createRunnerRuntimeAdapter({runnerRuntime:{async rpc(op,payload){
+  if(op==='runtime.detect')return{ok:true,data:{accessControl:{schema:policy.SCHEMA,supported:true,modes:['standard','full','readonly']}}};
+  if(op==='job.dispatch')return{ok:true,data:{ref}};
+  if(op==='job.session')return{ok:true,data:{status:answered?'done':'waiting-permission',accessPolicy,pendingPermissions:answered?[]:[request],items:[]}};
+  if(op==='job.permission'){answers.push(payload);answered=true;return{ok:true,data:{ok:true}};}
+  if(op==='job.stop')return{ok:true,data:{ok:true}};
+  throw Error(op);
+ }},modelConfig:{fetchModel:async()=>({ok:true,model:{id:'fixture',baseUrl:'http://fixture.invalid',key:'test'}})}});
+ const session=await adapter.createSession({identity:{clientId:'test'},native:{runner:{openOptions:{ref:alias,cwd:root,accessPolicy}}}});
+ t.after(()=>session.dispose());const handle=getRunnerSessionDetails(session).handle;
+ const sent=session.send({text:'fixture'});let complete=false;sent.completion.then(()=>complete=true);
+ await until(()=>handle.snapshot().pendingUi?.requestId===request.requestId);
+ assert.equal(complete,false);assert.deepEqual(answers,[]);assert.deepEqual(handle.snapshot().pendingUi.options,request.options);
+ for(const reply of [{decision:'once'},{decision:'session'},{decision:'answer'},{decision:'answer',optionId:'unknown'},
+   {decision:'answer',optionId:'q0_opt_1',policyRevision:2}]) {
+  assert.equal((await handle.answerUi({requestId:request.requestId,policyRevision:1,...reply})).ok,false);
+ }
+ assert.deepEqual(answers,[]);
+ const decision=mode==='readonly'?'deny':'answer',optionId=mode==='full'?'q0_skip':'q0_opt_1';
+ assert.equal((await handle.answerUi({requestId:request.requestId,policyRevision:1,decision,optionId})).ok,true);
+ assert.deepEqual(answers,[{ref,requestId:request.requestId,policyRevision:1,decision,...(decision==='answer'?{optionId}:{})}]);
+ assert.equal((await handle.answerUi({requestId:request.requestId,policyRevision:1,decision,optionId})).ok,false);
+ await sent.completion;
+});

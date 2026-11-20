@@ -12,6 +12,7 @@ async function request(identity, route, body) {
   let data = {};
   try { data = await response.json(); }
   catch (_) { data = {}; }
+  require('../requirement-diagnostics.cjs').http(identity, route, body, data, response.status);
   if (!response.ok || data.ok === false) {
     const status = Number(response.status) || 0;
     const error = new Error(typeof data.detail === 'string' ? data.detail
@@ -68,8 +69,12 @@ function latestDeliveryAttachments(rows) {
     .filter(file => String(file?.role || '') !== 'rework_input');
   const hasVersion = delivery.some(file => attachmentRound(file) > 0 || attachmentBatch(file) !== 'legacy');
   if (!hasVersion) return delivery;
+  const isRequirementInput = file => attachmentRound(file) === 0 &&
+    attachmentBatch(file) === 'legacy' && String(file?.role || '') === 'input';
   const batches = new Map();
   delivery.forEach((file, index) => {
+    // Later requirement uploads remain context, but cannot select a delivery batch.
+    if (isRequirementInput(file)) return;
     const key = attachmentBatch(file);
     const previous = batches.get(key) || {key, stamp: -1, index: -1, round: 0};
     previous.stamp = Math.max(previous.stamp, attachmentStamp(file, index));
@@ -84,8 +89,7 @@ function latestDeliveryAttachments(rows) {
     /* Human supplied requirement material has no delivery batch. Keep it as
        context for a correction, while old unversioned outputs must not leak
        into a versioned rework session. */
-    const legacyInput = round === 0 && batch === 'legacy' && String(file?.role || '') === 'input';
-    return legacyInput || (batch === latest.key && (round === latest.round || round === 0));
+    return isRequirementInput(file) || (batch === latest.key && (round === latest.round || round === 0));
   });
 }
 
@@ -127,10 +131,13 @@ async function prepare(identity, taskId, conversationId, turnId, instruction, re
   if (!identity || !identity.hub) throw new Error('请先连接 SoduWork 服务');
   const route = '/tasks/' + encodeURIComponent(taskId);
   const task = await request(identity, route);
+  require('../requirement-diagnostics.cjs').record('native.prepared', {
+    ...require('../../core/requirement-diagnostics').task(task),taskId,conversationId,turnId,
+    selectedMode:requested.submissionMode,hubKey:identity.hub});
   // Review analysis reads requirement context and attachments without execution or plugin-run receipts.
   // Allow reviewer follow-ups without accidentally starting the requirement.
   if (requested.acceptanceOnly === true) {
-    const acceptance = await require('./acceptance-turn').prepare({ identity, taskId, instruction,
+    const acceptance = await require('./acceptance-turn').prepare({ identity, taskId, turnId, instruction,
       requested, runtime, request });
     const bundle = acceptance.deliveryBundle;
     const extraIds = [...new Set([...acceptance.referenceAttachmentIds, ...acceptance.optionalAttachmentIds])];
@@ -156,6 +163,28 @@ async function prepare(identity, taskId, conversationId, turnId, instruction, re
   const submissionMode = ['auto', 'manual'].includes(String(requested.submissionMode || ''))
     ? String(requested.submissionMode) : '';
   const dispatchInstructions = require('./dispatch-instructions.cjs').submitted(requested);
+  const captureModelSource = (retry = false, queuedModel) => {
+    if (spec.mode !== 'native') return { source: 'managed', name: '' };
+    const handle = runtime?.handle, selection = handle?.snapshot?.()?.modelSelection;
+    const explicitModel = retry ? (typeof queuedModel === 'string' ? queuedModel.trim() : '')
+      : String(spec.model || '').trim();
+    const name = retry && typeof queuedModel === 'string' ? queuedModel.trim()
+      : explicitModel || String(selection?.name || '').trim();
+    const image = require('../../core/model-choice').imageChoice(name);
+    const reference = image?.name || name;
+    if (!reference.startsWith('local:')) return { source: 'managed', name };
+    const agent = String(handle?.adapterId || '');
+    const managed = require('../agent-runtime/runtime-catalog').runtime(agent)?.modelMode === 'managed';
+    // A fresh task may apply its explicit model only when its queued turn
+    // starts. Resolve that selection locally instead of trusting a raw source
+    // flag or requiring the previous active model to have changed already.
+    const local = managed && (explicitModel || selection?.model?.localOnly === true && selection.name === name) &&
+      !(selection?.name === name && (selection.model?.unavailable || selection.model?.historicalLocal)) &&
+      (!image || agent === 'pi') && require('../local-model-store.cjs').resolve(reference);
+    if (!local?.localOnly) throw Error('本轮本地模型无法确认或已删除，请重新选择可用模型');
+    return { source: 'device', name, agentId: 'local:' + agent };
+  };
+  let capturedModel = captureModelSource();
 
   // Attach task receipts to the prepare -> start -> collect -> complete lifecycle so outputs from
   // follow-up turns flow back to the task. Otherwise a later correction, such as changing the output
@@ -168,7 +197,9 @@ async function prepare(identity, taskId, conversationId, turnId, instruction, re
     const routing = current?.workRouting || {}, context = routing.executionContext || {};
     if (routing.selectedStrategy !== 'direct' || routing.workflowBindingId || routing.selectedWorkflowBindingId ||
       context.strategy !== 'direct' || context.agent?.id !== spec.agentId || context.runner?.mode !== 'local' ||
-      String(context.model || '') !== spec.model)
+      (capturedModel.source === 'device'
+        ? context.modelSource !== 'device' || Boolean(context.model)
+        : String(context.model || '') !== spec.model))
       throw new Error('服务端未确认本次执行选择或安排已变化，请刷新后重新选择；旧服务端需更新后再改选');
   };
   const verifyReuse = async (refresh = false, quick = false) => {
@@ -215,9 +246,19 @@ async function prepare(identity, taskId, conversationId, turnId, instruction, re
   let attachments = followUp || runnerContinuation ? [] : await loadTaskAttachments(identity, route,
     reworkSession ? {latestDelivery: true} : undefined);
   const scope = { conversationId, turnId };
+  const nativeReceiptScope = () => capturedModel.source === 'device'
+    ? { ...scope, modelSource: 'device', modelAgentId: capturedModel.agentId } : scope;
   // Freeze receipt ownership while preparation still has an authenticated account.
   // Queue admission is not execution; only the runtime start acknowledgement records it.
   const startReceipt = spec.mode === 'native' ? runtime?.startReceipts?.forTask(identity, taskId) : null;
+  // An omitted choice on an existing task preserves its saved policy. A new
+  // native default may infer submission only after Hub validates real outputs.
+  const routing = task.workRouting || {};
+  const inferSubmission = spec.mode === 'native' && !submissionMode &&
+    !['manual', 'auto'].includes(dispatchInstructions?.submissionMode) &&
+    (Object.hasOwn(requested, 'submissionMode') && requested.submissionMode === '' ||
+      dispatchInstructions?.submissionMode === 'default' ||
+      !requested.followUp && !routing.executionSubmissionChoice && !routing.executionSubmissionMode);
   let executionStarted = false, startAcknowledged = false;
   // A turn can outlive the 30-minute device session token (long AI runs), so
   // every receipt call re-resolves the identity first; a renewal failure keeps
@@ -230,34 +271,65 @@ async function prepare(identity, taskId, conversationId, turnId, instruction, re
   };
   const transition = action => freshIdentity()
     .then(id => request(id, route + '/conversation-turn', { action, ...scope, executor: spec.mode,
+      ...(capturedModel.source === 'device' ? { modelSource: 'device', agentId: capturedModel.agentId } : {}),
       ...(action === 'prepare' && dispatchInstructions ? {dispatchInstructions} : {}),
+      ...(action === 'prepare' && inferSubmission ? {submissionChoice: 'infer'} : {}),
       ...(spec.continuationRef ? { continuationRef: spec.continuationRef } : {}),
       ...(submissionMode ? { submissionMode } : {}),
       ...(explicitNative && action === 'prepare' ? { executionChoice: 'native',
-        agentId: spec.agentId, model: spec.model } : {}) }));
+        agentId: spec.agentId, model: capturedModel.source === 'device' ? '' : spec.model } : {}) }));
   // Freeze bytes before the terminal receipt. The existing durable transport
   // queue retries uploads without re-executing the model or rereading files.
-  let settlementFailed = false;
+  let settlementFailed = false, capturedSettlement = null, settledResult = null;
+  const captureIssue = code => ({action: code === 'capture_failed' ? 'fail' : 'wait', deliveryIssue: {code,
+    reason: code === 'capture_pending' ? '执行已结束，正在收集交付文件；如收集中断，请检查工作区和交付清单后重新交付。' : '交付文件收集失败，尚未提交验收；请检查工作区文件和交付清单，修复后重新交付。'}});
+  const persistCaptured = async () => {
+    const result = await startReceipt.finish(nativeReceiptScope(), capturedSettlement.body,
+      {started: executionStarted && !startAcknowledged, delivery: capturedSettlement.delivery});
+    settlementFailed = false;
+    // Waiting is resumable. Once its receipt is durably accepted, a later
+    // completion must collect the resumed output instead of replaying wait.
+    if (capturedSettlement.body.action === 'wait') capturedSettlement = null;
+    else settledResult = result;
+    return result;
+  };
   const deliverThen = async (action, outcome) => {
     // Controlled executors publish their own artifacts. Scanning this handle's
     // unrelated local cwd can neither collect nor replace those remote results.
     if (spec.mode !== 'native') return transition(action);
+    if (settledResult) return settledResult;
+    // A transport persistence failure is not a model failure. Retry exactly
+    // the frozen completion, including when the turn queue reports failed.
+    if (capturedSettlement && startReceipt) return persistCaptured();
     if (settlementFailed) {
-      // The queue reports a capture failure separately from model completion.
-      // Release the execution receipt so a repair is possible; never mark it complete.
-      if (action !== 'fail') return;
-      return startReceipt ? startReceipt.finish(scope, {action:'fail'},
+      return startReceipt ? startReceipt.finish(nativeReceiptScope(), captureIssue('capture_failed'),
         {started:executionStarted && !startAcknowledged}) : transition('fail');
     }
     try {
-      const delivery = await require('./task-delivery.cjs').capture(runtime?.handle, outcome);
+      // A crash during asynchronous capture leaves a durable, scoped waiting
+      // receipt. Restart only reports this interruption; it never rescans a
+      // changed workspace or reruns the completed model.
+      if (startReceipt && action === 'complete') await startReceipt.finish(nativeReceiptScope(),
+        captureIssue('capture_pending'), {started:executionStarted && !startAcknowledged});
+      const contract = (receipt.task?.workRouting || task.workRouting || {}).outputContract || {};
+      // A kind or prose requirement alone does not require local files. Only
+      // explicit file entries authorize treating an empty inventory as failure.
+      const requiresFiles = !['repository-change', 'production-release'].includes(contract.kind) &&
+        !String(receipt.task?.artifactUrl || task.artifactUrl || '').trim() &&
+        [contract.deliverables, contract.expectedArtifacts, contract.outputs].some(rows =>
+          Array.isArray(rows) && rows.some(row => row && typeof row === 'object' &&
+            (typeof row.path === 'string' && row.path.trim() || typeof row.entry === 'string' && row.entry.trim())));
+      const delivery = await require('./task-delivery.cjs').capture(runtime?.handle, outcome, {taskId,...scope}, {requiresFiles});
+      require('../requirement-diagnostics.cjs').record('native.capture', {taskId,...scope,outcome,
+        fileCount:delivery?.files?.length || 0});
+      capturedSettlement = {body: {action, ...(submissionMode ? {submissionMode} : {})}, delivery};
       return startReceipt
-        ? await startReceipt.finish(scope, {action, ...(submissionMode ? {submissionMode} : {})},
-          {started: executionStarted && !startAcknowledged, delivery})
+        ? await persistCaptured()
         : (delivery && await require('./task-delivery.cjs').send(await freshIdentity(), route, scope, delivery),
           await transition(action));
     } catch (error) {
       settlementFailed = true;
+      require('../requirement-diagnostics.cjs').record('native.capture', {taskId,...scope,ok:false,errorKey:String(error.message || error)});
       throw error;
     }
   };
@@ -272,6 +344,12 @@ async function prepare(identity, taskId, conversationId, turnId, instruction, re
   if (releaseRecovery) scope.turnId = previous.turnId;
   const receipt = releaseRecovery ? { turn: previous, task } : await transition('prepare');
   if (!releaseRecovery && receipt.turn.state !== 'queued') throw new Error('这项需求已经执行，请刷新后查看结果');
+  const requireSubmissionAck = inferSubmission &&
+    (Object.hasOwn(requested, 'submissionMode') || dispatchInstructions?.submissionMode === 'default');
+  if (!releaseRecovery && requireSubmissionAck && receipt.task?.workRouting?.executionSubmissionChoice !== 'infer') {
+    await transition('cancel').catch(() => {});
+    throw Error('服务端未确认本次提交方式，请更新 Hub 并刷新需求后重新安排执行。');
+  }
   if (explicitNative) {
     try { assertNativeChoice(receipt.task); }
     catch (error) { await transition('cancel').catch(() => {}); throw error; }
@@ -279,12 +357,13 @@ async function prepare(identity, taskId, conversationId, turnId, instruction, re
   return {
     text, attachments, task: receipt.task || task,
     executor: spec.mode,
-    ...(spec.mode === 'native' && !reuse ? { modelName: String(spec.model || '') } : {}),
+    ...(spec.mode === 'native' && !reuse ? { modelName: capturedModel.source === 'device'
+      ? capturedModel.name : String(spec.model || '') } : {}),
     controlled: spec.mode === 'native' ? null : controlled.create({ task: receipt.task || task, spec, scope,
       request: async (route, body) => request(await freshIdentity(), route, body) }),
     ...(startReceipt ? { onStarted: async () => {
       executionStarted = true;
-      const recorded = await startReceipt(scope);
+      const recorded = await startReceipt(nativeReceiptScope());
       startAcknowledged = recorded.pending === false;
       return recorded;
     } } : {}),
@@ -310,21 +389,29 @@ async function prepare(identity, taskId, conversationId, turnId, instruction, re
         throw error;
       }
     },
-    beforeRetry: async () => {
+    beforeRetry: async turn => {
       // Mint a fresh receipt attempt, but retain this conversation's context.
-      const next = { ...scope, turnId: 'recovery-' + require('node:crypto').randomUUID() };
+      // Queue admission freezes a model independently of later picker changes.
+      const nextModel = captureModelSource(true, turn?.modelName);
+      const next = { conversationId: scope.conversationId, turnId: 'recovery-' + require('node:crypto').randomUUID() };
       const receipt = await request(await freshIdentity(), route + '/conversation-turn',
         { action: 'prepare', ...next, executor: spec.mode,
+          ...(nextModel.source === 'device' ? { modelSource: 'device', agentId: nextModel.agentId } : {}),
           ...(dispatchInstructions ? {dispatchInstructions} : {}),
+          ...(inferSubmission ? {submissionChoice: 'infer'} : {}),
           ...(spec.continuationRef ? { continuationRef: spec.continuationRef } : {}),
           ...(submissionMode ? { submissionMode } : {}) });
       if (receipt.turn.state !== 'queued') throw new Error('需求状态已变化，请刷新后查看结果');
       scope.turnId = next.turnId;
+      capturedModel = nextModel;
       settlementFailed = false;
+      capturedSettlement = null;
+      settledResult = null;
       executionStarted = false;
       startAcknowledged = false;
     },
     afterTurn: status => {
+      require('../requirement-diagnostics.cjs').record('native.terminal', {taskId,...scope,outcome:status});
       const action = { completed: 'complete', failed: 'fail', waiting: 'wait', stopped: 'cancel' }[status] || 'fail';
       return deliverThen(action, status === 'completed' ? 'completed' : 'incomplete');
     },

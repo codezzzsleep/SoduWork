@@ -8,6 +8,18 @@ const TaskSync = require('../core/task-sync.js');
 const source = fs.readFileSync(path.join(__dirname, '../core/store-lifecycle.js'), 'utf8') + '\n' +
   fs.readFileSync(path.join(__dirname, '..', 'core', 'store.js'), 'utf8');
 
+test('fresh and partial configurations hide desktop widgets without rewriting explicit choices', () => {
+  for (const saved of [undefined, { theme: 'saved' }, { dockVisible: true, petVisible: true },
+    { dockVisible: false, petVisible: true }, { dockVisible: true, petVisible: false }]) {
+    const seed = saved ? { soduwork_work_cfg_v5: JSON.stringify(saved) } : {};
+    const f = fixture({}, seed);
+    assert.equal(f.Store.cfg.dockVisible, saved?.dockVisible ?? false);
+    assert.equal(f.Store.cfg.petVisible, saved?.petVisible ?? false);
+    assert.equal(f.values.get('soduwork_work_cfg_v5'), seed.soduwork_work_cfg_v5);
+    assert.equal(f.Store._cfgRevision, 0);
+  }
+});
+
 test('a remote skin patch wins over an older config fetch and refreshes the originating window', async () => {
   const config = deferred(), calls = [];
   const f = fixture({ online: true, getConfig: () => config.promise,
@@ -69,6 +81,25 @@ function fixture(api, seed, options) {
     initData: vm.runInContext('initData', context),
   };
 }
+
+test('pending before initialization stays idle and login immediately hydrates and subscribes once', async () => {
+  let state = 'pending', reads = 0, connections = 0, registrations = 0;
+  const f = fixture({
+    online: true, clientAuthSnapshot: () => ({ state }),
+    registerClient: async () => { registrations++; return { ok: true, authState: state, activationRequired: state !== 'active' }; },
+    getTasksSnapshot: async () => { reads++; return { online: true, items: [] }; },
+    getConfig: async () => ({}),
+    connectWS: () => { connections++; return () => {}; },
+  });
+  await f.initData();
+  assert.equal(registrations, 0); assert.equal(reads, 0); assert.equal(f.Store._startupPromise, null);
+  assert.equal(f.timers.filter(row => row.interval).length, 0);
+  state = 'active'; f.context.dispatchEvent({ type: 'soduwork-device-auth' }); await settle();
+  assert.equal(reads, 1); assert.equal(connections, 1); assert.equal(f.Store.taskState, 'ready');
+  f.context.dispatchEvent({ type: 'soduwork-device-auth' }); await settle();
+  assert.equal(reads, 1); assert.equal(connections, 1);
+  assert.equal(f.timers.filter(row => row.interval).length, 1);
+});
 
 test('有本地缓存时首屏也不展示缓存，后台校准后就地填入同一任务数组', async () => {
   let releaseRegistration;

@@ -224,6 +224,11 @@ function _loadChatSkills(force) {
     const picker = ctx._skillPicker;
     const api = global.soduWorkAPI && (global.soduWorkAPI.conversationSession || global.soduWorkAPI.piSession);
     if (!picker) return;
+    const auth = global.SoduWorkAPI?.clientAuthSnapshot?.();
+    if (auth?.state && auth.state !== 'active') {
+      ctx._skillLoadSeq++; skillRefreshQueued = false; picker.setItems([]);
+      return Promise.resolve();
+    }
     // A changed catalog invalidates the active response, but only one trailing
     // request is needed even when several install or preference events arrive.
     if (force === true) ctx._skillLoadSeq++;
@@ -282,7 +287,7 @@ function _loadChatSkills(force) {
 
 function _canStop() {
     const snap = ctx._snap || {}, execution = snap.execution || {}, phase = execution.quality?.phase || '';
-    return snap.status === 'streaming' || execution.running === true ||
+    return ['streaming', 'queued'].includes(snap.status) || execution.running === true ||
       ['executing', 'implementing', 'reviewing', 'repairing'].includes(phase);
   }
 
@@ -448,6 +453,10 @@ function _bind(el) {
         ctx._sessionOptions.modelName = selection.name;
         ctx._sessionOptions.modelLabel = selection.model?.label || selection.name;
         if (draft) void ctx._workCards?.saveDraftSelection?.(); ctx._render(); },
+      modelAvailabilityChanged: selection => {
+        if (ctx._snap) ctx._snap.modelSelection = selection;
+        ctx._render();
+      },
       thinkingChanged: thinking => { if (ctx._snap) ctx._snap.thinking = thinking;
         if (draftControls.active()) {
           if (ctx._sessionOptions.adapterId === 'codex') ctx._sessionOptions.reasoningEffort = thinking.level || '';

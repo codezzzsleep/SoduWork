@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
+const { PassThrough } = require('node:stream');
 const { createRequire } = require('node:module');
 
 async function fixture(t, options = {}) {
@@ -19,6 +20,15 @@ async function fixture(t, options = {}) {
   fs.writeFileSync(path.join(resources, 'runner', binary), 'fixture');
   const file = path.resolve(__dirname, '../main/runner-runtime.js');
   const nativeRequire = createRequire(file), handlers = new Map(), children = [], timers = [];
+  const secureIdentity = { hub: 'https://fixture.invalid', clientId: 'fixture-device', secret: 'fixture-device-secret-before' };
+  let session = options.noSession ? '' : 'fixture-session';
+  if (options.existingConfig) {
+    fs.mkdirSync(path.join(root, 'runner'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'runner', 'config.json'), JSON.stringify({
+      hub: secureIdentity.hub, clientId: secureIdentity.clientId, ...options.savedIdentity,
+      ...(options.confirmed ? { activationConfirmed: true } : {}),
+    }));
+  }
   const client = options.sourceLayout ? path.join(root, 'application', 'client') : path.dirname(path.dirname(file));
   const python = path.join(root, 'venv', ...(process.platform === 'win32' ? ['Scripts', 'python.exe'] : ['bin', 'python']));
   const env = { ...process.env, ...options.env };
@@ -51,8 +61,9 @@ async function fixture(t, options = {}) {
       if (name === 'child_process') return { spawn(bin, args, options) {
         const child = new EventEmitter(); child.pid = 100 + children.length;
         child.command = { bin, args, options };
-        child.stdout = new EventEmitter(); child.stdin = new EventEmitter();
-        child.stdin.writable = true; child.stdin.write = () => true; child.stdin.end = () => {};
+        child.stdout = new PassThrough(); child.stdin = new EventEmitter();
+        child.writes = []; child.stdin.writable = true;
+        child.stdin.write = value => { child.writes.push(value); return true; }; child.stdin.end = () => {};
         children.push(child); return child;
       } };
       if (name.includes('custom-runtime-store')) return { startupAgents: () => [] };
@@ -60,14 +71,125 @@ async function fixture(t, options = {}) {
     } };
   vm.runInNewContext(fs.readFileSync(file, 'utf8'), context, { filename: file });
   context.module.exports.install({ app, ipcMain: { handle: (id, fn) => handlers.set(id, fn) },
-    identityOf: () => ({ hub: 'https://fixture.invalid', clientId: 'fixture-device', secret: 'fixture' }) });
+    identityOf: () => ({ ...secureIdentity }),
+    sessionOf: (_app, hub, clientId) => {
+      assert.equal(hub, secureIdentity.hub);
+      assert.equal(clientId, secureIdentity.clientId);
+      return session;
+    } });
   await Promise.resolve();
   const configure = () => handlers.get('runner-configure')(null, { hub: 'https://fixture.invalid', clientId: 'fixture-device' });
-  await configure();
-  return { configure, children, timers, python, client, status: () => handlers.get('runner-status')(), rpc: context.module.exports.rpc,
+  if (!options.existingConfig) await configure();
+  return { configure, children, timers, python, client,
+    activate: () => { session = 'fixture-session'; },
+    setSecret: secret => { secureIdentity.secret = secret; },
+    configText: () => fs.readFileSync(path.join(root, 'runner', 'config.json'), 'utf8'),
+    status: () => handlers.get('runner-status')(), rpc: context.module.exports.rpc,
     mobile: context.module.exports.setMobileCapabilities,
     report: data => children.at(-1).stdout.emit('data', '@@SODUWORK_RUNNER_STATUS@@' + JSON.stringify(data) + '\n') };
 }
+
+for (const existingConfig of [false, true]) {
+  test(`pending device waits for login with ${existingConfig ? 'a legacy' : 'no'} Runner configuration`, async t => {
+    const f = await fixture(t, { existingConfig, noSession: true });
+    await f.configure();
+    await f.configure();
+    assert.equal(f.children.length, 0);
+    assert.equal(f.timers.length, 0);
+    f.activate();
+    await f.configure();
+    f.report({ state: 'online' });
+    await f.configure();
+    assert.equal(f.children.length, 1);
+    assert.equal(f.status().connected, true);
+    assert.equal(JSON.parse(f.configText()).activationConfirmed, true);
+  });
+}
+
+test('a previously activated device starts on cold boot while the Hub session is offline', async t => {
+  const f = await fixture(t, { existingConfig: true, confirmed: true, noSession: true });
+  assert.equal(f.children.length, 1);
+});
+
+test('a saved activation cannot start a different Hub or device before login', async t => {
+  for (const savedIdentity of [{ hub: 'https://other.invalid' }, { clientId: 'other-device' }]) {
+    const f = await fixture(t, { existingConfig: true, confirmed: true, noSession: true, savedIdentity });
+    await f.configure();
+    assert.equal(f.children.length, 0);
+  }
+});
+
+test('unchanged secure identity and configuration keep the current Runner', async t => {
+  const f = await fixture(t), child = f.children.at(-1);
+  f.report({ state: 'online' });
+  await f.configure();
+  await f.configure();
+  assert.equal(f.children.length, 1);
+  assert.equal(f.status().pid, child.pid);
+  assert.equal(f.status().connected, true);
+  f.report({ state: 'error', code: 'AUTH_REQUIRED' });
+  const authError = f.status().error;
+  assert.match(authError, /设备登记/);
+  await f.configure();
+  assert.equal(f.children.length, 1, 'an authentication failure alone cannot restart with the same rejected key');
+  assert.equal(f.status().pid, child.pid);
+  assert.equal(f.status().connected, false);
+  assert.equal(f.status().error, authError);
+  assert.equal(f.timers.length, 0);
+});
+
+test('startup from existing public configuration tracks the launched secure identity', async t => {
+  const f = await fixture(t, { existingConfig: true });
+  assert.equal(f.children.length, 1, 'whenReady starts the persisted configuration before renderer configure');
+  const initial = f.children[0];
+  await f.configure();
+  assert.equal(f.children.length, 1, 'the first renderer configure must preserve the auto-started Runner');
+  assert.equal(f.status().pid, initial.pid);
+  f.setSecret('fixture-recovered-startup-secret');
+  await f.configure();
+  assert.equal(f.children.length, 2);
+  assert.equal(f.status().pid, f.children[1].pid);
+  assert.equal(f.children[1].command.options.env.SODUWORK_DEVICE_SECRET, 'fixture-recovered-startup-secret');
+  await f.configure();
+  assert.equal(f.children.length, 2);
+});
+
+test('rotated device secret replaces the Runner without exposing credentials', async t => {
+  const f = await fixture(t), previous = f.children.at(-1);
+  const previousSecret = previous.command.options.env.SODUWORK_DEVICE_SECRET;
+  const recoveredSecret = 'fixture-device-secret-after';
+  const persistedConfig = f.configText();
+  f.report({ state: 'online' });
+  f.setSecret(recoveredSecret);
+  const result = await f.configure();
+  assert.equal(result.ok, true);
+  assert.equal(f.children.length, 2, 'the recovered key must reach a newly spawned Runner');
+  const replacement = f.children.at(-1);
+  assert.notEqual(replacement, previous);
+  assert.equal(previous.command.options.env.SODUWORK_DEVICE_SECRET, previousSecret);
+  assert.equal(replacement.command.options.env.SODUWORK_DEVICE_SECRET, recoveredSecret);
+  assert.equal(f.configText(), persistedConfig, 'rotating a key must not change public Runner configuration');
+  assert.equal(f.status().pid, replacement.pid);
+  previous.stdout.emit('data', '@@SODUWORK_RUNNER_STATUS@@' + JSON.stringify({ state: 'online' }) + '\n');
+  assert.equal(f.status().connected, false, 'the replacement must wait for its own Hub welcome');
+  for (const child of f.children) assert.match(child.writes[0], /^@@SODUWORK_RUNNER_CONFIG@@/);
+  for (const value of [f.configText(), JSON.stringify(f.status()), JSON.stringify(result),
+    ...f.children.flatMap(child => child.writes), ...f.children.flatMap(child => Array.from(child.command.args))]) {
+    assert.equal(value.includes(previousSecret), false);
+    assert.equal(value.includes(recoveredSecret), false);
+  }
+  f.report({ state: 'online' });
+  previous.stdout.emit('data', '@@SODUWORK_RUNNER_STATUS@@' + JSON.stringify({ state: 'error', code: 'AUTH_REQUIRED' }) + '\n');
+  assert.equal(f.status().error, '', 'a superseded Runner cannot overwrite the new connection status');
+  const timerCount = f.timers.length;
+  previous.emit('exit', 0);
+  assert.equal(f.status().running, true);
+  assert.equal(f.status().pid, replacement.pid);
+  assert.equal(f.status().connected, true);
+  assert.equal(f.timers.length, timerCount, 'the superseded process cannot schedule another Runner');
+  await f.configure();
+  assert.equal(f.children.length, 2, 'refreshing the recovered identity must not restart again');
+});
 
 test('mobile capability replies use the initiating private Runner pipe', async t => {
   const f = await fixture(t), child = f.children.at(-1), writes = [];
@@ -79,6 +201,44 @@ test('mobile capability replies use the initiating private Runner pipe', async t
   assert.equal(packet.message.op, 'desktop.capability.reply');
   assert.equal(packet.message.requestId, 'request');
   assert.equal(packet.message.result.data.operation, 'catalog');
+});
+
+test('Runner RPC preserves multiline user events across UTF-8 pipe boundaries and process replacement', async t => {
+  const f = await fixture(t), previous = f.children.at(-1);
+  const prefix = '@@SODUWORK_LOCAL_RPC@@';
+  const text = 'first line\nsecond line 中文 🎨';
+  function response(child, value) {
+    const { id } = JSON.parse(child.writes.at(-1).slice(prefix.length));
+    return Buffer.from(prefix + JSON.stringify({ id, ok: true, result: { items: [{ kind: 'user', text: value }] } }) + '\r\n');
+  }
+
+  const first = f.rpc('job.session');
+  const firstFrame = response(previous, text);
+  const second = f.rpc('job.session');
+  const secondFrame = response(previous, '另一条消息');
+  const chinese = firstFrame.indexOf('中') + 1;
+  const emoji = firstFrame.indexOf('🎨') + 2;
+  previous.stdout.write(firstFrame.subarray(0, chinese));
+  previous.stdout.write(firstFrame.subarray(chinese, emoji));
+  previous.stdout.write(Buffer.concat([firstFrame.subarray(emoji), secondFrame]));
+  assert.equal((await first).items[0].text, text);
+  assert.equal((await second).items[0].text, '另一条消息');
+
+  const abandoned = f.rpc('job.session');
+  const partial = response(previous, text);
+  const split = partial.indexOf('中') + 1;
+  previous.stdout.write(partial.subarray(0, split));
+  const stopped = assert.rejects(abandoned, /Runner stopped/);
+  f.setSecret('fixture-replacement-secret');
+  await f.configure();
+  await stopped;
+  previous.stdout.write(partial.subarray(split));
+
+  const replacement = f.children.at(-1);
+  assert.notEqual(replacement, previous);
+  const fresh = f.rpc('job.session');
+  replacement.stdout.write(response(replacement, text));
+  assert.equal((await fresh).items[0].text, text);
 });
 
 test('mobile capability result never goes to a replaced Runner process', async t => {

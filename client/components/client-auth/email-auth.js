@@ -22,16 +22,23 @@
     });
     input.addEventListener('input', () => normalizeSingleLineInput(input));
   }
+  function transitionMessage(error) {
+    if (error?.code === 'AUTH_TRANSITION_PENDING') return '正在完成账号切换，请稍后重试登录。';
+    if (['STALE_AUTH_OPERATION', 'STALE_TASK_SCOPE'].includes(error?.code) ||
+        (error?.error || error?.message) === '账号或服务已变化，请重新打开这条对话')
+      return '账号或服务已变化，请重新登录。';
+    return '';
+  }
   function mount(gate, hooks) {
     const ui = global.AccountUI;
     // Established accounts may use a username, employee number, or email.
     // Email verification is an explicit registration / recovery flow instead
     // of the default login mode.
-    let mode = 'password', policy = null, revision = 0, busy = false, sending = false;
+    let mode = 'password', policy = null, revision = 0, busy = false, sending = null, submission = null;
     let policyError = false;
     let legalLocales = {};
     let challenge = null, cooldownUntil = 0, clock = null, pendingPasswordMode = false;
-    let delivery = null, deliveryTimer = null, disposed = false, statusSource = '';
+    let delivery = null, deliveryTimer = null, disposed = false, statusSource = '', invalidField = '';
     gate.classList.add('ac-auth');
     gate.innerHTML = '<main class="soduwork-auth-card ac-auth-card">' +
       '<header class="ac-brand"><img src="icon.png" alt="" width="32" height="32"><b>SoduWork</b><span>让工作更简单</span></header>' +
@@ -39,11 +46,13 @@
       '<div class="ac-auth-tabs" role="tablist" aria-label="登录方式"><button type="button" role="tab" data-auth-mode="emailCode">验证码登录</button>' +
       '<button type="button" role="tab" data-auth-mode="password">密码登录</button></div>' +
       '<form class="soduwork-auth-form ac-auth-form" novalidate>' +
-      '<label><span class="ac-account-label">账号</span><input id="soduWorkAuthAccount" name="username" type="text" autocomplete="username" maxlength="254" placeholder="输入账号" required></label>' +
+      '<label><span class="ac-account-label">账号</span><input id="soduWorkAuthAccount" name="username" type="text" autocomplete="username" maxlength="254" placeholder="输入账号" aria-describedby="acAccountError acAccountErrorHint" required>' +
+      '<span id="acAccountError" class="ac-field-error" aria-live="polite" hidden></span><span id="acAccountErrorHint" class="ac-status ac-field-hint" hidden></span></label>' +
       '<label data-auth-code><span>邮箱验证码</span><span class="ac-code-row"><input id="acEmailCode" type="text" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" placeholder="6 位验证码">' +
       '<button type="button" class="ac-secondary" data-send-code>获取验证码</button></span></label>' +
-      '<label data-auth-password hidden><span class="ac-password-label">密码</span><span class="ac-password-row"><input id="soduWorkAuthPassword" type="password" autocomplete="current-password" maxlength="128" placeholder="输入密码" aria-describedby="acPasswordRequirements">' +
-      '<button type="button" class="ac-text" data-password-toggle="soduWorkAuthPassword" aria-label="显示密码" aria-pressed="false">显示</button></span><span id="acPasswordRequirements" class="ac-status" hidden></span></label>' +
+      '<label data-auth-password hidden><span class="ac-password-label">密码</span><span class="ac-password-row"><input id="soduWorkAuthPassword" type="password" autocomplete="current-password" maxlength="128" placeholder="输入密码" aria-describedby="acPasswordRequirements acPasswordError">' +
+      '<button type="button" class="ac-text" data-password-toggle="soduWorkAuthPassword" aria-label="显示密码" aria-pressed="false">显示</button></span><span id="acPasswordRequirements" class="ac-status" hidden></span>' +
+      '<span id="acPasswordError" class="ac-field-error" aria-live="polite" hidden></span></label>' +
       '<label data-auth-confirm hidden><span>确认密码</span><input id="acConfirmPassword" type="password" autocomplete="new-password" maxlength="128" placeholder="再次输入密码"></label>' +
       '<div class="ac-consent" data-auth-consent hidden><label><input id="acConsent" type="checkbox"><span>我已阅读并同意</span></label>' +
       '<button type="button" class="ac-link" data-legal="terms">《用户协议》</button><span data-consent-and>和</span><button type="button" class="ac-link" data-legal="privacy">《隐私政策》</button></div>' +
@@ -62,6 +71,8 @@
     const status = gate.querySelector('.soduwork-auth-status'), submit = gate.querySelector('[type="submit"]');
     const send = gate.querySelector('[data-send-code]');
     const language = gate.querySelector('[data-auth-language]');
+    const accountError = gate.querySelector('#acAccountError'), passwordError = gate.querySelector('#acPasswordError');
+    const accountErrorHint = gate.querySelector('#acAccountErrorHint');
     const consentRequiredMessage = '请阅读并同意用户协议和隐私政策。';
     const api = () => hooks.api();
     const tx = value => (global.SoduWorkI18n && typeof global.SoduWorkI18n.translateText === 'function')
@@ -75,9 +86,30 @@
       hint.textContent = tx(passwordRequirements());
     }
     function setStatus(message, kind) {
+      clearLoginError();
       statusSource = String(message || '');
       status.textContent = tx(statusSource);
       status.className = 'soduwork-auth-status' + (kind ? ' is-' + kind : '');
+    }
+    function clearLoginError() {
+      invalidField = '';
+      account.removeAttribute('aria-invalid'); password.removeAttribute('aria-invalid');
+      accountError.hidden = passwordError.hidden = accountErrorHint.hidden = true;
+      accountError.textContent = passwordError.textContent = accountErrorHint.textContent = '';
+    }
+    function refreshLoginError() {
+      if (invalidField === 'account') {
+        accountError.textContent = tx('未找到该账号，请检查输入是否正确。');
+        accountErrorHint.textContent = tx('如果你已注册，请确认服务地址是否正确。');
+      } else if (invalidField === 'password') passwordError.textContent = tx('密码不正确，请重新输入。');
+    }
+    function showLoginError(code) {
+      setStatus('');
+      invalidField = code === 'ACCOUNT_NOT_FOUND' ? 'account' : 'password';
+      const input = invalidField === 'account' ? account : password;
+      accountError.hidden = accountErrorHint.hidden = invalidField !== 'account';
+      passwordError.hidden = invalidField !== 'password';
+      input.setAttribute('aria-invalid', 'true'); refreshLoginError(); input.focus();
     }
     function modeCopy() {
       return mode === 'register'
@@ -112,6 +144,7 @@
         const shown = password.type === 'text';
         toggle.textContent = tx(shown ? '隐藏' : '显示');
         toggle.setAttribute('aria-label', tx(shown ? '隐藏密码' : '显示密码'));
+        toggle.setAttribute('aria-pressed', String(shown));
       }
       const passwordLogin = mode === 'password';
       text('.ac-account-label', passwordLogin ? '账号' : '邮箱');
@@ -136,7 +169,7 @@
       const hub = gate.querySelector('.soduwork-auth-hub');
       if (hub && hub.firstChild && hub.firstChild.nodeType === 3) hub.firstChild.nodeValue = tx('连接 ');
       if (!busy) text('.soduwork-auth-submit span', actionLabel());
-      refreshCooldown(); refreshAvailability(); refreshPasswordRequirements();
+      refreshCooldown(); refreshAvailability(); refreshPasswordRequirements(); refreshLoginError();
       if (statusSource) status.textContent = tx(statusSource);
     }
     function actionLabel() { return mode === 'register' ? '注册并进入工作区' : mode === 'resetPassword' ? '重置密码' : '登录'; }
@@ -221,6 +254,20 @@
       submit.querySelector('span').textContent = tx(label || (busy ? '正在处理…' : actionLabel()));
       submit.classList.toggle('is-busy', busy); refreshCooldown();
     }
+    function finishSubmission(state) {
+      if (submission !== state) return;
+      submission = null;
+      setBusy(false);
+    }
+    function invalidate() {
+      stopDelivery(); revision++; challenge = null; submission = null; sending = null;
+      cooldownUntil = 0;
+      if (clock) clearInterval(clock);
+      clock = null;
+      password.value = ''; confirm.value = ''; code.value = ''; password.type = 'password';
+      consent.checked = false; legalLocales = {};
+      setBusy(false); setStatus(''); refreshLocale();
+    }
     function changeMode(next) {
       if (busy) return;
       stopDelivery();
@@ -250,6 +297,7 @@
     }
     bindSingleLineInput(account);
     account.addEventListener('input', () => { stopDelivery(); revision++; challenge = null; code.value = ''; setStatus(''); });
+    password.addEventListener('input', () => { if (invalidField === 'password') clearLoginError(); });
     code.addEventListener('input', () => { code.value = code.value.replace(/\D/g, '').slice(0, 6); });
     consent.addEventListener('change', () => {
       if (mode === 'register' && consent.checked && policy?.requiredConsentVersions?.terms && policy?.requiredConsentVersions?.privacy &&
@@ -295,7 +343,7 @@
     send.addEventListener('click', async () => {
       if (!ui.email(account.value)) { setStatus('请输入有效的邮箱地址。', 'error'); account.focus(); return; }
       if (!canMail() || sending || busy || cooldownUntil > Date.now()) return;
-      const state = stamp(); sending = true; refreshCooldown(); setStatus('');
+      const state = stamp(); sending = state; refreshCooldown(); setStatus('');
       try {
         const result = ui.check(await api().clientAccountAction('emailChallenge', {
           email: state.email, purpose: mode === 'register' ? 'register' : mode === 'resetPassword' ? 'reset_password' : 'login'
@@ -319,9 +367,9 @@
             changeMode('register');
             setStatus('此邮箱尚未注册，请先创建账号。', 'working');
           }
-        } else setStatus(ui.error(error), 'error');
+        } else setStatus(transitionMessage(error) || ui.error(error), 'error');
       }
-      finally { sending = false; refreshCooldown(); }
+      finally { if (sending === state) { sending = null; refreshCooldown(); } }
     });
     form.addEventListener('submit', async event => {
       event.preventDefault();
@@ -348,23 +396,39 @@
         const read = legalLocales[kind];
         return [kind, (read?.version === policy?.requiredConsentVersions?.[kind] ? read.locale : selected?.locale) || ''];
       }));
+      submission = state;
+      let enteringWorkspace = false;
       setBusy(true); setStatus('');
       try {
         const result = ui.check(await (action === 'password' && (!ui.email(value) || (policy && !supportsEmail()))
           ? api().clientLogin({ account: value, password: password.value }) : api().clientAccountAction(action, payload)));
         // The API fences concurrent auth changes; first login can also establish the real device ID.
-        if (!current(state, true)) return;
+        if (submission !== state || !current(state, true)) return;
         password.value = ''; confirm.value = ''; code.value = ''; password.type = 'password';
         if (action === 'resetPassword') {
-          setBusy(false); changeMode('password'); setStatus('密码已重置，请用新密码登录。', 'success'); return;
+          finishSubmission(state); changeMode('password'); setStatus('密码已重置，请用新密码登录。', 'success'); return;
         }
-        setStatus('验证成功，正在进入工作区…', 'success'); hooks.success(result);
+        setStatus('验证成功，正在进入工作区…', 'success');
+        if (hooks.success(result) === false) throw new Error('暂未确认登录状态，请重试。');
+        enteringWorkspace = true;
       } catch (error) {
-        if (current(state) && error?.code === 'CONSENT_REQUIRED') {
+        if (submission === state && current(state) && error?.code === 'CONSENT_REQUIRED') {
           consent.checked = false;
-          try { const latest = await api().clientAuthPolicy(); if (current(state)) setPolicy(latest); } catch (_) {}
+          try { const latest = await api().clientAuthPolicy(); if (submission === state && current(state)) setPolicy(latest); } catch (_) {}
         }
-        if (current(state)) { password.value = ''; confirm.value = ''; setStatus(ui.error(error), 'error'); setBusy(false); }
+        if (submission === state && current(state)) {
+          password.value = ''; confirm.value = ''; password.type = 'password';
+          finishSubmission(state); refreshLocale();
+          if (action === 'password' && mode === 'password' && ['ACCOUNT_NOT_FOUND', 'PASSWORD_INCORRECT'].includes(error?.code)) {
+            showLoginError(error.code);
+          } else setStatus(transitionMessage(error) || ui.error(error), 'error');
+        }
+      } finally {
+        // A revoked request can retire its own lock, but cannot touch a new submission.
+        if (submission === state && !enteringWorkspace) {
+          if (current(state)) finishSubmission(state);
+          else invalidate();
+        }
       }
     });
     function setPolicy(next) {
@@ -388,8 +452,8 @@
     changeMode('password');
     return { form, accountInput: account, passwordInput: password, displayInput: null,
       statusNode: status, submitButton: submit, setBusy, setPolicy, setPolicyError, setStatus,
-      invalidate() { stopDelivery(); revision++; challenge = null; password.value = ''; confirm.value = ''; code.value = ''; },
+      invalidate,
       dispose() { stopDelivery(); disposed = true; revision++; if (clock) clearInterval(clock); global.removeEventListener?.('soduwork-locale-change', onLocaleChange); gate._accountUiPasswordLocaleDispose?.(); delete gate._accountUiPasswordLocaleDispose; } };
   }
-  global.EmailAuth = { mount };
+  global.EmailAuth = { mount, transitionMessage };
 })(window);

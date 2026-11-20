@@ -13,7 +13,8 @@ const taskControllerSource = fs.readFileSync(
 const markdownSource = fs.readFileSync(
   path.join(__dirname, '../components/panels/chat-markdown.js'), 'utf8');
 const markedSource = fs.readFileSync(
-  path.join(__dirname, '../vendor/markdown/marked.umd.js'), 'utf8');
+  path.join(__dirname, '../vendor/markdown/marked.umd.js'), 'utf8') + '\n' + fs.readFileSync(
+  path.join(__dirname, '../core/markdown.js'), 'utf8');
 
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (char) => ({
@@ -624,9 +625,11 @@ test('desktop loads Markdown dependencies before the chat renderer', () => {
   const html = fs.readFileSync(path.join(__dirname, '../desk.html'), 'utf8');
   const rendererAt = html.indexOf('components/panels/chat-message-renderer.js');
   const markedAt = html.indexOf('vendor/markdown/marked.umd.js');
+  const markdownPolicyAt = html.indexOf('core/markdown.js');
   const purifierAt = html.indexOf('vendor/markdown/purify.min.js');
   const markdownAt = html.indexOf('components/panels/chat-markdown.js');
   assert.ok(markedAt >= 0 && purifierAt >= 0 && rendererAt > markedAt && rendererAt > purifierAt);
+  assert.ok(markdownPolicyAt > markedAt && markdownPolicyAt < markdownAt);
   assert.ok(markdownAt > purifierAt && markdownAt < rendererAt);
 });
 
@@ -814,11 +817,11 @@ test('one turn aggregates different runs and tool-only collaborators without lea
     { role: 'assistant', sourceAgent: { agentId: 'qwen', runId: 'second' }, blocks: [{ kind: 'text', text: 'Final answer' }], done: true },
     { role: 'user', text: 'Second request' },
     { role: 'assistant', sourceAgent: { agentId: 'pi' }, blocks: [{ kind: 'text', text: 'Next answer' }], done: true },
-  ], tools: [{ id: 'read', name: 'read', after: 1, state: 'done', sourceAgent: { agentId: 'claude' } }] };
+  ], tools: [{ id: 'read', name: 'read', after: 1, state: 'done', sourceAgent: { agentId: 'codex' } }] };
   renderer._render();
   assert.equal((list.innerHTML.match(/class="nchat-agent-source/g) || []).length, 2);
   assert.match(list.innerHTML, /agent-brand-qwen crew-sub/);
-  assert.match(list.innerHTML, /agent-brand-claude crew-sub/);
+  assert.match(list.innerHTML, /agent-brand-codex crew-sub/);
   assert.equal((list.innerHTML.match(/Initial explanation/g) || []).length, 1);
   assert.ok(list.innerHTML.indexOf('Initial explanation') < list.innerHTML.indexOf('Final answer'));
   assert.doesNotMatch(list.innerHTML.slice(list.innerHTML.indexOf('Second request')), /crew-sub/);

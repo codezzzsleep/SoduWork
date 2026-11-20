@@ -75,6 +75,244 @@ function fixture({ fresh = false, attachments, send, files: initialFiles } = {})
   return { ctx, input, bridge, requests, notices, added, plugins, switchTo, paints: () => paints };
 }
 
+test('automation timing uses the send click before asynchronous access checks', async () => {
+  const f = fixture(), check = deferred(); let clock = Date.parse('2099-11-16T12:13:00Z'), routed;
+  f.ctx.Date = class extends Date { static now() { return clock; } };
+  f.ctx._composerControls = {waitForAccess: () => check.promise};
+  f.ctx.global.ChatWorkActions = f.ctx.ChatWorkActions = {route: async options => {
+    routed = options; return {handled:true,accepted:true};
+  }};
+  vm.runInContext(require('./renderer-source.cjs').factoryFunction('chat-session-controller.js','ChatSessionController','_send'), f.ctx);
+  f.input.value = '修改为10分钟之后';
+  const sentAt = clock, pending = f.ctx._send(); await flush();
+  clock += 120000; check.resolve(true);
+  assert.equal(await pending, true);
+  assert.equal(routed.requestedAt, sentAt);
+  assert.equal(routed.text, '修改为10分钟之后');
+  assert.equal(f.requests.length, 0);
+});
+
+test('model preflight shows pending state, preserves an acceptance draft on failure, and allows retry', async () => {
+  const f = fixture(), check = deferred(), states = [];
+  let token = 0, cleared = 0;
+  f.ctx._beginSendState = () => { states.push('sending'); return ++token; };
+  f.ctx._finishSendState = value => { assert.equal(value, token); states.push('idle'); };
+  f.ctx._messageAttachments.clear = () => { cleared++; };
+  f.ctx._composerControls = { waitForAccess: () => check.promise };
+  f.ctx._activeCollabTaskId = 'review-task';
+  f.ctx._collabTasks = new Map([['review-task', {task: {id:'review-task', status:'reviewing'}, nativeTurn:true}]]);
+  f.ctx._sessionOptions = {acceptanceExecutionSession:true, acceptanceMode:'auto', approvalId:'review-1'};
+  f.input.value = 'Review the delivered result against the frozen criteria';
+  const pending = f.ctx._sendCore(); await flush();
+  assert.deepEqual(states, ['sending']); assert.equal(f.requests.length, 0); assert.equal(cleared, 0);
+  check.reject(Error('Model directory temporarily unavailable'));
+  assert.equal(await pending, false);
+  assert.deepEqual(states, ['sending', 'idle']);
+  assert.match(f.ctx._snap.statusText, /Model directory temporarily unavailable/);
+  assert.equal(f.input.value, 'Review the delivered result against the frozen criteria');
+  assert.equal(cleared, 0); assert.equal(f.requests.length, 0);
+  f.ctx._composerControls.waitForAccess = async () => true;
+  assert.equal(await f.ctx._sendCore(), true);
+  assert.equal(f.requests.length, 1); assert.equal(cleared, 1);
+  assert.equal(f.requests[0][3].taskId, 'review-task');
+  assert.equal(f.requests[0][3].taskExecution.acceptanceOnly, true);
+  assert.equal(f.requests[0][3].taskExecution.acceptanceMode, 'auto');
+  assert.equal(f.requests[0][3].taskExecution.approvalId, 'review-1');
+  assert.equal(states.at(-1), 'idle');
+});
+
+test('review sends preserve the exact generated template and distinct reviewer instruction without promoting history to a fresh instruction',async()=>{
+  const f=fixture(),draft='【验收分析】\nOriginal and historical supplement context';
+  f.ctx._sessionOptions={acceptanceExecutionSession:true,acceptanceMode:'manual',approvalId:'review-1',
+    acceptanceDraft:draft,acceptanceInstruction:'Fresh reviewer note'};
+  f.ctx._activeCollabTaskId='review-task';f.ctx._collabTasks=new Map([['review-task',{task:{id:'review-task',status:'reviewing'},nativeTurn:true}]]);
+  f.input.value=draft+'\n\nFresh composer addition';
+  assert.equal(await f.ctx._sendCore(),true);
+  const sent=f.requests[0][3].taskExecution;
+  assert.equal(sent.acceptanceOnly,true);assert.equal(sent.acceptanceDraft,draft);assert.equal(sent.acceptanceInstruction,'Fresh reviewer note');
+  assert.equal(f.requests[0][1],draft+'\n\nFresh composer addition');
+});
+
+test('a late preflight error cannot overwrite a different conversation or account', async () => {
+  for (const changed of ['conversation', 'account']) {
+    const f = fixture(), check = deferred(); let finished = false;
+    f.ctx._composerControls = {waitForAccess: () => check.promise};
+    f.ctx._beginSendState = () => 1;
+    f.ctx._finishSendState = () => { finished = true; };
+    f.input.value = 'Original acceptance draft';
+    const pending = f.ctx._sendCore(); await flush();
+    if (changed === 'conversation') f.switchTo('b', 'New conversation draft');
+    else { f.ctx._draftScopeEpoch++; f.input.value = 'Other account draft'; }
+    const snapshot = f.ctx._snap, draft = f.input.value;
+    check.reject(Error('Late directory error'));
+    assert.equal(await pending, false); assert.equal(finished, true);
+    assert.equal(f.ctx._snap, snapshot); assert.equal(f.input.value, draft);
+    assert.equal(f.requests.length, 0);
+  }
+});
+
+test('failed preflight for a queued message does not mark the active execution as failed', async () => {
+  const f = fixture(); f.ctx._snap.status = 'streaming';
+  const snapshot = f.ctx._snap;
+  f.ctx.global.petSay = message => f.notices.push(message);
+  f.ctx._composerControls = {waitForAccess: async () => { throw Error('Model lookup failed'); }};
+  f.input.value = 'Keep this follow-up';
+  assert.equal(await f.ctx._sendCore(), false);
+  assert.equal(f.ctx._snap, snapshot); assert.equal(f.ctx._snap.status, 'streaming');
+  assert.deepEqual(f.notices, ['Model lookup failed']);
+  assert.equal(f.input.value, 'Keep this follow-up'); assert.equal(f.requests.length, 0);
+});
+
+test('repeated Enter while running and awaiting composer preflight sends the retained draft only once', async () => {
+  const f = fixture(), check = deferred(), route = deferred();
+  f.ctx._snap.status = 'streaming';
+  f.ctx._composerControls = {waitForAccess: () => check.promise};
+  f.ctx.global.ChatWorkActions = f.ctx.ChatWorkActions = {route: () => route.promise};
+  f.input.value = 'One acceptance follow-up';
+  const first = f.ctx._sendCore(); await flush();
+  assert.equal(await f.ctx._sendCore(), false);
+  check.resolve(true); await flush();
+  assert.equal(await f.ctx._sendCore(), false, 'work-action routing must retain this draft admission lock');
+  route.resolve({handled:false});
+  assert.equal(await first, true);
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0][1], 'One acceptance follow-up');
+  assert.equal(f.ctx._sendPreflight, null);
+});
+
+test('a consumed draft releases preflight admission before the previous send acknowledgement', async () => {
+  const receipt = deferred(), f = fixture({send: () => receipt.promise});
+  f.ctx._snap.status = 'streaming';
+  f.ctx._composerControls = {waitForAccess: async () => true};
+  f.input.value = 'First queued draft';
+  const first = f.ctx._sendCore(); await flush();
+  assert.equal(f.requests.length, 1); assert.equal(f.ctx._sendPreflight, null);
+  f.input.value = 'Second queued draft';
+  const second = f.ctx._sendCore(); await flush();
+  assert.equal(f.input.value, '');
+  receipt.resolve({ok:true});
+  assert.equal(await first, true); assert.equal(await second, true);
+  assert.deepEqual(f.requests.map(row => row[1]), ['First queued draft', 'Second queued draft']);
+});
+
+test('preflight locks preserve newer view and account admissions when an earlier check settles', async () => {
+  for (const changed of ['view', 'account']) {
+    const f = fixture(), oldCheck = deferred(), newCheck = deferred();
+    let reads = 0;
+    f.ctx._composerControls = {waitForAccess: () => (++reads === 1 ? oldCheck : newCheck).promise};
+    f.input.value = 'Previous owner draft';
+    const oldSend = f.ctx._sendCore(); await flush();
+    if (changed === 'view') f.switchTo('b', 'Current draft');
+    else { f.ctx._draftScopeEpoch++; f.input.value = 'Current draft'; }
+    const newSend = f.ctx._sendCore(); await flush();
+    const currentLock = f.ctx._sendPreflight;
+    oldCheck.resolve(true);
+    assert.equal(await oldSend, false);
+    assert.equal(f.ctx._sendPreflight, currentLock);
+    assert.equal(f.input.value, 'Current draft');
+    assert.equal(await f.ctx._sendCore(), false);
+    newCheck.resolve(true); assert.equal(await newSend, true);
+    assert.equal(f.requests.length, 1); assert.equal(f.requests[0][1], 'Current draft');
+  }
+});
+
+test('an explicit programmatic task send remains independent of a pending composer admission', async () => {
+  const f = fixture(), check = deferred();
+  f.ctx._composerControls = {waitForAccess: () => check.promise};
+  f.input.value = 'Keep composer draft';
+  const composer = f.ctx._sendCore(); await flush();
+  const task = f.ctx._sendCore('Explicit task instruction', {taskId:'task',useComposer:false}); await flush();
+  check.resolve(true);
+  assert.equal(await task, true); assert.equal(await composer, true);
+  assert.equal(f.requests.length, 2);
+  assert.ok(f.requests.some(row => row[1] === 'Explicit task instruction' && row[3].taskId === 'task'));
+  assert.ok(f.requests.some(row => row[1] === 'Keep composer draft'));
+});
+
+for (const hook of ['capture', 'render']) {
+  test(`a synchronous ${hook} failure releases its submission reservation and retains the unsent draft`, async () => {
+    const f = fixture();
+    let retainedFiles = [{ name: 'retained.txt', path: 'synthetic-retained.txt' }];
+    f.ctx._messageAttachments = {
+      names: () => retainedFiles.map(file => file.name), files: () => retainedFiles.slice(),
+      refs: () => Promise.resolve(retainedFiles.map(file => ({ path: file.path, name: file.name }))),
+      clear: () => { retainedFiles = []; }, add: files => { retainedFiles.push(...files); },
+    };
+    const original = hook === 'render' ? f.ctx._render : () => {};
+    let fail = true;
+    const once = (...args) => {
+      if (fail) { fail = false; throw Error('Synthetic ' + hook + ' failure'); }
+      return original(...args);
+    };
+    if (hook === 'capture') f.ctx._workCards = { capture: once };
+    else f.ctx._render = once;
+    f.input.value = 'Retain this instruction and its attachment';
+    assert.equal(await f.ctx._sendCore(), false);
+    let released = false;
+    f.ctx._submitTail.then(() => { released = true; });
+    await flush();
+    assert.equal(released, true, 'A failed admission cannot strand later submissions');
+    assert.equal(f.requests.length, 0);
+    assert.equal(f.input.value, 'Retain this instruction and its attachment');
+    assert.deepEqual(retainedFiles.map(file => file.name), ['retained.txt']);
+    assert.equal(f.ctx._sendPreflight, null);
+    assert.equal(await f.ctx._sendCore(), true);
+    assert.equal(f.requests.length, 1);
+    assert.equal(f.requests[0][1], 'Retain this instruction and its attachment');
+    assert.equal(f.requests[0][2][0].name, 'retained.txt');
+  });
+}
+
+for (const failure of ['capture', 'attachments']) {
+  test(`a ${failure} failure releases its own reservation without letting a later send bypass an earlier admission`, async () => {
+    const admission = deferred();
+    const f = fixture({ files: [], send: (_ref, text) => text === 'First admission'
+      ? admission.promise : { ok: true } });
+    f.ctx._runtimeBusy = () => Boolean(f.ctx._pending || f.ctx._snap?.status === 'streaming');
+    f.input.value = 'First admission';
+    const first = f.ctx._sendCore(); await flush();
+    assert.equal(f.requests.length, 1);
+    if (failure === 'capture') f.ctx._workCards = { capture() { throw Error('Synthetic capture failure'); } };
+    else f.ctx._messageAttachments.refs = () => Promise.reject(Error('Synthetic attachment failure'));
+    f.input.value = 'Failed second draft';
+    assert.equal(await f.ctx._sendCore(), false, 'A failed preparation reports immediately while the first admission is unresolved');
+    delete f.ctx._workCards;
+    f.ctx._messageAttachments.refs = () => Promise.resolve([]);
+    f.input.value = 'Third draft';
+    const third = f.ctx._sendCore(); await flush();
+    assert.equal(f.requests.length, 1, 'A released failed reservation must still inherit the preceding admission');
+    admission.resolve({ ok: true });
+    assert.equal(await first, true);
+    assert.equal(await third, true);
+    assert.deepEqual(f.requests.map(row => row[1]), ['First admission', 'Third draft']);
+  });
+}
+
+test('a synchronous capture failure also observes an already rejected attachment preparation', async () => {
+  const f = fixture();
+  f.ctx._workCards = { capture() { throw Error('Synthetic capture failure'); } };
+  f.ctx._messageAttachments.refs = () => Promise.reject(Error('Synthetic attachment failure'));
+  f.input.value = 'Retain the draft when both preparations fail';
+  assert.equal(await f.ctx._sendCore(), false);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.input.value, 'Retain the draft when both preparations fail');
+});
+
+test('a deleted local model blocks sending and preserves the draft until a valid model is explicitly selected', async () => {
+  const f = fixture(); f.input.value = 'Keep this original draft';
+  f.ctx._snap.modelSelection = { name: 'local:deleted', model: {
+    id: 'local:deleted', label: '原本地模型已删除或不可用', unavailable: true, historicalLocal: true,
+  } };
+  assert.equal(await f.ctx._sendCore(), false);
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.input.value, 'Keep this original draft');
+  assert.match(JSON.stringify(f.ctx._snap), /主动选择可用模型/);
+  f.ctx._snap.modelSelection = { name: 'valid-model', model: { id: 'valid-model' } };
+  assert.equal(await f.ctx._sendCore(), true);
+  assert.equal(f.requests.length, 1);
+});
+
 test('folded original request reaches plugin inference, send and failure receipt intact', async () => {
   const original = '  #1 原始要求\r\n' + '按原文执行，不解析为另一个需求。'.repeat(130) + '\n\n';
   const suffix = '追加约束  ';

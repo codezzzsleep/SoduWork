@@ -4,9 +4,10 @@ unassigned devices. Client.user_ref determines device ownership.
 """
 from datetime import datetime, timedelta, timezone
 import logging
+import uuid
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import models
@@ -49,6 +50,7 @@ from ..services import work_catalog
 from ..services import device_auth
 from ..services import device_connections
 from ..services import environment_service
+from .input_validation import parse_integer
 
 log = logging.getLogger("uvicorn.error")
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
@@ -144,6 +146,8 @@ def _org_mutation_error(exc: rbac.OrgMutationError) -> HTTPException:
         "out_of_scope": (403, "只能在自己管辖的部门内操作"),
         "parent_not_found": (400, "上级部门不存在"),
         "cycle": (400, "部门不能移动到自身或下级部门"),
+        "invalid_name": (400, "部门名称须为 1 至 64 个字符"),
+        "duplicate_name": (409, "同级部门已使用这个名称"),
     }.get(exc.reason, (400, "组织架构操作无效"))
     return HTTPException(status_code=status, detail=message)
 
@@ -203,7 +207,9 @@ async def delete_org(
         raise _org_mutation_error(exc) from exc
     if not r["ok"]:
         msg = {"has_children": "该部门下还有子部门", "has_users": "该部门下还有用户", "not_found": "部门不存在"}
-        raise HTTPException(status_code=400, detail=msg.get(r["reason"], "无法删除"))
+        reason = r["reason"]
+        raise HTTPException(status_code=400, detail=msg.get(reason, "无法删除"),
+                            headers={"X-Error-Code": f"org.delete.{reason}"})
     await audit.log(session, user, "org.delete", "org", oid, r.get("name", ""), {})
     return r
 
@@ -246,7 +252,9 @@ async def delete_role(rid: str,
     r = await rbac.delete_role(session, rid)
     if not r["ok"]:
         msg = {"system_role": "系统内置角色不可删", "in_use": "仍有用户在用该角色", "not_found": "角色不存在"}
-        raise HTTPException(status_code=400, detail=msg.get(r["reason"], "无法删除"))
+        reason = r["reason"]
+        raise HTTPException(status_code=400, detail=msg.get(reason, "无法删除"),
+                            headers={"X-Error-Code": f"role.delete.{reason}"})
     await audit.log(session, user, "role.delete", "role", rid, label, {})
     return r
 
@@ -274,6 +282,7 @@ async def create_user(
     try:
         position_ids = await work_catalog.validate_profession_ids(
             session, body.orgId, body.positions or [])
+        await rbac.validate_user_domains(session, body.domains)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     created = await rbac.create_user(
@@ -302,24 +311,29 @@ async def update_user(
         raise HTTPException(status_code=400, detail="不能停用超级管理员")
     was_active = bool(target.is_active)
     patch = body.model_dump(exclude_none=True)
+    # Explicit null clears the role; omitting the field preserves it.
+    if "roleId" in body.model_fields_set:
+        patch["roleId"] = body.roleId
     target_org_id = body.orgId if body.orgId is not None else target.org_id
-    if body.positions is not None or body.orgId is not None:
-        try:
+    try:
+        await rbac.validate_user_domains(session, body.domains)
+        if body.positions is not None or body.orgId is not None:
             patch["positions"] = await work_catalog.validate_profession_ids(
                 session, target_org_id,
                 body.positions if body.positions is not None else target.positions)
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
-    updated = await rbac.update_user(session, uid, patch)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    client_ids = []
     if was_active and patch.get("isActive") is False:
-        bound_clients = list((await session.execute(
-            select(Client).where(Client.user_ref == uid)
-        )).scalars().all())
-        for bound in bound_clients:
-            if bound.auth_state != "revoked":
-                device_auth.revoke(bound)
-        await session.commit()
-        client_ids = [bound.id for bound in bound_clients]
+        # End this account's sessions while preserving device identity/history
+        # and explicit administrator bans. rbac.update_user commits both changes.
+        client_ids = list((await session.scalars(update(Client).where(
+            Client.user_ref == uid, Client.auth_state != "revoked",
+        ).values(auth_state="pending", auth_version=Client.auth_version + 1,
+                 activated_at=None, revoked_at=None).returning(Client.id)
+            .execution_options(synchronize_session=False))).all())
+    updated = await rbac.update_user(session, uid, patch)
+    if client_ids:
         await device_connections.disconnect_many(client_ids)
     await audit.log(session, user, "user.update", "user", uid, target.display_name or target.username,
                     {"fields": [k for k in patch if k != "password"], "pwChanged": "password" in patch})
@@ -412,7 +426,8 @@ async def create_domain(
     user: User = Depends(require_perm("user.manage")),
     session: AsyncSession = Depends(get_session),
 ):
-    r = await rbac.create_domain(session, (body.get("name") or "").strip(), int(body.get("sort") or 0))
+    sort = parse_integer(body.get("sort"), field="sort", default=0)
+    r = await rbac.create_domain(session, (body.get("name") or "").strip(), sort)
     await audit.log(session, user, "domain.create", "domain", r["id"], r["name"], {})
     return r
 
@@ -424,7 +439,12 @@ async def update_domain(
     user: User = Depends(require_perm("user.manage")),
     session: AsyncSession = Depends(get_session),
 ):
-    r = await rbac.update_domain(session, did, body.get("name"), body.get("sort"))
+    # Omitted/null sort retains the previous rank; a supplied value must be
+    # validated before the service can mutate either name or sort.
+    sort = body.get("sort")
+    if sort is not None:
+        sort = parse_integer(sort, field="sort")
+    r = await rbac.update_domain(session, did, body.get("name"), sort)
     if r is None:
         raise HTTPException(status_code=404, detail="领域不存在")
     await audit.log(session, user, "domain.update", "domain", did, r["name"], {})
@@ -439,7 +459,8 @@ async def delete_domain(
 ):
     r = await rbac.delete_domain(session, did)
     if not r.get("ok"):
-        msg = {"not_found": "领域不存在", "system": "内置领域不可删除"}.get(r.get("reason"), "删除失败")
+        msg = {"not_found": "领域不存在", "system": "内置领域不可删除",
+               "in_use": "仍有用户使用该业务域，请先解除关联"}.get(r.get("reason"), "删除失败")
         raise HTTPException(status_code=404 if r.get("reason") == "not_found" else 400, detail=msg)
     await audit.log(session, user, "domain.delete", "domain", did, did, {})
     return r
@@ -833,7 +854,9 @@ async def upload_task_attachment(
         raise HTTPException(status_code=400, detail="空文件")
     fn = (file.filename or "file").replace("/", "_").replace("\\", "_").strip()[:200] or "file"
     ct = file.content_type or "application/octet-stream"
-    a = Attachment(task_id=tid, filename=fn, content_type=ct, size=len(data), uploaded_by="admin:" + user.id)
+    # The column default is applied at flush; the storage key needs the id now.
+    a = Attachment(id=str(uuid.uuid4()), task_id=tid, filename=fn, content_type=ct, size=len(data),
+                   uploaded_by="admin:" + user.id)
     a.storage_key = f"att/{tid}/{a.id}/{fn}"
     a.backend = storage.put(a.storage_key, data, ct)
     session.add(a)
@@ -1289,6 +1312,7 @@ async def discover_model_provider(
         raise HTTPException(status_code=404, detail="这个模型服务不存在")
     if not p.enabled or not p.base_url or not p.api_key:
         return {"ok": False, "models": [], "known": [],
+                "code": "model.discovery.provider-incomplete",
                 "detail": "服务需要先启用，并填写地址与密钥后才能读取模型列表"}
     result = await model_discovery.discover(p.base_url, p.api_key, p.kind)
     existing = (await session.execute(
@@ -1322,9 +1346,11 @@ async def put_model_def(
     # Keep those exact rows editable; never truncate or rename their identities.
     if m is None and len(mid) > 64:
         raise HTTPException(status_code=400, detail="模型服务标识加模型标识共超过 64 个字符，请缩短模型标识")
-    if await session.get(ModelProvider, pid, populate_existing=True) is None:
+    provider = await session.get(ModelProvider, pid, populate_existing=True)
+    if provider is None:
         raise HTTPException(status_code=400, detail="这个模型服务不存在")
-    if m is None:
+    created = m is None
+    if created:
         m = ModelDef(id=mid, provider_id=pid, name=name, builtin=False)
         session.add(m)
     if "label" in body:
@@ -1348,6 +1374,9 @@ async def put_model_def(
         m.ctx_window = validate_limits(body.get("ctxWindow", m.ctx_window), m.config or {})
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    receipt = {}
+    if created and model_catalog.normalize_modality(m.modality) == "chat":
+        receipt = await model_catalog.creation_receipt(session, provider, m)
     await session.commit()
     from ..services.client_domain_events import models_changed
     await models_changed(session)
@@ -1355,7 +1384,7 @@ async def put_model_def(
         session, user, "model.def", "setting", mid, m.label or name,
         {"enabled": m.enabled, "modality": m.modality},
     )
-    return {"ok": True, "id": mid}
+    return {"ok": True, "id": mid, **receipt}
 
 
 @router.delete("/model-defs/{mid:path}")

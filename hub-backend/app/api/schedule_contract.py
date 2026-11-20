@@ -4,11 +4,17 @@ Authorization and owner selection remain in each router. Timestamp formatting is
 provided by the caller to preserve the existing tolerant personal view.
 """
 from fastapi import HTTPException
+import re
+
+from .input_validation import parse_integer
 
 
 def schedule_payload(s, *, timestamp, administrative=False) -> dict:
     from datetime import datetime, timezone
     from ..services import schedules as sch
+    from ..services.schedule_run_contracts import (
+        clean_schedule_model_reference, schedule_model_source,
+    )
     # Automation is a plain conversation. Enterprise workflow bindings are not
     # exposed, while a personal plugin remains an ordinary-chat plugin resolved
     # by the owner desktop.
@@ -18,6 +24,8 @@ def schedule_payload(s, *, timestamp, administrative=False) -> dict:
     next_at = sch.next_run_instant(s, origin)
     end_date = str(getattr(s, "end_date", None) or "")
     current = datetime.now(timezone.utc)
+    # Historical retries remain recorded, but expired work is no longer pending.
+    retry_at = s.next_retry_at if sch.schedule_timing.retry_within_dates(s, s.next_retry_at, current) else None
     if s.every not in ("once", "custom") and end_date and current.astimezone(sch.schedule_zone(s)).date().isoformat() > end_date:
         pending = sch.next_run_instant(s, s.last_run_at or s.created_at)
         next_at = pending if sch.calendar_window_allows(s, current, pending) else None
@@ -33,6 +41,9 @@ def schedule_payload(s, *, timestamp, administrative=False) -> dict:
     weekdays = sch.schedule_timing.clean_weekdays(getattr(s, "weekdays", None))
     if s.every == "weekly" and not weekdays:
         weekdays = sch.schedule_timing.clean_weekdays(getattr(s, "weekday", None))
+    model_source = schedule_model_source(s)
+    model_name = ("" if model_source == "device" else
+                  clean_schedule_model_reference(getattr(s, "model_name", "")))
     payload = {"id": s.id, "title": s.title, "note": s.note, "every": s.every,
             "runAt": timestamp(getattr(s, "run_at", None)),
             "onceFired": bool(getattr(s, "once_fired", False)),
@@ -45,7 +56,10 @@ def schedule_payload(s, *, timestamp, administrative=False) -> dict:
             "endDate": str(getattr(s, "end_date", None) or ""),
             "timeZone": sch.clean_time_zone(s.time_zone),
             "assigneeId": s.assignee_id, "assigneeType": s.assignee_type,
-            "modelName": str(getattr(s, "model_name", "") or ""),
+            # A device-owned model name never crosses the Hub boundary. The
+            # source marker is enough for clients to enforce fail-closed use.
+            "modelName": model_name,
+            "modelSource": model_source,
             "repoId": s.repo_id, "flow": False, "enabled": bool(s.enabled),
             "pluginBindingId": "",
             "personalPluginKey": personal_key,
@@ -59,8 +73,8 @@ def schedule_payload(s, *, timestamp, administrative=False) -> dict:
             "retryLimit": int(s.retry_limit or 0),
             "retryDelayMinutes": int(s.retry_delay_minutes or 5),
             "retryCount": int(s.retry_count or 0),
-            "nextRetryAt": timestamp(s.next_retry_at),
-            "retrying": bool(s.next_retry_at),
+            "nextRetryAt": timestamp(retry_at),
+            "retrying": bool(retry_at),
             "lastRunAt": timestamp(s.last_run_at), "lastTaskId": "",
             "lastError": s.last_error,
             "nextRunAt": timestamp(next_at),
@@ -77,6 +91,30 @@ def schedule_payload(s, *, timestamp, administrative=False) -> dict:
 def apply_schedule_update(s, body: dict) -> None:
     """Apply only supplied schedule fields after validating their shape and length."""
     from ..services import schedules as sch, schedule_timing
+    # Validate request numbers before touching even an attached ORM instance.
+    # Existing clients may send decimal strings, nulls and empty strings; only
+    # those documented empty values use defaults, never booleans or containers.
+    body = dict(body)
+    numbers = {}
+    for key, default in (("atHour", 0), ("atMinute", 0), ("weekday", 1),
+                         ("retryLimit", 0), ("retryDelayMinutes", 5)):
+        if key in body:
+            raw = body[key]
+            value = parse_integer(raw, field=key, default=default)
+            # Preserve the previous numeric-zero default for this field. A
+            # string "0" remains an explicit value and is clamped to one below.
+            if key == "retryDelayMinutes" and type(raw) is int and raw == 0:
+                value = default
+            numbers[key] = value
+    for key in ("weekdays", "monthDays"):
+        if key in body and body[key] is not None and body[key] != "":
+            values = body[key] if isinstance(body[key], list) else [body[key]]
+            body[key] = [parse_integer(value, field=key) for value in values]
+    if "timeZone" in body:
+        try:
+            body["timeZone"] = sch.validate_time_zone(body["timeZone"])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
     once_edit = getattr(s, "every", "") == "once" or body.get("every") == "once"
     before_execution = schedule_timing.execution_snapshot(s) if once_edit else None
     before_timing = schedule_timing.snapshot(s)
@@ -86,19 +124,64 @@ def apply_schedule_update(s, body: dict) -> None:
         from ..services.conversation_turns import execution_instruction
         s.note = execution_instruction(body.get("note"))
     if "atHour" in body:
-        s.at_hour = max(0, min(23, int(body.get("atHour") or 0)))
+        s.at_hour = max(0, min(23, numbers["atHour"]))
     if "atMinute" in body:
-        s.at_minute = max(0, min(59, int(body.get("atMinute") or 0)))
+        s.at_minute = max(0, min(59, numbers["atMinute"]))
     if "weekday" in body:
-        s.weekday = max(1, min(7, int(body.get("weekday") or 1)))
+        s.weekday = max(1, min(7, numbers["weekday"]))
     if "timeZone" in body:
-        s.time_zone = sch.clean_time_zone(body.get("timeZone"))
+        s.time_zone = body["timeZone"]
     for k, f in (("assigneeId", "assignee_id"), ("assigneeType", "assignee_type"),
                  ("repoId", "repo_id"), ("ownerClientId", "owner_client_id")):
         if k in body:
             setattr(s, f, str(body.get(k) or "").strip()[:64])
-    if "modelName" in body:
-        s.model_name = str(body.get("modelName") or "").strip()[:300]
+    if "modelSource" in body or "modelName" in body:
+        from ..services.schedule_run_contracts import (
+            clean_schedule_model_reference, clean_schedule_model_source,
+            is_local_model_reference,
+        )
+        raw_model = str(body.get("modelName") or "").strip()
+        explicit_source = "modelSource" in body
+        try:
+            if explicit_source:
+                source = clean_schedule_model_source(body.get("modelSource"))
+            elif is_local_model_reference(raw_model):
+                source = "device"
+            elif (not raw_model and
+                  str(getattr(s, "model_source", "") or "").strip().lower() == "device"):
+                # Older clients receive a redacted device modelName and may
+                # send that blank value back without the source marker. Keep
+                # the existing device-owned selection until a current client
+                # explicitly chooses a managed model/source.
+                source = "device"
+            else:
+                # A supplied model name is an explicit managed selection. This
+                # also makes clearing a previous device selection unambiguous.
+                source = "managed"
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if source == "device":
+            target_assignee = str(body.get("assigneeId", getattr(s, "assignee_id", "")) or "").strip()
+            runtime_id = ""
+            if target_assignee.startswith("local:"):
+                runtime_id = target_assignee.removeprefix("local:")
+            else:
+                match = re.fullmatch(r"runner:[^:]+:([a-z][a-z0-9-]{0,39})", target_assignee)
+                runtime_id = match.group(1) if match else ""
+            from ..agent_catalog import AGENTS
+            if not runtime_id or AGENTS.get(runtime_id, {}).get("modelMode") != "managed":
+                raise HTTPException(status_code=400,
+                                    detail="本地模型只能绑定本机托管型执行底座")
+            if raw_model and not is_local_model_reference(raw_model):
+                raise HTTPException(status_code=400,
+                                    detail="本地模型只允许保存设备模型来源标记")
+            s.model_name = ""
+        else:
+            if is_local_model_reference(raw_model):
+                raise HTTPException(status_code=400,
+                                    detail="本地模型不能写入 Hub 模型名称")
+            s.model_name = clean_schedule_model_reference(raw_model)[:300]
+        s.model_source = source
     # Enterprise workflow bindings remain retired from the ordinary-conversation
     # contract. Personal plugins run in the same chat through the local worker,
     # so preserve their verifiable snapshot when supplied by the editor.
@@ -164,11 +247,11 @@ def apply_schedule_update(s, body: dict) -> None:
         s.required_capabilities = sch.clean_required_capabilities(
             body.get("requiredCapabilities"))
     if "retryLimit" in body:
-        s.retry_limit = max(0, min(10, int(body.get("retryLimit") or 0)))
+        s.retry_limit = max(0, min(10, numbers["retryLimit"]))
     if "retryDelayMinutes" in body:
         s.retry_delay_minutes = max(
-            1, min(1440, int(body.get("retryDelayMinutes") or 5)))
-    if any(key in body for key in ("assigneeId", "modelName", "requiredCapabilities",
+            1, min(1440, numbers["retryDelayMinutes"]))
+    if any(key in body for key in ("assigneeId", "modelName", "modelSource", "requiredCapabilities",
                                    "personalPluginKey", "personalPluginVersionPolicy",
                                    "personalPluginVersion", "personalPluginChecksum")) and (
             not once_edit or before_execution != schedule_timing.execution_snapshot(s)):

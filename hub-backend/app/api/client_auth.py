@@ -203,8 +203,10 @@ async def login(body: ClientLogin,
         account = client_access.normalize_account(body.account)
         await email_auth.password_budget(session, account, client.id)
         user = await client_access.find_login_user(session, account)
-        if user is None or not verify_password(body.password, user.password_hash):
-            raise client_access.ClientAccessError("账号或密码不正确", code="ACCOUNT_OR_PASSWORD_INVALID", status=401)
+        if user is None:
+            raise client_access.ClientAccessError("未找到该账号，请检查输入是否正确。", code="ACCOUNT_NOT_FOUND", status=401)
+        if not verify_password(body.password, user.password_hash):
+            raise client_access.ClientAccessError("密码不正确，请重新输入。", code="PASSWORD_INCORRECT", status=401)
         return await complete_login(session, client, user, body)
     except client_access.ClientAccessError as exc:
         await session.rollback()
@@ -346,8 +348,9 @@ async def authorize_ai(response: Response, model: str = "", agent: str = "",
     response.headers["Cache-Control"] = "private, no-store"
     from ..services import model_catalog, model_quota
     conf = {}
-    if agent.strip().lower().removeprefix("local:") == "pi":
-        want = model.strip() or model_catalog.agent_model(client, "pi")
+    runtime = model_quota.managed_runtime(agent)
+    if runtime:
+        want = model.strip() or model_catalog.agent_model(client, runtime)
         conf = await model_catalog.resolve(session, client, want)
         if not conf:
             raise HTTPException(400, "所选模型不可用，请刷新模型列表后重试")
@@ -356,7 +359,7 @@ async def authorize_ai(response: Response, model: str = "", agent: str = "",
     platform = status.pop("platformQuota", status.copy())
     return {"ok": True, "quota": status, "platformQuota": platform,
             "quotaScope": conf.get("quotaScope", "platform"), "quotaVersion": model_quota.VERSION,
-            "personalQuotaSupported": agent.strip().lower().removeprefix("local:") == "pi",
+            "personalQuotaSupported": bool(runtime),
             "resolvedModel": conf.get("model", ""), "providerId": conf.get("provider", "")}
 
 

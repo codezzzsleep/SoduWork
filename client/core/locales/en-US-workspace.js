@@ -1,5 +1,6 @@
 (function (global) {
   const messages = {
+    '已选底座': 'Selected runtime',
     '这条旧会话缺少服务归属信息，原文件已保留，暂时无法读取': 'This legacy conversation lacks service ownership information. The original file is preserved but cannot be read yet.',
     '无法确认这条会话属于当前账号，请明确导入后再查看': 'This conversation cannot be verified as belonging to this account. Import an eligible legacy conversation explicitly to view a copy.',
     '无法确认这条会话属于当前账号或服务，请切回原连接': 'This conversation cannot be verified as belonging to the current account and service. Switch back to its original connection.',

@@ -10,10 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
 from ..db import get_session
-from ..deps import current_ai_client, authenticated_client, current_client, enforce_client_quota
+from ..deps import current_ai_client, authenticated_client, current_client, enforce_client_access, enforce_client_quota
 from ..models import Client, Task, User
 from ..realtime import hub
-from ..schemas import BatchUpdate, TaskCreate, TaskUpdate, task_to_api
+from ..schemas import BatchUpdate, TaskCreate, TaskSyncCreate, TaskUpdate, task_to_api
 from ..services import audit, task_access
 from ..services import task_access as _task_access
 from ..services import tasks as svc
@@ -22,6 +22,7 @@ from ..services.task_dispatch_context import (
     _attach_dev_flow, _attach_skills, _fill_repo_wire, _settle_work_dir,
     _aio_thread, _link_task_repo, _stale_runner_hint, _push_task,
 )
+from ..timestamps import iso_utc
 
 router = APIRouter(prefix="/api/v1", tags=["tasks"])
 log = logging.getLogger("uvicorn.error")
@@ -222,7 +223,7 @@ async def get_delivery_state(
         "blockers": truth.get("blockers") or [],
         "approvals": approvals,
         "outputContract": contract,
-        "reviewedAt": task.reviewed_at.isoformat() if task.reviewed_at else None,
+        "reviewedAt": iso_utc(task.reviewed_at) if task.reviewed_at else None,
         "engineering": {
             "projectId": getattr(task, "project_id", None),
             "repoId": str(getattr(task, "repo_id", "") or "").strip(),
@@ -237,7 +238,7 @@ async def get_delivery_state(
 
 @router.put("/tasks/{tid}")
 async def put_task(
-    tid: str, body: TaskCreate,
+    tid: str, body: TaskSyncCreate,
     client: Client = Depends(current_client), session: AsyncSession = Depends(get_session),
 ):
     """Create tasks idempotently using client-generated IDs so offline replay cannot create
@@ -568,7 +569,13 @@ async def conversation_task_turn(
     if task is None:
         raise HTTPException(404, "需求不存在或不属于当前设备")
     if str(body.get("action") or "prepare") not in {"complete", "fail", "wait", "cancel"}:
-        await enforce_client_quota(session, client)
+        if conversation_turns.receipt_model_source(task, body) == "device":
+            # This endpoint records an authenticated native queue receipt. It
+            # cannot issue model tickets or launch a remote executor; those
+            # independent entry points retain their model quota admission.
+            await enforce_client_access(session, client)
+        else:
+            await enforce_client_quota(session, client)
     actor = await _actor_user(session, client)
     receipt = await conversation_turns.apply(session, task, body, _actor_label(actor, client))
     await session.commit()
@@ -630,9 +637,13 @@ async def conversation_task_delivery(
         if categories:
             prepared_categories[name] = categories[index]
     try:
+        from ..services.model_reference_privacy import is_local_model_reference
+        # Legacy desktops may include a device-only reference on delivery receipts.
+        # Keep the deliverable while excluding that reference from Hub persistence.
+        provider = "" if is_local_model_reference(model) else model[:80]
         result = await conversation_turns.deliver_artifacts(
             session, task, conversation_id=conversation_id[:180],
-            turn_id=turn_id[:120], provider=model[:80], files=prepared,
+            turn_id=turn_id[:120], provider=provider, files=prepared,
             categories=prepared_categories,
             outcome=normalized_outcome)
     except HTTPException:
@@ -1416,8 +1427,6 @@ async def ai_session_task(
     limit: int = Query(default=400, ge=1, le=1000),
 ):
     """Behavior and constraints for this operation."""
-    import asyncio as _aio
-
     from ..services import ai_exec, execution_sessions
     if not isinstance(limit, int):
         limit = 400
@@ -1456,8 +1465,16 @@ async def ai_session_task(
             return {"ok": False, "items": [], "error": "这条需求还没交给 AI"}
         d = ev_row.detail or {}
         ref = d.get("ref") or d.get("issueId", "")
+        if not d.get("runnerId"):
+            from ..automation_models import ExecutionSession
+            from sqlalchemy import select
+            owner = await session.scalar(select(ExecutionSession).where(
+                ExecutionSession.task_id == tid, ExecutionSession.ref == ref))
+            if owner and owner.runner_id:
+                d = {**d, "runnerId": owner.runner_id}
     ctx = await ai_exec.load(session)
-    live = await _aio.to_thread(ai_exec.session_sync, ctx, ref, int(since or 0))
+    live = await ai_exec.read_session(ctx, ref, int(since or 0),
+        runner_id=str(d.get("runnerId") or ""), limit=limit)
     if live.get("ok"):
         # New Runners push events; older Runners and backend-local execution use read-through persistence during upgrades.
         await execution_sessions.ingest_live_snapshot(session, t, ref, live, d)
@@ -1913,7 +1930,7 @@ async def submit_task_for_review(
     """
     from ..services import release_control
     from ..services import task_requirements
-    from ..services import task_access
+    from ..services import task_notifications
     from ..services import task_events as ev
 
     # Serialize manual submission with execution starts and approval decisions.
@@ -1958,10 +1975,12 @@ async def submit_task_for_review(
         }, actor=who)
     ev.record(session, tid, "artifact.submitted_for_review",
               {"requestId": request.id, "versionId": artifact.id, "note": note}, actor=who)
+    # Commit the notification with the review, but deliver it outside this HTTP
+    # request. Slow devices must not turn an accepted submission into a timeout.
+    task_notifications.enqueue(session, task, "task.updated")
     await session.commit()
     await session.refresh(task)
     api = await svc.task_to_api_live(session, task)
-    await task_access.publish_task(session, task, "task.updated", api)
     return {"ok": True, "request": release_control.request_api(request), "task": api}
 
 

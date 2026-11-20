@@ -5,6 +5,7 @@
  * stop them with the client.
  */
 const { spawn } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
@@ -15,7 +16,10 @@ let _quitting = false;
 let _lastError = '';
 let _connectionState = 'stopped';
 let _lastConfig = '';
+let _processCredential = '';
 let _identityOf = null;
+let _sessionOf = null;
+let _canConnect = () => true;
 const _ownedRunners = new Map();
 const _runnerStops = new Set();
 const LOCAL_RPC_PREFIX = '@@SODUWORK_LOCAL_RPC@@';
@@ -30,7 +34,6 @@ const CONNECTION_ERRORS = Object.freeze({
 });
 const _rpcPending = new Map();
 let _rpcSeq = 0;
-let _stdoutRest = '';
 const CAPABILITY_KEYS = new Set(['browser', 'computer']);
 const CAPABILITY_GRANT_VERSION = 2;
 const DEFAULT_CAPABILITY_GRANTS = Object.freeze(['browser']);
@@ -235,6 +238,26 @@ function _stored(cfg) {
     capabilityGrants: cfg.capabilityGrants, dataRoot: cfg.dataRoot };
 }
 
+function _activationConfirmed(app, saved, id) {
+  if (!_canConnect(app, id.hub, id.clientId)) return false;
+  // Old configurations could be written before first login. Once Hub has issued
+  // a session for this device, it can also start offline on later desktop boots.
+  return (saved.activationConfirmed === true && saved.hub === id.hub && saved.clientId === id.clientId)
+    || !!_sessionOf(app, id.hub, id.clientId);
+}
+
+function _encodeConfig(cfg) {
+  return JSON.stringify({ ..._stored(cfg), activationConfirmed: true });
+}
+
+function _credentialFingerprint(cfg) {
+  // Credentials are injected only at spawn. Keep this comparison in memory:
+  // the persisted configuration deliberately excludes the device secret.
+  return crypto.createHash('sha256').update(JSON.stringify([
+    cfg.hub, cfg.clientId, cfg.secret,
+  ])).digest('hex');
+}
+
 function _spec(app) {
   if (app.isPackaged) {
     if (process.platform === 'win32') {
@@ -285,9 +308,10 @@ function _readConfig(app) {
     const raw = JSON.parse(encodedFile);
     const migrated = _migrateRaw(raw);
     const id = _identityOf ? _identityOf(app, raw.hub, raw.clientId) : null;
+    if (id && !_activationConfirmed(app, raw, id)) return null;
     const clean = _clean(migrated, path.join(_dir(app), 'data'), id);
     _prepareWorkRoot(clean.workRoot);
-    const encoded = JSON.stringify(_stored(clean));
+    const encoded = _encodeConfig(clean);
     /*
      * Persist configuration migrations before spawning Runner. Updating only memory can let it
      * register stale settings while later comparisons incorrectly suppress restart.
@@ -312,10 +336,7 @@ function _rejectRpc(message = 'Runner stopped') {
 let _mobileCapabilities = null;
 function setMobileCapabilities(handler) { _mobileCapabilities = handler; }
 
-function _consumeRunnerOutput(chunk, logPath, child = _proc) {
-  _stdoutRest += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk || '');
-  const lines = _stdoutRest.split(/\r?\n/);
-  _stdoutRest = lines.pop() || '';
+function _consumeRunnerLines(lines, logPath, child) {
   const logLines = [];
   lines.forEach((line) => {
     if (line.startsWith(STATUS_PREFIX)) {
@@ -403,9 +424,9 @@ function _retire(child) {
 function _stop() {
   if (_restartTimer) { clearTimeout(_restartTimer); _restartTimer = null; }
   _rejectRpc('Runner stopped');
-  _stdoutRest = '';
   const p = _proc;
   _proc = null;
+  _processCredential = '';
   _connectionState = 'stopped';
   return _retire(p);
 }
@@ -450,13 +471,20 @@ function _start(app) {
       env: _runnerEnv(process.env, cfg.secret, app),
     });
     _proc = child;
+    _processCredential = _credentialFingerprint(cfg);
     if (Number.isInteger(child.pid)) {
       _ownedRunners.set(child, require('./runner-process-lifecycle.cjs').supervise(child));
     }
     _connectionState = 'connecting';
-    if (child.stdout) child.stdout.on('data', (chunk) => {
-      if (_proc === child) _consumeRunnerOutput(chunk, logPath);
-    });
+    if (child.stdout) {
+      let remainder = '';
+      child.stdout.setEncoding('utf8').on('data', (text) => {
+        if (_proc !== child) return;
+        const lines = (remainder + text).split(/\r?\n/);
+        remainder = lines.pop();
+        _consumeRunnerLines(lines, logPath, child);
+      });
+    }
     if (child.stdin) child.stdin.on('error', (error) => {
       if (_proc === child) _rejectRpc(error);
     });
@@ -469,8 +497,8 @@ function _start(app) {
       _lastError = String(e && e.message || e);
       _connectionState = 'error';
       _proc = null;
+      _processCredential = '';
       _rejectRpc(e);
-      _stdoutRest = '';
       _schedule(app);
     });
     child.once('exit', (code) => {
@@ -479,14 +507,15 @@ function _start(app) {
       // child's late exit must not erase or duplicate that new runner.
       if (_proc !== child) return;
       _proc = null;
+      _processCredential = '';
       _connectionState = 'error';
       if (!_lastError) _lastError = '本机 Runner 已退出（' + String(code ?? '未知') + '），正在自动重启。';
       _rejectRpc('Runner exited');
-      _stdoutRest = '';
       _schedule(app);
     });
   } catch (e) {
     _proc = null;
+    _processCredential = '';
     _lastError = String(e && e.message || e);
     _schedule(app);
   } finally {
@@ -514,15 +543,19 @@ function pauseForHubChange() {
 
 function _applyConfig(app, raw) {
   try {
-    const merged = _mergeRaw(_migrateRaw(_rawConfig(app)), raw);
+    const saved = _rawConfig(app);
+    const merged = _mergeRaw(_migrateRaw(saved), raw);
     const id = _identityOf
       ? _identityOf(app, merged && merged.hub, merged && merged.clientId) : null;
+    if (id && !_activationConfirmed(app, saved, id)) {
+      return { ok: false, running: false, error: '请先登录以激活本机 Runner。' };
+    }
     const cfg = _clean(merged, path.join(_dir(app), 'data'), id);
     _prepareWorkRoot(cfg.workRoot);
-    const encoded = JSON.stringify(_stored(cfg));
+    const encoded = _encodeConfig(cfg);
     _writeConfig(app, encoded);
     _wanted = true;
-    if (encoded !== _lastConfig) {
+    if (encoded !== _lastConfig || (_proc && _processCredential !== _credentialFingerprint(cfg))) {
       _lastConfig = encoded;
       _stop();
     }
@@ -540,8 +573,10 @@ function _applyConfig(app, raw) {
   }
 }
 
-function install({ app, ipcMain, identityOf }) {
+function install({ app, ipcMain, identityOf, sessionOf, canConnect }) {
+  _canConnect = canConnect || (() => true);
   _identityOf = identityOf || null;
+  _sessionOf = sessionOf;
   ipcMain.handle('runner-configure', async (_event, raw) => _applyConfig(app, raw || {}));
   ipcMain.handle('runner-capability-set', async (event, rawKey, enabled) => {
     const key = String(rawKey || '').trim().toLowerCase();
@@ -604,7 +639,7 @@ function install({ app, ipcMain, identityOf }) {
   app.whenReady().then(() => {
     const cfg = _readConfig(app);
     if (cfg) {
-      _lastConfig = JSON.stringify(_stored(cfg));
+      _lastConfig = _encodeConfig(cfg);
       _wanted = true;
       _start(app);
     }

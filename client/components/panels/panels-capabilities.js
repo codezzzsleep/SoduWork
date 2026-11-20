@@ -474,6 +474,7 @@
       openMcpEditor: openMcpEditor,
       mcpCatalog: function () { return mcp; },
       openModal: openModal, closeModal: closeModal, say: say, errorText: errorText,
+      openSkillImport: (file, preview) => capabilityEditors().openImportPreview(file, preview),
       refresh: function () { render(); },
       clearSearch: function () {
         query = ''; const search = document.getElementById('capSearch');
@@ -646,10 +647,12 @@
     content._skillShape = shape;
     content.innerHTML =
       '<section class="cap-section cap-skill-section">' +
+        '<button type="button" class="cap-skill-help" id="capSkillHelp" aria-haspopup="dialog">如何获得技能？</button>' +
         sectionTitle('可用技能', '开启后自动保存，并在下一次任务生效', visible.length) +
         (visible.length ? '<div class="cap-grid">' + visible.map(skillCard).join('') + '</div>'
           : empty('没有匹配的 Skill', '可以创建个人 Skill，或让管理员导入公司工作方法。')) +
       '</section>';
+    content.querySelector?.('#capSkillHelp')?.addEventListener('click', openSkillSources);
     content.querySelectorAll('[data-skill]').forEach(function (card) {
       card.addEventListener('click', function () {
         const name = card.getAttribute('data-skill');
@@ -667,6 +670,33 @@
     });
     content.querySelectorAll('[data-remove-skill]').forEach(button => {
       button.onclick = () => capabilityEditors().openDeleteSkill(button.dataset.removeSkill);
+    });
+  }
+
+  // 中文：在技能列表就近提供获取入口；固定推荐地址通过系统桥接打开，避免站点替换工作区页面。
+  // English: Offer discovery beside the skill list; open fixed destinations through the OS bridge to preserve the workspace.
+  function openSkillSources() {
+    const sources = [
+      { name: 'Anthropic Skills', url: 'https://github.com/anthropics/skills/tree/main/skills', description: '浏览 Anthropic 的公开技能示例。' },
+      { name: 'SkillsMP', url: 'https://skillsmp.com/', description: '搜索社区分享的技能与工作方法。' },
+    ];
+    const layer = openModal('如何获得技能？', '发现适合你的技能与工作方法',
+      '<div class="cap-skill-sources">' + sources.map((item, index) =>
+        '<a class="cap-skill-source" href="' + h(item.url) + '" data-skill-source="' + index + '"><b>' + h(item.name) +
+        ' ↗</b><span>' + h(item.description) + '</span><small>' + h(item.url) + '</small></a>').join('') +
+      '</div><p>找到技能后，可通过“添加技能”导入。</p>',
+      '<button type="button" class="btn-mini" id="capSkillSourcesClose">关闭</button>');
+    layer.querySelector('#capSkillSourcesClose').onclick = closeModal;
+    layer.querySelectorAll('[data-skill-source]').forEach(link => {
+      link.addEventListener('click', async event => {
+        event.preventDefault();
+        try {
+          const open = window.soduWorkAPI?.openExternal;
+          if (!open) throw new Error('无法打开浏览器，请稍后重试。');
+          const result = await open(sources[Number(link.dataset.skillSource)].url);
+          if (result === false || result?.ok === false) throw new Error('无法打开浏览器，请稍后重试。');
+        } catch (error) { say(errorText(error, '无法打开浏览器，请稍后重试。')); }
+      });
     });
   }
 

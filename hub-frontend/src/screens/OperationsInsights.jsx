@@ -19,7 +19,7 @@ import './operations-insights.css'
 const CATEGORY = localeMap(() => ({
   dev: '研发与交付', office: '办公文稿', research: '信息与研究', errand: '日常零活',
 }))
-const AGENT_NAME = { pi: 'Pi', opencode: 'OpenCode', claude: 'Claude Code', codex: 'Codex', qwen: 'Qwen', dsh: 'DSH' }
+const AGENT_NAME = { pi: 'Pi', opencode: 'OpenCode', codex: 'Codex', qwen: 'Qwen', dsh: 'DSH' }
 
 const dayLabel = (iso) => {
   if (!iso) return '—'
@@ -321,7 +321,7 @@ export default function OperationsInsights() {
             value={item.installed} unit={tx("台")}
             sub={hasAuth ? <>{tx("已登录 ")}<em className="ok">{item.authed}</em>{item.unauthed > 0 && <>{tx(" · 待登录 ")}<em className="warn">{item.unauthed}</em></>}{unknown > 0 && tx(" · 待上报 {0}", [unknown])}</> : tx("已安装")} />
         })}
-        <p className="oi-note"><Icon name="shield" />{tx("Codex / Claude Code 需在对应电脑上完成账号登录。")}</p>
+        <p className="oi-note"><Icon name="shield" />{tx("Codex 需在对应电脑上完成账号登录。")}</p>
       </div>
     </section>
     </div>

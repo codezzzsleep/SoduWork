@@ -48,6 +48,7 @@
     get _cancel() { return _cancel; },
     get _stopState() { return _stopState; },
     get _sendState() { return _sendState; },
+    get _sendPreflight() { return _sendPreflight; }, set _sendPreflight(value) { _sendPreflight = value; },
     get _beginSendState() { return _beginSendState; },
     get _finishSendState() { return _finishSendState; },
     get _mode() { return _mode; }, set _mode(value) { _mode = value; },
@@ -193,6 +194,7 @@
   let _stopState = 'idle';  // idle | requested | timeout; scoped to the active turn.
   let _sendState = 'idle';  // idle | sending; scoped to the current submission.
   let _sendStateToken = 0;
+  let _sendPreflight = null;
   let _stopTimer = null;
   let _stopRequestToken = 0;
   let _stopReceiptAcknowledged = false;
@@ -493,7 +495,7 @@
   }
   function _stopCapable() {
     const execution = _snap?.execution || {}, phase = execution.quality?.phase || '';
-    return _snap?.status === 'streaming' || execution.running === true ||
+    return ['streaming', 'queued'].includes(_snap?.status) || execution.running === true ||
       ['executing', 'implementing', 'reviewing', 'repairing'].includes(phase);
   }
   function _paintActionState() {
@@ -507,6 +509,14 @@
     root.dataset.sendState = _sendState;
     if (global.ChatTools && typeof ChatTools.paintSendButton === 'function') {
       ChatTools.paintSendButton(root, _runtimeBusy(), _messageAttachments, _stopState, _stopCapable(), _sendState);
+    }
+    if ((_snap?.modelSelection?.model || _model)?.unavailable && !_stopCapable()) {
+      const send = root.querySelector('#nchatSend');
+      if (send) {
+        send.disabled = true;
+        send.title = '暂无可用模型，请检查模型配置后重试';
+        send.setAttribute('aria-label', send.title);
+      }
     }
   }
   function _paintStopState() { _paintActionState(); }
@@ -842,6 +852,7 @@
     _stopRequestToken += 1;
     _sendStateToken += 1;
     _sendState = 'idle';
+    _sendPreflight = null;
     _clearStopTimer();
     _stopState = 'idle';
     _stopReceiptAcknowledged = false;
