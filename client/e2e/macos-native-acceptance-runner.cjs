@@ -51,7 +51,7 @@ async function availablePort() {
   const port = listener.address().port;
   await new Promise(resolve => listener.close(resolve)); return port;
 }
-let server, mounted;
+let server, mounted, productionModules;
 (async () => {
   await stage('locked-client-dependencies', async () => {
     const pnpmArchive = path.join(temporary, 'pnpm.tgz');
@@ -71,6 +71,20 @@ let server, mounted;
     run(process.execPath, [path.join(client, 'node_modules/electron/install.js')]);
     run(process.execPath, [path.join(client, 'scripts/patch-pi-extension-cache.cjs')]);
     run(process.execPath, [path.join(client, 'scripts/patch-pi-retry-schedule.cjs')]);
+    // The public installer helper enforces npm's historical physical layout.
+    // Keep that helper and lockfile unchanged; this diagnostic bundle instead
+    // uses pnpm's production installation, with every version checked below.
+    const production = path.join(temporary, 'production'); fs.mkdirSync(production);
+    for (const name of ['package.json', 'package-lock.json', 'pnpm-lock.yaml'])
+      fs.copyFileSync(path.join(dependencies, name), path.join(production, name));
+    run(process.execPath, [cli, 'install', '--prod', '--frozen-lockfile', '--ignore-scripts', '--config.node-linker=hoisted'],
+      { ...config, cwd: production });
+    productionModules = path.join(production, 'node_modules');
+    for (const name of ['patch-pi-extension-cache.cjs', 'patch-pi-retry-schedule.cjs']) {
+      const method = name.includes('extension-cache') ? 'patchPiExtensionCache' : 'patchPiRetrySchedule';
+      const patched = require(path.join(client, 'scripts', name))[method]({ root: production });
+      assert.equal(patched.ok, true, 'Production SDK preparation failed');
+    }
   });
   const python = await stage('isolated-backend-and-runner-build-interpreter', async () => {
     const directory = path.join(repository, 'hub-backend/.venv');
@@ -108,7 +122,7 @@ let server, mounted;
   });
   const installer = await stage('build-and-mount-native-diagnostic-dmg', async () => {
     const configuration = path.join(temporary, 'native-build.cjs');
-    fs.writeFileSync(configuration, `'use strict';\nconst base=require(${JSON.stringify(path.join(client, 'scripts/public-build-config.cjs'))});\nmodule.exports={...base,npmRebuild:false,files:[...base.files,'e2e/macos-native-client-worker.cjs','e2e/fixtures/full-client-isolation.cjs'],extraMetadata:{...base.extraMetadata,main:'e2e/macos-native-client-worker.cjs'},directories:{...base.directories,output:${JSON.stringify(path.join(output, 'packages'))}}};\n`);
+    fs.writeFileSync(configuration, `'use strict';\nconst create=require(${JSON.stringify(path.join(client, 'e2e/macos-native-pack-config.cjs'))});\nmodule.exports=create(${JSON.stringify({ repository, output, productionModules })});\n`);
     const environment = { ...process.env, SODUWORK_MACOS_ARCH: 'arm64', SODUWORK_MACOS_ARM64_PYTHON: python,
       SODUWORK_INTERNAL_BUILD: '1', SODUWORK_MAC_RELEASE: '0', CSC_IDENTITY_AUTO_DISCOVERY: 'false',
       SODUWORK_PYTHON_MIRROR: '', SODUWORK_NODE_MIRROR: '' };
@@ -125,7 +139,9 @@ let server, mounted;
     const app = path.join(mounted, 'SoduWork.app'); assert.ok(fs.existsSync(app));
     run('codesign', ['--verify', '--deep', '--strict', app]);
     report.installer = { filename: file, nativeDmgMounted: true, codeSignatureVerified: true,
-      diagnosticMain: true, developerIdNotarized: false, currentSourceRuntimeBuild: true }; flush();
+      diagnosticMain: true, developerIdNotarized: false, currentSourceRuntimeBuild: true,
+      dependencyPackaging: 'pnpm diagnostic layout; installed versions checked against committed lockfile',
+      officialBeforePackAcceptance: false }; flush();
     return { app, evidence: report.installer };
   });
   await stage('native-finder-dock-live-model-and-profile-acceptance', async () => {

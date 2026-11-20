@@ -10,7 +10,7 @@ const http = require('node:http');
 const crypto = require('node:crypto');
 const electron = require('electron');
 const { app, BrowserWindow, safeStorage } = electron;
-const rootIndex = process.argv.indexOf('--sodu-native-root');
+const rootIndex = process.argv.indexOf('--soduwork-native-root');
 const binding = path.join(path.resolve(path.dirname(process.execPath), '../../..'), 'native-root.txt');
 const root = rootIndex >= 0 ? process.argv[rootIndex + 1] :
   fs.existsSync(binding) ? fs.readFileSync(binding, 'utf8').trim() : '';
@@ -76,11 +76,17 @@ app.on('before-quit', () => record('before-quit', { quitting }));
 app.on('will-quit', () => record('will-quit', { quitting }));
 app.on('quit', () => record('quit', { quitting }));
 const originalHandle = electron.ipcMain.handle.bind(electron.ipcMain);
-electron.ipcMain.handle = (name, handler) => originalHandle(name, name === 'file-open-claim' ? async (...args) => {
-  const answer = await handler(...args);
-  if (answer?.ok) record('file-claim', { name: answer.file?.name, id: answer.id });
-  return answer;
-} : handler);
+const claimNames = new Map();
+electron.ipcMain.handle = (name, handler) => originalHandle(name,
+  name === 'file-open-claim' ? async (...args) => {
+    const answer = await handler(...args);
+    if (answer?.ok) { claimNames.set(answer.id, answer.file?.name); record('file-claim', { name: answer.file?.name, id: answer.id }); }
+    return answer;
+  } : name === 'file-open-ack' ? (...args) => {
+    const answer = handler(...args);
+    if (answer?.ok) record('file-ack', { name: claimNames.get(args[1]), id: args[1] });
+    return answer;
+  } : handler);
 const originalFork = electron.utilityProcess.fork.bind(electron.utilityProcess);
 electron.utilityProcess.fork = (...args) => {
   const child = originalFork(...args);
@@ -97,20 +103,6 @@ app.on('browser-window-created', (_event, candidate) => {
       window = candidate;
       record('workspace-loaded');
       candidate.setSize(1000, 700);
-      // Record file-open deliveries without replacing the real workspace call.
-      void candidate.webContents.executeJavaScript(`(() => {
-        const install = () => {
-          if (!window.WorkspaceHost || window.__nativeDeliveryObserver) return false;
-          window.__nativeDeliveryObserver = true; window.__nativeFileDeliveries = [];
-          const original = WorkspaceHost.open;
-          WorkspaceHost.open = function(view, options, ...rest) {
-            if (options?.fileOpen) window.__nativeFileDeliveries.push({name:options.fileOpen.file?.name,id:options.fileOpen.id});
-            return original.call(this, view, options, ...rest);
-          };
-          return true;
-        };
-        if (!install()) { const timer=setInterval(()=>{if(install())clearInterval(timer)},20); setTimeout(()=>clearInterval(timer),30000); }
-      })()`).catch(error => record('observer-error', { message: error.message }));
     }
   });
 });

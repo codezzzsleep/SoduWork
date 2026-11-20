@@ -197,7 +197,7 @@ async function armDelivery(root, app, kind, files) {
     fs.writeFileSync(path.join(root,'native-input.json'),JSON.stringify({workspace,hub:hub.url,controlKey:crypto.randomBytes(24).toString('hex')}));
     const row={kind,root,ok:false,startedAt:Date.now()}; report.cases.push(row);flush();
     try{
-      await execute('open',['-n','-a',app,'--args','--sodu-native-root',root,'--soduwork-open-file',earlier],{timeout:15000});
+      await execute('open',['-n','-a',app,'--args','--soduwork-native-root',root,'--soduwork-open-file',earlier],{timeout:15000});
       await until(()=>fs.existsSync(path.join(root,'worker-control.json')),'installed client control');
       await login(root,hub,'native-'+nonce+'@example.test',crypto.randomBytes(18).toString('base64url'));
       const initial=await rpc(root,'status');row.oldPid=initial.pid;assert.equal(initial.packaged,true);assert.equal(initial.encryptionAvailable,true);
@@ -209,7 +209,7 @@ async function armDelivery(root, app, kind, files) {
       if(kind==='cancel'){
         await nativeButton(initial.pid,dialog.cancelLabel);
         await nativeFiles([filePaths[0]],app);await nativeDock();
-        await until(()=>eventRows(root).some(e=>e.event==='file-claim'&&e.name===path.basename(filePaths[0])),'file delivery after cancellation');
+        await until(()=>eventRows(root).some(e=>e.event==='file-ack'&&e.name===path.basename(filePaths[0])),'workspace file delivery after cancellation');
         const current=await rpc(root,'status');assert.equal(current.pid,initial.pid);assert.equal(current.quitting,false);
         assert.ok(!eventRows(root).some(e=>e.event==='confirmed-quit'||e.event==='relaunch'));
         row.modelStillRunningAfterCancellation = report.modelRequests.some(e => e.acceptanceTask && e.active && e.streamCharacters > 0);
@@ -246,6 +246,10 @@ async function armDelivery(root, app, kind, files) {
         await until(()=>eventRows(root).filter(e=>e.pid===row.newPid&&e.event==='file-claim').length>=expected.length,'fresh native file claims',60000);
         const claims=eventRows(root).filter(e=>e.pid===row.newPid&&e.event==='file-claim');
         assert.deepEqual(claims.map(e=>e.name).sort(),expected.map(e=>path.basename(e)).sort());
+        await until(()=>eventRows(root).filter(e=>e.pid===row.newPid&&e.event==='file-ack').length>=expected.length,
+          'successful real workspace opens acknowledged',60000);
+        const acknowledgements=eventRows(root).filter(e=>e.pid===row.newPid&&e.event==='file-ack');
+        assert.deepEqual(acknowledgements.map(e=>e.name).sort(),expected.map(e=>path.basename(e)).sort());
         await until(() => js(root, `ClientAuth.snapshot().state==='active'&&ClientAuth.snapshot().user?.email===${literal('native-'+nonce+'@example.test')}`), 'existing authenticated profile after relaunch');
         const persisted = await js(root, 'soduWorkAPI.localModels.get()');
         assert.ok(persisted.myModels.some(model => model.id === inferenceSession.modelRef), 'Encrypted local model reference did not survive relaunch');
