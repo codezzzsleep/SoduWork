@@ -2110,8 +2110,21 @@ if sys.platform == "darwin" and os.environ.get("GITHUB_ACTIONS") == "true":
             repository = Path(__file__).resolve().parents[2]
             node = shutil.which("node")
             self.assertIsNotNone(node, "macOS probe requires the workflow Node runtime")
-            output = repository / "macos-native-evidence" / "environment.json"
+            output = Path(tempfile.mkdtemp(prefix="soduwork-macos-evidence-")) / "environment.json"
             result = subprocess.run([node, str(repository / "client/e2e/macos-desktop-probe.cjs"), str(output)],
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=150)
             print(result.stdout, flush=True)
             self.assertEqual(result.returncode, 0, "Native macOS environment probe did not execute")
+
+        def test_installed_native_reopen_with_actual_local_inference(self):
+            import shutil
+            import subprocess
+            repository = Path(__file__).resolve().parents[2]
+            node = shutil.which("node")
+            self.assertIsNotNone(node, "Native acceptance requires the workflow Node runtime")
+            output = Path(tempfile.mkdtemp(prefix="soduwork-macos-native-acceptance-"))
+            environment = dict(os.environ, SODUWORK_NATIVE_PYTHON=sys.executable)
+            result = subprocess.run([node, str(repository / "client/e2e/macos-native-acceptance-runner.cjs"), str(output)],
+                env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1500)
+            print(result.stdout, flush=True)
+            self.assertEqual(result.returncode, 0, "Actual macOS native reopen acceptance failed; inspect recorded stage/case evidence")
