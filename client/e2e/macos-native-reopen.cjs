@@ -275,8 +275,14 @@ async function armDelivery(root, app, kind, files) {
   }
   report.ok=true;
 })().catch(error=>{report.errors.push(String(error.stack||error));process.exitCode=1;}).finally(()=>{
-  proxy.closeAllConnections();proxy.close();flush();console.log('MACOS_NATIVE_ACCEPTANCE_JSON='+JSON.stringify(report));
+  proxy.closeAllConnections();proxy.close();flush();
+  const summary = { ...report, cases: report.cases.map(({ events, nativeEvents, ...value }) => value) };
+  console.log('MACOS_NATIVE_ACCEPTANCE_JSON='+JSON.stringify(summary));
+  for (const row of report.cases) console.log('MACOS_NATIVE_CASE_REPORT_JSON='+JSON.stringify(row));
   for (const shot of report.screenshots) {
-    console.log('MACOS_NATIVE_SCREENSHOT_JSON='+JSON.stringify({kind:shot.kind,name:shot.name,data:fs.readFileSync(path.join(output,shot.file)).toString('base64')}));
+    const data = fs.readFileSync(path.join(output,shot.file)).toString('base64');
+    const total = Math.ceil(data.length / 12000);
+    for (let index = 0; index < total; index++)
+      console.log('MACOS_NATIVE_SCREENSHOT_CHUNK_JSON='+JSON.stringify({kind:shot.kind,name:shot.name,index,total,data:data.slice(index*12000,(index+1)*12000)}));
   }
 });

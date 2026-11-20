@@ -28,13 +28,16 @@ module.exports = function create({ repository, output, productionModules }) {
       require(path.join(client, 'scripts/client-build-version.cjs')).prepareVersionFile(context);
       await require(path.join(client, 'scripts/prepare-client-runtime.cjs'))(context);
       const lock = JSON.parse(fs.readFileSync(path.join(client, 'package-lock.json'), 'utf8'));
-      const versions = new Set(Object.entries(lock.packages).filter(([name, pkg]) => name && !pkg.dev)
+      const versions = new Set(Object.entries(lock.packages).filter(([name]) => name)
+        .map(([name, pkg]) => (pkg.name || name.slice(name.lastIndexOf('node_modules/') + 13)) + '@' + pkg.version));
+      const productionVersions = new Set(Object.entries(lock.packages).filter(([name, pkg]) => name && !pkg.dev)
         .map(([name, pkg]) => (pkg.name || name.slice(name.lastIndexOf('node_modules/') + 13)) + '@' + pkg.version));
       const directories = compliance.packages(productionModules);
       const installed = directories.map(directory => {
         const pkg = JSON.parse(fs.readFileSync(path.join(directory, 'package.json'), 'utf8'));
         assert.ok(versions.has(pkg.name + '@' + pkg.version), 'Unpinned diagnostic runtime dependency: ' + pkg.name + '@' + pkg.version);
-        return { name: pkg.name, version: pkg.version };
+        return { name: pkg.name, version: pkg.version,
+          npmLockDevOnly: !productionVersions.has(pkg.name + '@' + pkg.version) };
       });
       assert.ok(installed.some(row => row.name === '@earendil-works/pi-coding-agent' && row.version === '1.4.0'));
       const manifest = JSON.parse(fs.readFileSync(path.join(repository, 'third-party/manifest.json'), 'utf8'));

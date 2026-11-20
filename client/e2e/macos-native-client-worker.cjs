@@ -51,6 +51,9 @@ const events = path.join(root, 'native-events.jsonl');
 const record = (event, value = {}) => fs.appendFileSync(events, JSON.stringify({
   event, at: Date.now(), pid: process.pid, ...value,
 }) + '\n');
+process.on('uncaughtExceptionMonitor', error => record('uncaught-exception', {
+  message: String(error.message).slice(0, 2000), stack: String(error.stack).slice(0, 6000),
+}));
 let quitting = false;
 record('process-start', { packaged: app.isPackaged, files: require('../main/file-open.cjs').commandFiles(process.argv, root, app.isPackaged) });
 const quitModule = require('../main/quit-relaunch.cjs');

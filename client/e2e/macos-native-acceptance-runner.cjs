@@ -21,11 +21,15 @@ const report = { ok: false, source: process.env.GITHUB_SHA, platform: process.pl
   macOS: execFileSync('sw_vers', ['-productVersion'], { encoding: 'utf8' }).trim(),
   paidServices: false, notarizedReleaseInstaller: false, diagnosticEntry: true, stages: [], errors: [] };
 function flush() { fs.writeFileSync(path.join(output, 'setup.json'), JSON.stringify(report, null, 2)); }
+function notice(value) {
+  const text = JSON.stringify(value).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+  console.log('::notice title=macOS native acceptance::' + text);
+}
 async function stage(name, action) {
   const item = { name, startedAt: new Date().toISOString(), ok: false }; report.stages.push(item); flush();
   console.log('MACOS_NATIVE_STAGE=' + JSON.stringify(item));
-  try { const result = await action(); item.ok = true; item.completedAt = new Date().toISOString(); flush(); return result; }
-  catch (error) { item.error = String(error.message); flush(); throw error; }
+  try { const result = await action(); item.ok = true; item.completedAt = new Date().toISOString(); flush(); notice(item); return result; }
+  catch (error) { item.error = String(error.message); flush(); notice(item); throw error; }
 }
 function run(executable, args, options = {}) {
   return execFileSync(executable, args, { cwd: repository, stdio: 'inherit', timeout: 12 * 60 * 1000, ...options });
