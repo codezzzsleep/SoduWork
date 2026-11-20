@@ -2123,7 +2123,7 @@ if sys.platform == "darwin" and os.environ.get("GITHUB_ACTIONS") == "true":
             node = shutil.which("node")
             self.assertIsNotNone(node, "Native acceptance requires the workflow Node runtime")
             output = Path(tempfile.mkdtemp(prefix="soduwork-macos-native-acceptance-"))
-            environment = dict(os.environ, SODUWORK_NATIVE_PYTHON=sys.executable)
+            environment = dict(os.environ, SODUWORK_NATIVE_PYTHON=sys.executable, SODUWORK_NATIVE_CASES="budget")
             result = subprocess.run([node, str(repository / "client/e2e/macos-native-acceptance-runner.cjs"), str(output)],
                 env=environment, text=True, stderr=subprocess.STDOUT, timeout=1700)
             self.assertEqual(result.returncode, 0, "Actual macOS native reopen acceptance failed; inspect recorded stage/case evidence")

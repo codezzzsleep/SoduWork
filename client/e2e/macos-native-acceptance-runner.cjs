@@ -139,8 +139,21 @@ let server, mounted;
     const specification = path.join(output, 'input.json');
     fs.writeFileSync(specification, JSON.stringify({ output, repository, python, app: installer.app,
       source: report.source, macOS: report.macOS, model: model.evidence, modelURL: model.modelURL,
-      installer: installer.evidence }));
-    run(process.execPath, [path.join(client, 'e2e/macos-native-reopen.cjs'), specification], { timeout: 18 * 60 * 1000 });
+      installer: installer.evidence,
+      ...(process.env.SODUWORK_NATIVE_CASES ? { cases: process.env.SODUWORK_NATIVE_CASES.split(',') } : {}) }));
+    try {
+      run(process.execPath, [path.join(client, 'e2e/macos-native-reopen.cjs'), specification], { timeout: 18 * 60 * 1000 });
+    } catch (error) {
+      // A timeout can terminate the worker before its final logger runs. Keep
+      // the durable partial report, including failures and unfinished cases.
+      const result = path.join(output, 'acceptance.json');
+      if (fs.existsSync(result)) {
+        const partial = JSON.parse(fs.readFileSync(result, 'utf8'));
+        partial.interrupted = true;
+        console.log('MACOS_NATIVE_ACCEPTANCE_JSON=' + JSON.stringify(partial));
+      }
+      throw error;
+    }
     assert.equal(JSON.parse(fs.readFileSync(path.join(output, 'acceptance.json'))).ok, true);
   });
   report.ok = true;

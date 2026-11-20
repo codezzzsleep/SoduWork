@@ -15,11 +15,15 @@ const execute = promisify(execFile);
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 if (process.platform !== 'darwin') throw Error('Actual macOS is required');
 const input = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const plannedCases = input.cases || ['cancel', 'finder', 'dock', 'mixed', 'budget'];
+assert.ok(Array.isArray(plannedCases) && plannedCases.length &&
+  new Set(plannedCases).size === plannedCases.length && plannedCases.every(kind =>
+    ['cancel', 'finder', 'dock', 'mixed', 'budget'].includes(kind)), 'Unknown or duplicate native acceptance case');
 const output = input.output;
 fs.mkdirSync(output, { recursive: true });
 const report = { ok: false, scope: 'Installed diagnostic bundle and production client; native UI/OS events; real local Qwen inference',
   source: input.source, model: input.model, macOS: input.macOS, architecture: process.arch,
-  notarizedReleaseInstaller: false, installer: input.installer, cases: [], modelRequests: [], errors: [], screenshots: [], platformPermissions: [] };
+  notarizedReleaseInstaller: false, installer: input.installer, plannedCases, cases: [], modelRequests: [], errors: [], screenshots: [], platformPermissions: [] };
 const flush = () => fs.writeFileSync(path.join(output, 'acceptance.json'), JSON.stringify(report, null, 2));
 let nonce = '';
 const proxy = http.createServer((request, response) => {
@@ -206,7 +210,7 @@ async function armDelivery(root, app, kind, files) {
 (async()=>{
   await new Promise(resolve=>proxy.listen(0,'127.0.0.1',resolve));
   const providerURL='http://127.0.0.1:'+proxy.address().port;
-  for(const kind of ['cancel','finder','dock','mixed','budget']){
+  for(const kind of plannedCases){
     const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'soduwork-account-five-native-')));
     const workspace=path.join(root,'workspace'); fs.mkdirSync(workspace);
     const applications=path.join(root,'Applications'); fs.mkdirSync(applications);
