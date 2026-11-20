@@ -94,16 +94,7 @@ async function screenshot(root, kind, name, native = false) {
   report.screenshots.push({ kind, name, file: path.basename(target) });
   flush();
 }
-function networkPermissionScript(press) {
-  return 'tell application "System Events"\nrepeat with p in processes\n' +
-    'set targetName to name of p\nif visible of p or targetName is "UserNotificationCenter" or targetName is "CoreServicesUIAgent" or targetName is "SystemUIServer" then\n' +
-    'try\nrepeat with w in windows of p\nset elements to entire contents of w\nset wording to ""\n' +
-    'repeat with item in elements\ntry\nif role of item is "AXStaticText" then set wording to wording & " " & (value of item as text)\nend try\nend repeat\n' +
-    'if wording contains "local networks" and (wording contains "Python" or wording contains "SoduWork") then\n' +
-    'repeat with item in elements\ntry\nif role of item is "AXButton" and name of item is "Allow" then\n' +
-    (press ? 'perform action "AXPress" of item\nreturn "allowed isolated test local network access"\n' : 'return "expected local network prompt"\n') +
-    'end if\nend try\nend repeat\nend if\nend repeat\nend try\nend if\nend repeat\nreturn ""\nend tell';
-}
+const { networkPermissionScript } = require('./macos-native-system-dialog.cjs');
 async function approveTestNetworkPermission(root, phase) {
   const found = await apple(networkPermissionScript(false), 8000);
   if (!found) return false;

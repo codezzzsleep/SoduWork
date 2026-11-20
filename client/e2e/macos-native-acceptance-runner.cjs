@@ -57,6 +57,11 @@ async function availablePort() {
 }
 let server, mounted;
 (async () => {
+  await stage('native-ui-automation-compilation', () => {
+    const scripts = require('./macos-native-system-dialog.cjs');
+    for (const press of [false, true])
+      run('osacompile', ['-o', path.join(temporary, 'network-' + press + '.scpt'), '-e', scripts.networkPermissionScript(press)], { timeout: 15000 });
+  });
   await stage('locked-client-dependencies', async () => {
     assert.ok(!fs.existsSync(path.join(client, 'node_modules')), 'Refusing to replace existing dependencies');
     // Use this repository's documented package manager and lockfile to preserve
