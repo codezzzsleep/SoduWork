@@ -135,7 +135,7 @@ let server, mounted;
     fs.writeFileSync(specification, JSON.stringify({ output, repository, python, app: installer.app,
       source: report.source, macOS: report.macOS, model: model.evidence, modelURL: model.modelURL,
       installer: installer.evidence }));
-    run(process.execPath, [path.join(client, 'e2e/macos-native-reopen.cjs'), specification], { timeout: 15 * 60 * 1000 });
+    run(process.execPath, [path.join(client, 'e2e/macos-native-reopen.cjs'), specification], { timeout: 18 * 60 * 1000 });
     assert.equal(JSON.parse(fs.readFileSync(path.join(output, 'acceptance.json'))).ok, true);
   });
   report.ok = true;

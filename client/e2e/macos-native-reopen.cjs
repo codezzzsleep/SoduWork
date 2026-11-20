@@ -75,7 +75,7 @@ async function nativeFiles(files, app) {
 }
 async function nativeDock() {
   return apple('tell application "System Events" to tell process "Dock"\n' +
-    'set targetItem to first UI element of list 1 whose description is "SoduWork"\n' +
+    'set targetItem to first UI element of list 1 whose name is "SoduWork"\n' +
     'perform action "AXPress" of targetItem\nend tell');
 }
 async function nativeButton(pid, label) {
@@ -195,7 +195,7 @@ async function armDelivery(root, app, kind, files) {
   const values=files.map(file=>`(POSIX file ${literal(file)} as alias)`).join(',');
   const finder=files.length ? `tell application "Finder" to open {${values}} using (POSIX file ${literal(app)} as alias)\n` : '';
   const dock=kind==='dock'||kind==='mixed' ? 'tell application "System Events" to perform action "AXPress" of targetItem\n' : '';
-  const setup=dock ? 'tell application "System Events" to tell process "Dock" to set targetItem to first UI element of list 1 whose description is "SoduWork"\n' : '';
+  const setup=dock ? 'tell application "System Events" to tell process "Dock" to set targetItem to first UI element of list 1 whose name is "SoduWork"\n' : '';
   const script='use framework "Foundation"\n'+setup+'set fm to current application\'s NSFileManager\'s defaultManager()\n' +
     `do shell script "/usr/bin/touch " & quoted form of ${literal(ready)}\n` +
     `repeat 2000\nif (fm's fileExistsAtPath:${literal(marker)}) as boolean then\n${finder}${dock}return "native requests sent"\nend if\ndelay 0.005\nend repeat\nerror "Confirmed quit marker was not observed"`;
@@ -228,6 +228,10 @@ async function armDelivery(root, app, kind, files) {
       await until(()=>fs.existsSync(path.join(root,'worker-control.json')),'installed client control');
       await login(root,hub,'native-'+nonce+'@example.test',crypto.randomBytes(18).toString('base64url'));
       const initial=await rpc(root,'status');row.oldPid=initial.pid;assert.equal(initial.packaged,true);assert.equal(initial.encryptionAvailable,true);
+      row.dockNames = await apple('tell application "System Events" to tell process "Dock" to get name of every UI element of list 1');
+      // Verify native Dock addressing while the installed client is running,
+      // before spending time on CPU inference or exercising confirmed quit.
+      await nativeDock();
       const inferenceSession = await startInference(root,providerURL);row.realModelRunning=true;
       row.modelRef = inferenceSession.modelRef;
       await screenshot(root, kind, 'before-quit');
