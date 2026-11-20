@@ -59,7 +59,8 @@ const proxy = http.createServer((request, response) => {
 async function until(predicate, label, timeout = 45000) {
   const deadline = Date.now() + timeout; let last;
   while (Date.now() < deadline) {
-    try { const answer = await predicate(); if (answer) return answer; } catch (error) { last = error.message; }
+    try { const answer = await predicate(); if (answer) return answer; }
+    catch (error) { if (error.immediate) throw error; last = error.message; }
     await delay(30);
   }
   throw Error('Timed out: ' + label + (last ? '; ' + last : ''));
@@ -97,7 +98,7 @@ async function screenshot(root, kind, name, native = false) {
   report.screenshots.push({ kind, name, file: path.basename(target) });
   flush();
 }
-const { networkPermissionScript } = require('./macos-native-system-dialog.cjs');
+const { networkPermissionScript, deliveryScript } = require('./macos-native-system-dialog.cjs');
 const nextPermissionCheck = new Map();
 async function approveTestNetworkPermission(root, phase) {
   if (Date.now() < (nextPermissionCheck.get(root) || 0)) return false;
@@ -192,18 +193,13 @@ async function quitDialog(root) {
 async function armDelivery(root, app, kind, files) {
   const marker=path.join(root,'confirmed-quit.json');
   const ready=path.join(root,'native-delivery-ready');
-  const values=files.map(file=>`(POSIX file ${literal(file)} as alias)`).join(',');
-  const finder=files.length ? `tell application "Finder" to open {${values}} using (POSIX file ${literal(app)} as alias)\n` : '';
-  const dock=kind==='dock'||kind==='mixed' ? 'tell application "System Events" to perform action "AXPress" of targetItem\n' : '';
-  const setup=dock ? 'tell application "System Events" to tell process "Dock" to set targetItem to first UI element of list 1 whose name is "SoduWork"\n' : '';
-  const script='use framework "Foundation"\n'+setup+'set fm to current application\'s NSFileManager\'s defaultManager()\n' +
-    `do shell script "/usr/bin/touch " & quoted form of ${literal(ready)}\n` +
-    `repeat 2000\nif (fm's fileExistsAtPath:${literal(marker)}) as boolean then\n${finder}${dock}return "native requests sent"\nend if\ndelay 0.005\nend repeat\nerror "Confirmed quit marker was not observed"`;
+  const script = deliveryScript({ marker, ready, app, kind, files });
   const completion = apple(script,30000);
   // Compile Foundation and resolve the real Dock element before confirming
   // exit. This does not hold up or alter production shutdown.
-  completion.catch(() => {});
-  await until(() => fs.existsSync(ready), 'native delivery automation armed', 25000);
+  let failure;
+  completion.catch(error => { error.immediate = true; failure = error; });
+  await until(() => { if (failure) throw failure; return fs.existsSync(ready); }, 'native delivery automation armed', 25000);
   return { completion };
 }
 
@@ -295,7 +291,7 @@ async function armDelivery(root, app, kind, files) {
       const summary=await fetch(hub.url+'/__fixture__/summary',{headers:{'X-Fixture-Key':hub.key}}).then(r=>r.json());
       assert.equal(summary.modelCalls.length,0,'The Hub mock model was used instead of real local inference');
       row.ok=true;row.events=eventRows(root);flush();console.log('MACOS_NATIVE_CASE='+JSON.stringify({kind,ok:true,oldPid:row.oldPid,newPid:row.newPid,files:row.files}));
-    }catch(error){row.error=String(error.stack||error);row.events=eventRows(root);report.errors.push(row.error);try{await screenshot(root,kind,'failure',true)}catch{}flush();throw error;}
+    }catch(error){row.error=String(error.stack||error);row.events=eventRows(root);report.errors.push(row.error);try{await screenshot(root,kind,'failure',true)}catch{}flush();}
     finally{
       for(const pid of [...new Set(eventRows(root).filter(e=>e.event==='process-start').map(e=>e.pid))]){try{process.kill(pid,'SIGTERM')}catch{}}
       try{await fetch(hub.url+'/__fixture__/shutdown',{method:'POST',headers:{'X-Fixture-Key':hub.key},signal:AbortSignal.timeout(5000)})}catch{hub.child.kill('SIGTERM')}
@@ -304,7 +300,8 @@ async function armDelivery(root, app, kind, files) {
       fs.rmSync(app, { recursive: true, force: true });
     }
   }
-  report.ok=true;
+  report.ok=report.cases.every(row => row.ok);
+  if (!report.ok) process.exitCode=1;
 })().catch(error=>{report.errors.push(String(error.stack||error));process.exitCode=1;}).finally(()=>{
   proxy.closeAllConnections();proxy.close();flush();
   const summary = { ...report, cases: report.cases.map(({ events, nativeEvents, ...value }) => value) };

@@ -13,4 +13,16 @@ function networkPermissionScript(press) {
     'end if\nend try\nend repeat\nend if\nend repeat\nend try\nend if\nend repeat\nreturn ""\nend tell';
 }
 
-module.exports = { networkPermissionScript };
+function deliveryScript({ marker, ready, app, kind, files }) {
+  const literal = value => JSON.stringify(String(value));
+  const values = files.map(file => `(POSIX file ${literal(file)} as alias)`).join(',');
+  const finder = files.length ? `tell application "Finder" to open {${values}} using (POSIX file ${literal(app)} as alias)\n` : '';
+  const dock = kind === 'dock' || kind === 'mixed' ? 'tell application "System Events" to perform action "AXPress" of targetItem\n' : '';
+  const setup = dock ? 'tell application "System Events" to tell process "Dock" to set targetItem to first UI element of list 1 whose name is "SoduWork"\n' : '';
+  return 'use framework "Foundation"\nuse scripting additions\n' + setup +
+    'set fm to current application\'s NSFileManager\'s defaultManager()\n' +
+    `do shell script "/usr/bin/touch " & quoted form of ${literal(ready)}\n` +
+    `repeat 2000\nif (fm's fileExistsAtPath:${literal(marker)}) as boolean then\n${finder}${dock}return "native requests sent"\nend if\ndelay 0.005\nend repeat\nerror "Confirmed quit marker was not observed"`;
+}
+
+module.exports = { networkPermissionScript, deliveryScript };

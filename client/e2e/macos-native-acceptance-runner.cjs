@@ -61,6 +61,11 @@ let server, mounted;
     const scripts = require('./macos-native-system-dialog.cjs');
     for (const press of [false, true])
       run('osacompile', ['-o', path.join(temporary, 'network-' + press + '.scpt'), '-e', scripts.networkPermissionScript(press)], { timeout: 15000 });
+    for (const kind of ['finder', 'dock', 'mixed', 'budget']) {
+      const source = scripts.deliveryScript({ marker: path.join(temporary, 'marker'), ready: path.join(temporary, 'ready'),
+        app: path.join(temporary, 'SoduWork.app'), kind, files: kind === 'dock' ? [] : [path.join(temporary, 'input.txt')] });
+      run('osacompile', ['-o', path.join(temporary, 'delivery-' + kind + '.scpt'), '-e', source], { timeout: 15000 });
+    }
   });
   await stage('locked-client-dependencies', async () => {
     assert.ok(!fs.existsSync(path.join(client, 'node_modules')), 'Refusing to replace existing dependencies');
