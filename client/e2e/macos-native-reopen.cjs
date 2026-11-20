@@ -155,7 +155,9 @@ async function login(root, hub, email, password) {
   await click(root, '#acConsent');
   const beforeReload = await js(root, 'performance.timeOrigin');
   await click(root, '#soduWorkClientAuthGate [type=submit]');
-  await until(() => js(root, `performance.timeOrigin!==${beforeReload} && document.readyState==='complete' && window.ClientAuth?.snapshot()?.state==='active' && ClientAuth.snapshot().user?.email===${literal(email)}`), 'authenticated production client after normal reload', 60000);
+  await until(() => js(root, `performance.timeOrigin!==${beforeReload} && document.readyState==='complete' && SoduWorkAPI.clientAuthSnapshot().state==='active' && ClientAuth.snapshot().user?.email===${literal(email)} && !document.documentElement.classList.contains('soduwork-auth-pending') && !document.querySelector('#soduWorkClientAuthGate')?.checkVisibility()`), 'authenticated production client after normal reload', 60000);
+  const identity = await js(root, 'SoduWorkAPI.clientAuthMe()');
+  assert.equal(identity.user?.email, email, 'Authenticated Hub identity must match the registered account');
 }
 async function startInference(root, providerURL) {
   const saved = await js(root, `(async()=>await soduWorkAPI.localModels.save({providers:[{id:'native-local',name:'Native local Qwen',baseUrl:${literal(providerURL+'/v1')},authMode:'none'}],models:[{providerId:'native-local',name:'native-qwen',label:'Native Qwen 0.6B',modality:'chat',ctxWindow:32768,config:{maxOutputTokens:2048}}]}))()`);
@@ -166,7 +168,8 @@ async function startInference(root, providerURL) {
   const prompt='Native acceptance '+nonce+'. Write a long, detailed technical essay with at least 2000 words about reliable desktop application shutdown. Start writing immediately. Do not use tools.';
   const opened=await js(root,`soduWorkAPI.conversationSession.open({modelName:${literal(model.id||model.name)},cwd:${literal(JSON.parse(fs.readFileSync(path.join(root,'native-input.json'))).workspace)},adapterId:'pi'})`);
   assert.equal(opened.ok,true,opened.reason); assert.ok(opened.ref);
-  await js(root,`(()=>{window.__nativeSendResult=null;window.__nativeSendPromise=soduWorkAPI.conversationSession.send(${literal(opened.ref)},${literal(prompt)},[],{}).then(value=>{window.__nativeSendResult=value},error=>{window.__nativeSendResult={error:String(error)}});return true})()`);
+  const accepted = await js(root,`soduWorkAPI.conversationSession.send(${literal(opened.ref)},${literal(prompt)},[],{})`);
+  assert.equal(accepted.ok, true, accepted.reason || accepted.error);
   await until(async () => {
     const active = report.modelRequests.some(row=>row.acceptanceTask&&row.active&&row.status===200&&row.streamCharacters>0);
     if (!active) await approveTestNetworkPermission(root, 'model');
@@ -268,7 +271,7 @@ async function armDelivery(root, app, kind, files) {
           'successful real workspace opens acknowledged',60000);
         const acknowledgements=eventRows(root).filter(e=>e.pid===row.newPid&&e.event==='file-ack');
         assert.deepEqual(acknowledgements.map(e=>e.name).sort(),expected.map(e=>path.basename(e)).sort());
-        await until(() => js(root, `ClientAuth.snapshot().state==='active'&&ClientAuth.snapshot().user?.email===${literal('native-'+nonce+'@example.test')}`), 'existing authenticated profile after relaunch');
+        await until(() => js(root, `SoduWorkAPI.clientAuthSnapshot().state==='active'&&ClientAuth.snapshot().user?.email===${literal('native-'+nonce+'@example.test')}`), 'existing authenticated profile after relaunch');
         const persisted = await js(root, 'soduWorkAPI.localModels.get()');
         assert.ok(persisted.myModels.some(model => model.id === inferenceSession.modelRef), 'Encrypted local model reference did not survive relaunch');
         assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'profile/hub-endpoint.json'))).hub, hub.url);
