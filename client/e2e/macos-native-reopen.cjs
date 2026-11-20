@@ -19,7 +19,7 @@ const output = input.output;
 fs.mkdirSync(output, { recursive: true });
 const report = { ok: false, scope: 'Installed diagnostic bundle and production client; native UI/OS events; real local Qwen inference',
   source: input.source, model: input.model, macOS: input.macOS, architecture: process.arch,
-  notarizedReleaseInstaller: false, installer: input.installer, cases: [], modelRequests: [], errors: [], screenshots: [] };
+  notarizedReleaseInstaller: false, installer: input.installer, cases: [], modelRequests: [], errors: [], screenshots: [], platformPermissions: [] };
 const flush = () => fs.writeFileSync(path.join(output, 'acceptance.json'), JSON.stringify(report, null, 2));
 let nonce = '';
 const proxy = http.createServer((request, response) => {
@@ -94,6 +94,25 @@ async function screenshot(root, kind, name, native = false) {
   report.screenshots.push({ kind, name, file: path.basename(target) });
   flush();
 }
+function networkPermissionScript(press) {
+  return 'tell application "System Events"\nrepeat with p in processes\n' +
+    'set targetName to name of p\nif visible of p or targetName is "UserNotificationCenter" or targetName is "CoreServicesUIAgent" or targetName is "SystemUIServer" then\n' +
+    'try\nrepeat with w in windows of p\nset elements to entire contents of w\nset wording to ""\n' +
+    'repeat with item in elements\ntry\nif role of item is "AXStaticText" then set wording to wording & " " & (value of item as text)\nend try\nend repeat\n' +
+    'if wording contains "local networks" and (wording contains "Python" or wording contains "SoduWork") then\n' +
+    'repeat with item in elements\ntry\nif role of item is "AXButton" and name of item is "Allow" then\n' +
+    (press ? 'perform action "AXPress" of item\nreturn "allowed isolated test local network access"\n' : 'return "expected local network prompt"\n') +
+    'end if\nend try\nend repeat\nend if\nend repeat\nend try\nend if\nend repeat\nreturn ""\nend tell';
+}
+async function approveTestNetworkPermission(root, phase) {
+  const found = await apple(networkPermissionScript(false), 8000);
+  if (!found) return false;
+  const kind = report.cases.at(-1).kind;
+  await screenshot(root, kind, 'network-permission-' + phase, true);
+  const action = await apple(networkPermissionScript(true), 8000);
+  if (action) { report.platformPermissions.push({ kind, phase, action, at: Date.now() }); flush(); }
+  return Boolean(action);
+}
 async function startHub(root) {
   const child = spawn(input.python, ['-B', path.join(input.repository, 'client/e2e/fixtures/full_client_hub_fixture.py'), '--root', root],
     { env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -137,11 +156,15 @@ async function login(root, hub, email, password) {
   const challenge = await until(() => fs.existsSync(path.join(root, 'challenge.json')) && JSON.parse(fs.readFileSync(path.join(root, 'challenge.json'))).challengeId, 'email challenge');
   const code = await until(async () => {
     const response=await fetch(hub.url+'/__fixture__/mail/'+encodeURIComponent(challenge),{headers:{'X-Fixture-Key':hub.key}});
-    const value=await response.json(); return value.ready && value.code;
-  }, 'fixture mail delivery');
+    const value=await response.json();
+    if (!value.ready) await approveTestNetworkPermission(root, 'mail');
+    return value.ready && value.code;
+  }, 'fixture mail delivery', 120000);
   await fill(root, '#acEmailCode', code); await fill(root, '#soduWorkAuthPassword', password); await fill(root, '#acConfirmPassword', password);
-  await click(root, '#acConsent'); await click(root, '#soduWorkClientAuthGate [type=submit]');
-  await until(() => js(root, `window.ClientAuth?.snapshot()?.state==='active' && ClientAuth.snapshot().user?.email===${literal(email)}`), 'authenticated production client', 60000);
+  await click(root, '#acConsent');
+  const beforeReload = await js(root, 'performance.timeOrigin');
+  await click(root, '#soduWorkClientAuthGate [type=submit]');
+  await until(() => js(root, `performance.timeOrigin!==${beforeReload} && document.readyState==='complete' && window.ClientAuth?.snapshot()?.state==='active' && ClientAuth.snapshot().user?.email===${literal(email)}`), 'authenticated production client after normal reload', 60000);
 }
 async function startInference(root, providerURL) {
   const saved = await js(root, `(async()=>await soduWorkAPI.localModels.save({providers:[{id:'native-local',name:'Native local Qwen',baseUrl:${literal(providerURL+'/v1')},authMode:'none'}],models:[{providerId:'native-local',name:'native-qwen',label:'Native Qwen 0.6B',modality:'chat',ctxWindow:32768,config:{maxOutputTokens:2048}}]}))()`);
@@ -153,7 +176,11 @@ async function startInference(root, providerURL) {
   const opened=await js(root,`soduWorkAPI.conversationSession.open({modelName:${literal(model.id||model.name)},cwd:${literal(JSON.parse(fs.readFileSync(path.join(root,'native-input.json'))).workspace)},adapterId:'pi'})`);
   assert.equal(opened.ok,true,opened.reason); assert.ok(opened.ref);
   await js(root,`(()=>{window.__nativeSendResult=null;window.__nativeSendPromise=soduWorkAPI.conversationSession.send(${literal(opened.ref)},${literal(prompt)},[],{}).then(value=>{window.__nativeSendResult=value},error=>{window.__nativeSendResult={error:String(error)}});return true})()`);
-  await until(() => report.modelRequests.some(row=>row.acceptanceTask&&row.active&&row.status===200&&row.streamCharacters>0), 'real local inference stream', 120000);
+  await until(async () => {
+    const active = report.modelRequests.some(row=>row.acceptanceTask&&row.active&&row.status===200&&row.streamCharacters>0);
+    if (!active) await approveTestNetworkPermission(root, 'model');
+    return active;
+  }, 'real local inference stream', 120000);
   const events=eventRows(root); assert.ok(events.some(row=>row.event==='runtime-spawn'&&row.childPid),'Production utilityProcess did not start');
   return { sessionRef: opened.ref, modelRef: model.id || model.name };
 }
