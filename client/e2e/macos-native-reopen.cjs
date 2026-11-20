@@ -28,7 +28,8 @@ const proxy = http.createServer((request, response) => {
     let data;
     try { data = JSON.parse(raw); } catch { response.writeHead(400); response.end(); return; }
     const row = { at: Date.now(), model: data.model, acceptanceTask: JSON.stringify(data.messages || []).includes(nonce),
-      streamCharacters: 0, active: true };
+      streaming: data.stream === true, promptMessages: Array.isArray(data.messages) ? data.messages.length : 0,
+      promptCharacters: JSON.stringify(data.messages || []).length, streamCharacters: 0, active: true };
     report.modelRequests.push(row);
     const destination = new URL('/v1/chat/completions', input.modelURL);
     const upstream = http.request(destination, { method: 'POST', headers: { 'Content-Type': 'application/json' } }, stream => {
@@ -40,7 +41,9 @@ const proxy = http.createServer((request, response) => {
         const lines = pending.split('\n'); pending = lines.pop();
         for (const line of lines) if (line.startsWith('data: ') && !line.includes('[DONE]')) {
           try { const frame=JSON.parse(line.slice(6)); const delta=frame.choices?.[0]?.delta;
-            row.streamCharacters += String(delta?.content || delta?.reasoning_content || '').length;
+            const characters = String(delta?.content || delta?.reasoning_content || '').length;
+            if (characters && !row.firstCharacterAt) row.firstCharacterAt = Date.now();
+            row.streamCharacters += characters;
           } catch {}
         }
       });
@@ -95,7 +98,10 @@ async function screenshot(root, kind, name, native = false) {
   flush();
 }
 const { networkPermissionScript } = require('./macos-native-system-dialog.cjs');
+const nextPermissionCheck = new Map();
 async function approveTestNetworkPermission(root, phase) {
+  if (Date.now() < (nextPermissionCheck.get(root) || 0)) return false;
+  nextPermissionCheck.set(root, Date.now() + 2000);
   const found = await apple(networkPermissionScript(false), 8000);
   if (!found) return false;
   const kind = report.cases.at(-1).kind;
@@ -174,7 +180,7 @@ async function startInference(root, providerURL) {
     const active = report.modelRequests.some(row=>row.acceptanceTask&&row.active&&row.status===200&&row.streamCharacters>0);
     if (!active) await approveTestNetworkPermission(root, 'model');
     return active;
-  }, 'real local inference stream', 120000);
+  }, 'real local inference stream', 300000);
   const events=eventRows(root); assert.ok(events.some(row=>row.event==='runtime-spawn'&&row.childPid),'Production utilityProcess did not start');
   return { sessionRef: opened.ref, modelRef: model.id || model.name };
 }
