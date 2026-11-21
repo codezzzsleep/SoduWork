@@ -249,7 +249,22 @@ async def request_observability(request: Request, call_next):
         runtime_telemetry.record(request.method, route_path, 500, elapsed,
                                  request_id, type(exc).__name__,
                                  getattr(request.state, "model_timing", None))
-        raise
+        # Keep the response generic while retaining the request id for support
+        # correlation. The exception details are already present in the log.
+        from starlette.responses import PlainTextResponse
+        return PlainTextResponse(
+            "Internal Server Error",
+            status_code=500,
+            headers={
+                "X-Request-ID": request_id,
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
+                "X-XSS-Protection": "1; mode=block",
+                "Content-Security-Policy": "default-src 'self'; script-src 'self'",
+                "Referrer-Policy": "strict-origin-when-cross-origin",
+                "Cache-Control": "no-store",
+            }
+        )
     elapsed = (time.perf_counter() - started) * 1000
     route = request.scope.get("route")
     route_path = getattr(route, "path", None) or "__unmatched__"
@@ -259,6 +274,19 @@ async def request_observability(request: Request, call_next):
         getattr(request.state, "model_timing", None),
     )
     response.headers["X-Request-ID"] = request_id
+    # Apply defaults without replacing route-specific policies, such as the
+    # sandbox CSP and private cache policy used for attachment downloads.
+    security_headers = {
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "X-XSS-Protection": "1; mode=block",
+        "Content-Security-Policy": "default-src 'self'; script-src 'self'",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+        "Cache-Control": "no-store",
+    }
+    for header, value in security_headers.items():
+        if header not in response.headers:
+            response.headers[header] = value
     timing = getattr(request.state, "model_timing", None) or {}
     parts = [f"app;dur={elapsed:.1f}"]
     for key, label in (("admissionMs", "model-admission"),

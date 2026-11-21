@@ -142,7 +142,9 @@ def _owner_key(client: Client) -> str:
 
 
 def _safe_name(value: str, fallback: str = "未命名资料") -> str:
-    name = str(value or "").replace("\\", "/").rsplit("/", 1)[-1]
+    if value is not None and not isinstance(value, str):
+        raise HTTPException(status_code=400, detail="名称必须是字符串")
+    name = (value or "").replace("\\", "/").rsplit("/", 1)[-1]
     name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip()
     return name[:240] or fallback
 

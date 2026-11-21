@@ -18,7 +18,7 @@ _COUNTERS = (
     "reasoning_tokens", "total_tokens", "requests", "turns", "steps",
     "duration_ms", "cost_microusd",
 )
-from .usage_values import _QUALITY_RANK, _number, normalize_usage
+from .usage_values import _QUALITY_RANK, _number, normalize_usage, validate_reported_usage
 from ..timestamps import iso_utc
 
 def _dt(value: Any) -> datetime:
@@ -249,9 +249,11 @@ async def from_client(
         workflow_run_id = ""
         node_run_id = ""
     from .model_quota import reported_scope
+    raw_usage = dict(payload.get("usage") or {})
+    validate_reported_usage(raw_usage)
     values = {
         "quota_scope": reported_scope(client, payload),
-        **normalize_usage(dict(payload.get("usage") or {})),
+        **normalize_usage(raw_usage),
         "org_id": str((user.org_id if user else "") or ""),
         "billing_user_id": user_id,
         "actor_user_id": user_id,

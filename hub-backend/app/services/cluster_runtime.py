@@ -80,14 +80,23 @@ class RemoteRunner(runner_hub._Runner):
         return bus.healthy and self.node in bus.peers and super().alive()
 
     async def call(self, op, data, timeout=60, *, _rerouted=False):
-        from .session_read_budget import remaining
+        from .session_read_budget import deadline_active, remaining
         try:
-            result = await bus.request(self.node, "runner.call", {
+            packet_timeout = remaining(timeout + 5)
+            wait_timeout = packet_timeout
+            if deadline_active() and op == "content.read":
+                wait_timeout = max(wait_timeout, 0.2)
+            request_data = {
                 "runner": self.id, "token": self.cluster_token,
                 "op": op, "data": data, "timeout": timeout,
                 "client": self.client_id, "org": self.org_id,
                 "owner": self.owner_user_id,
-            }, remaining(timeout + 5))
+            }
+            if op == "content.read":
+                result = await bus.request(self.node, "runner.call", request_data,
+                                           packet_timeout, wait_timeout=wait_timeout)
+            else:
+                result = await bus.request(self.node, "runner.call", request_data, packet_timeout)
             # A rejected old owner has NOT forwarded bytes. Refresh once so a
             # just-reconnected Runner does not require a second user click.
             if (not _rerouted and result.get("code") == "RUNNER_OWNER_CHANGED"
@@ -108,6 +117,14 @@ class RemoteRunner(runner_hub._Runner):
                         current.term_subs.pop(task, None)
                     return retried
             return result
+        except TimeoutError:
+            # A bounded session read must preserve timeout semantics so its
+            # middleware can return a retryable 504 instead of a 503.
+            if deadline_active():
+                raise
+            return {"ok": False, "code": "CLUSTER_RUNNER_UNAVAILABLE",
+                    "error": "执行机连接正在恢复，请稍后重试",
+                    "uncertain": op in {"job.dispatch", "job.comment"}}
         except Exception:
             return {"ok": False, "code": "CLUSTER_RUNNER_UNAVAILABLE",
                     "error": "执行机连接正在恢复，请稍后重试",
