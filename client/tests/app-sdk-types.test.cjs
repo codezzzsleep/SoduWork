@@ -127,6 +127,13 @@ for (const [name, suffix] of [['browser script', ''], ['ES module', '\nexport {}
   });
 }
 
+test('compiler consumers with Windows separators resolve the same virtual source', () => {
+  const result = compile('const app: SoduWorkApp.SDK = window.soduWorkApp;', undefined,
+    path.win32.join('C:\\sdk-contract', 'consumer.ts'));
+  assert.equal(result.diagnostics.length, 0, describe(result.diagnostics));
+  assert.ok(result.program.getSourceFile(result.consumer), 'consumer diagnostics and source lookup use the compiler filename');
+});
+
 for (const [language, file] of [['English', 'README.md'], ['Chinese', 'README.zh-CN.md']]) {
   test(`${language} SDK documentation examples compile in the documented browser layout`, () => {
     const folder = path.resolve(__dirname, '../sdk');

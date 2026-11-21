@@ -20,12 +20,16 @@ function compile(source, declarationFile = declaration, consumerFile = consumer)
     skipLibCheck: false,
   };
   const host = ts.createCompilerHost(options);
+  const consumerPath = consumerFile.replace(/\\/g, '/');
+  const canonicalConsumer = host.getCanonicalFileName(consumerPath);
+  const isConsumer = file => host.getCanonicalFileName(file.replace(/\\/g, '/')) === canonicalConsumer;
   const readFile = host.readFile.bind(host);
   const fileExists = host.fileExists.bind(host);
-  host.readFile = file => file === consumerFile ? source : readFile(file);
-  host.fileExists = file => file === consumerFile || fileExists(file);
-  const program = ts.createProgram([declarationFile, consumerFile], options, host);
-  return { program, diagnostics: ts.getPreEmitDiagnostics(program), consumer: consumerFile };
+  host.readFile = file => isConsumer(file) ? source : readFile(file);
+  host.fileExists = file => isConsumer(file) || fileExists(file);
+  const program = ts.createProgram([declarationFile, consumerPath], options, host);
+  return { program, diagnostics: ts.getPreEmitDiagnostics(program),
+    consumer: program.getSourceFile(consumerPath)?.fileName ?? consumerPath };
 }
 
 function describe(diagnostics) {
