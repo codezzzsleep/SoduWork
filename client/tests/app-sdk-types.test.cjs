@@ -134,17 +134,29 @@ test('compiler consumers with Windows separators resolve the same virtual source
   assert.ok(result.program.getSourceFile(result.consumer), 'consumer diagnostics and source lookup use the compiler filename');
 });
 
+function checkDocumentationExamples(markdown, folder) {
+  const examples = [...markdown.matchAll(/```ts\r?\n([\s\S]*?)```/g)];
+  assert.ok(examples.length, 'TypeScript setup must have a usable example');
+  for (const example of examples) {
+    const result = compile(example[1], path.join(folder, 'soduwork-app.d.ts'), path.join(folder, 'documentation-example.ts'));
+    assert.equal(result.diagnostics.length, 0, describe(result.diagnostics));
+  }
+}
+
 for (const [language, file] of [['English', 'README.md'], ['Chinese', 'README.zh-CN.md']]) {
   test(`${language} SDK documentation examples compile in the documented browser layout`, () => {
     const folder = path.resolve(__dirname, '../sdk');
-    const examples = [...fs.readFileSync(path.join(folder, file), 'utf8').matchAll(/```ts\n([\s\S]*?)```/g)];
-    assert.ok(examples.length, 'TypeScript setup must have a usable example');
-    for (const example of examples) {
-      const result = compile(example[1], path.join(folder, 'soduwork-app.d.ts'), path.join(folder, 'documentation-example.ts'));
-      assert.equal(result.diagnostics.length, 0, describe(result.diagnostics));
-    }
+    checkDocumentationExamples(fs.readFileSync(path.join(folder, file), 'utf8'), folder);
   });
 }
+
+test('both SDK documentation examples compile after a CRLF checkout', () => {
+  const folder = path.resolve(__dirname, '../sdk');
+  for (const file of ['README.md', 'README.zh-CN.md']) {
+    const markdown = fs.readFileSync(path.join(folder, file), 'utf8').replace(/\r?\n/g, '\r\n');
+    checkDocumentationExamples(markdown, folder);
+  }
+});
 
 const invalidCalls = [
   ['unknown SDK helper', `soduWorkApp.connect();`],
