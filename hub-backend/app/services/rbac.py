@@ -3,7 +3,7 @@ other users are scoped to their organization subtree. Clients inherit organizati
 user_ref.
 """
 from pydantic import TypeAdapter, ValidationError
-from sqlalchemy import func, or_, select, text, update
+from sqlalchemy import String, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import models
@@ -62,6 +62,16 @@ def position_to_api(p: models.Position) -> dict:
 
 def domain_to_api(d: models.Domain) -> dict:
     return {"id": d.id, "name": d.name, "sort": d.sort, "isSystem": d.is_system}
+
+
+def _validate_org_name(name: str) -> str:
+    """Validate and normalize an organization/department name."""
+    name = str(name).strip()
+    if not name:
+        return "未命名部门"
+    if len(name) > 200:
+        name = name[:200]
+    return name
 
 
 # Authorization scope.
@@ -216,6 +226,7 @@ async def create_org(
     *, scope: set[str] | None,
 ) -> dict:
     """Create below an authorized parent; only super users may create a root."""
+    name = _validate_org_name(name) if name else "未命名部门"
     pid = str(parent_id or "").strip() or None
     if scope is not None and (not pid or pid not in scope):
         raise OrgMutationError("out_of_scope")
@@ -241,6 +252,7 @@ async def update_org(
     if scope is not None and oid not in scope:
         raise OrgMutationError("out_of_scope")
     pid = o.parent_id
+    normalized_name = _validate_org_name(name) if name is not None else o.name
     if parent_id is not None:
         pid = str(parent_id or "").strip() or None
         if scope is not None and (not pid or pid not in scope):
@@ -250,8 +262,8 @@ async def update_org(
                 raise OrgMutationError("parent_not_found")
             if pid == oid or pid in await subtree_org_ids(session, oid):
                 raise OrgMutationError("cycle")
-    if pid != o.parent_id or (name is not None and name != o.name):
-        o.name = await _available_org_name(session, name if name is not None else o.name, pid, oid)
+    if pid != o.parent_id or normalized_name != o.name:
+        o.name = await _available_org_name(session, normalized_name, pid, oid)
         o.parent_id = pid
     if sort is not None:
         o.sort = sort
@@ -288,6 +300,9 @@ async def list_roles(session: AsyncSession) -> list[dict]:
 
 
 async def create_role(session: AsyncSession, name: str, permissions: list[str]) -> dict:
+    unknown = sorted(set(str(key) for key in (permissions or [])) - set(ALL_KEYS))
+    if unknown:
+        raise ValueError("未知权限：" + ", ".join(unknown))
     r = models.Role(name=name or "未命名角色", permissions=valid_keys(permissions))
     session.add(r)
     await session.commit()
@@ -299,9 +314,14 @@ async def update_role(session: AsyncSession, rid: str, name: str | None, permiss
     r = await session.get(models.Role, rid)
     if r is None:
         return None
+    if r.is_system:
+        raise ValueError("系统内置角色不允许修改")
     if name is not None:
         r.name = name
     if permissions is not None:
+        unknown = sorted(set(str(key) for key in permissions) - set(ALL_KEYS))
+        if unknown:
+            raise ValueError("未知权限：" + ", ".join(unknown))
         r.permissions = valid_keys(permissions)
     await session.commit()
     await session.refresh(r)
@@ -532,7 +552,7 @@ async def delete_domain(session: AsyncSession, did: str) -> dict:
     if d.is_system:
         return {"ok": False, "reason": "system"}
     assignments = await session.scalars(select(models.User.domains))
-    if any(did in (ids or []) for ids in assignments):
+    if any(did in {str(item) for item in (ids or [])} for ids in assignments):
         return {"ok": False, "reason": "in_use"}
     await session.delete(d)
     await session.commit()

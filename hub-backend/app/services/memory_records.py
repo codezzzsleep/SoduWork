@@ -517,7 +517,7 @@ async def org_create(session: AsyncSession, user: models.User, body: dict) -> di
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
-        raise HTTPException(409, "organization memory changed; reload before editing") from exc
+        raise HTTPException(409, "组织记忆已变更，请重新加载后编辑") from exc
     await session.refresh(row)
     return {"ok": True, "updated": False, "item": _admin_view(row)}
 

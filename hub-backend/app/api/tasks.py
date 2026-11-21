@@ -309,7 +309,14 @@ async def get_daily_report(
     u = await _actor_user(session, client)
     if u is None:
         raise HTTPException(status_code=400, detail="本 SoduWork 未绑定用户，请让管理员分配归属")
+    from datetime import date as _date
     day = (date or "").strip() or dr.today_str()
+    try:
+        parsed_date = _date.fromisoformat(day)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="非法日期，请使用 YYYY-MM-DD 格式")
+    if parsed_date > _date.today():
+        raise HTTPException(status_code=400, detail="日报只能查询今天或之前的日期")
     from sqlalchemy import select as _sel
     from ..models import DailyReport
     rep = (await session.execute(
@@ -332,7 +339,14 @@ async def gen_daily_report(
     u = await _actor_user(session, client)
     if u is None:
         raise HTTPException(status_code=400, detail="本 SoduWork 未绑定用户，请让管理员分配归属")
+    from datetime import date as _date
     day = (body.get("date") or "").strip() or dr.today_str()
+    try:
+        parsed_date = _date.fromisoformat(day)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="非法日期，请使用 YYYY-MM-DD 格式")
+    if parsed_date > _date.today():
+        raise HTTPException(status_code=400, detail="不允许为未来日期生成日报")
     rep = await dr.generate_for(session, u, day, notify=False)
     if rep is None:
         raise HTTPException(status_code=400, detail="今天还没有进展记录，先在需求里写一条再生成")

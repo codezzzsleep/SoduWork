@@ -22,6 +22,10 @@ from .workdirs import validate_repo_local_dir
 from ..timestamps import iso_utc
 
 
+class InvalidRepositoryInput(ValueError):
+    """A repository mapping field failed request validation."""
+
+
 def _text(value, limit: int) -> str:
     return str(value or "").strip()[:limit]
 
@@ -355,6 +359,10 @@ async def create_mapping(session: AsyncSession, project: models.Project,
         ))).scalar_one_or_none()
         if existing is not None:
             raise ValueError("This repository branch is already mapped to the project")
+        try:
+            route_priority = int(body.get("routePriority") or 0)
+        except (TypeError, ValueError):
+            raise InvalidRepositoryInput("routePriority must be an integer") from None
         row = models.Repo(
             project_id=project.id, org_id=project.org_id,
             source_repository_id=source.id, name=name,
@@ -367,7 +375,7 @@ async def create_mapping(session: AsyncSession, project: models.Project,
             dev_flow=dict(body.get("devFlow") or {}),
             route_keywords=list(body.get("routeKeywords") or []),
             route_layer=_text(body.get("routeLayer"), 16),
-            route_priority=int(body.get("routePriority") or 0))
+            route_priority=max(-100, min(100, route_priority)))
         session.add(row)
         await session.commit()
         await session.refresh(row)

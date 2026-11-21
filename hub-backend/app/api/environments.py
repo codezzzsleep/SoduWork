@@ -340,6 +340,8 @@ async def create_environment(
     try:
         safe = dict(body)
         safe["orgId"] = body.get("orgId") if user.is_super else user.org_id
+        if not user.is_super and not safe["orgId"]:
+            raise ValueError("请先加入组织后再创建环境")
         if "sort" in safe:
             safe["sort"] = parse_integer(safe["sort"], field="sort", default=0)
         row = await svc.save_environment(session, safe)
@@ -605,6 +607,8 @@ async def probe_secret_reference(
     row = await session.get(am.SecretReference, ref_id)
     if row is None:
         raise HTTPException(status_code=404, detail="密钥引用不存在")
+    if row.org_id is None and not user.is_super:
+        raise HTTPException(status_code=403, detail="系统级密钥引用只能由超级管理员操作")
     scope = await _scope(session, user)
     if scope is not None and row.org_id is not None and row.org_id not in scope:
         raise HTTPException(status_code=403, detail="这个密钥引用不在你的组织范围内")

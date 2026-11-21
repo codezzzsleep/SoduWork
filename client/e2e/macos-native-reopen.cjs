@@ -32,7 +32,7 @@ const proxy = http.createServer((request, response) => {
     let data;
     try { data = JSON.parse(raw); } catch { response.writeHead(400); response.end(); return; }
     const row = { at: Date.now(), model: data.model, acceptanceTask: JSON.stringify(data.messages || []).includes(nonce),
-      streaming: data.stream === true, promptMessages: Array.isArray(data.messages) ? data.messages.length : 0,
+      caseNonce: nonce, streaming: data.stream === true, promptMessages: Array.isArray(data.messages) ? data.messages.length : 0,
       promptCharacters: JSON.stringify(data.messages || []).length, streamCharacters: 0, active: true };
     report.modelRequests.push(row);
     const destination = new URL('/v1/chat/completions', input.modelURL);
@@ -182,7 +182,7 @@ async function startInference(root, providerURL) {
   const accepted = await js(root,`soduWorkAPI.conversationSession.send(${literal(opened.ref)},${literal(prompt)},[],{})`);
   assert.equal(accepted.ok, true, accepted.reason || accepted.error);
   await until(async () => {
-    const active = report.modelRequests.some(row=>row.acceptanceTask&&row.active&&row.status===200&&row.streamCharacters>0);
+    const active = report.modelRequests.some(row=>row.acceptanceTask&&row.caseNonce===nonce&&row.active&&row.status===200&&row.streamCharacters>0);
     if (!active) await approveTestNetworkPermission(root, 'model');
     return active;
   }, 'real local inference stream', 300000);
@@ -222,7 +222,7 @@ async function armDelivery(root, app, kind, files) {
     for(const file of filePaths)fs.writeFileSync(file,'Native Mac acceptance input.');
     const earlier=path.join(root,'earlier.txt');fs.writeFileSync(earlier,'Earlier startup file.');
     fs.writeFileSync(path.join(root,'native-input.json'),JSON.stringify({workspace,hub:hub.url,controlKey:crypto.randomBytes(24).toString('hex')}));
-    const row={kind,root,ok:false,startedAt:Date.now()}; report.cases.push(row);flush();
+    const row={kind,root,caseNonce:nonce,ok:false,startedAt:Date.now()}; report.cases.push(row);flush();
     try{
       await execute('open',['-n','-a',app,'--args','--soduwork-native-root',root,'--soduwork-open-file',earlier],{timeout:15000});
       await until(()=>fs.existsSync(path.join(root,'worker-control.json')),'installed client control');
@@ -243,20 +243,20 @@ async function armDelivery(root, app, kind, files) {
         await until(()=>eventRows(root).some(e=>e.event==='file-ack'&&e.name===path.basename(filePaths[0])),'workspace file delivery after cancellation');
         const current=await rpc(root,'status');assert.equal(current.pid,initial.pid);assert.equal(current.quitting,false);
         assert.ok(!eventRows(root).some(e=>e.event==='confirmed-quit'||e.event==='relaunch'));
-        row.modelStillRunningAfterCancellation = report.modelRequests.some(e => e.acceptanceTask && e.active && e.streamCharacters > 0);
+        row.modelStillRunningAfterCancellation = report.modelRequests.some(e => e.acceptanceTask && e.caseNonce === nonce && e.active && e.streamCharacters > 0);
         assert.equal(row.modelStillRunningAfterCancellation, true, 'Cancellation must leave the actual inference running');
         const finalDialog=await quitDialog(root);await nativeButton(initial.pid,finalDialog.quitLabel);
         await until(()=>eventRows(root).some(e=>e.event==='quit'&&e.pid===initial.pid),'normal confirmed exit');
       }else{
         const requested=kind==='dock'?[]:kind==='budget'?filePaths:kind==='finder'?[filePaths[0]]:[filePaths[0],filePaths[1],filePaths[0]];
         const delivery=await armDelivery(root,app,kind,requested);
-        row.modelActiveBeforeConfirmation = report.modelRequests.some(e => e.acceptanceTask && e.active && e.streamCharacters > 0);
+        row.modelActiveBeforeConfirmation = report.modelRequests.some(e => e.acceptanceTask && e.caseNonce === nonce && e.active && e.streamCharacters > 0);
         assert.equal(row.modelActiveBeforeConfirmation, true, 'Real inference ended before confirmation');
         await nativeButton(initial.pid,dialog.quitLabel);await delivery.completion;
         await until(()=>eventRows(root).filter(e=>e.event==='process-start').length>=2,'fresh native relaunch',60000);
         const events=eventRows(root),marked=events.find(e=>e.event==='confirmed-quit'&&e.pid===initial.pid),boundary=events.find(e=>e.event==='will-quit'&&e.pid===initial.pid);
         assert.ok(marked&&boundary,'Actual confirmed-quit lifecycle was not observed');
-        const inference = report.modelRequests.find(e => e.acceptanceTask && e.at <= marked.at &&
+        const inference = report.modelRequests.find(e => e.acceptanceTask && e.caseNonce === nonce && e.at <= marked.at &&
           (e.closedAt || e.endedAt || Date.now()) >= marked.at && e.streamCharacters > 0);
         assert.ok(inference, 'Confirmed quit did not overlap actual model execution');
         row.shutdownMilliseconds = boundary.at - marked.at;

@@ -600,16 +600,7 @@ async def abort(session, client, transfer_id):
     row_id = identity(client.id, transfer_id)
     row = await session.get(Handoff, row_id)
     if not row:
-        row = Handoff(id=row_id, owner_client_id=client.id, owner_user_id=user.id,
-            transfer_id=transfer_id, task_id=str(uuid.uuid5(_NS, row_id + ":task")), phase="aborted")
-        session.add(row)
-        try:
-            await session.commit()
-            return public(row)
-        except IntegrityError:
-            await session.rollback()
-            await session.refresh(client)
-    row = await get(session, client, transfer_id)
+        raise HTTPException(404, "交接记录不存在")
     if row.phase == "aborted":
         return public(row)
     changed = await session.execute(update(Handoff).where(
