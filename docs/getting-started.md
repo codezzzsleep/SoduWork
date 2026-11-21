@@ -25,6 +25,8 @@
 
 启动器会在专用 `venv/` 中安装 Hub 和 Runner 两套依赖，检查 Runner 所需的 Python 模块，并把同一解释器交给桌面端。使用此入口无需另建 `hub-backend/.venv`。如果 Agent 管理提示源码 Runner 环境不完整，请退出源码启动会话后重跑同一入口，保留原数据目录。
 
+准备独立 Python 环境时，启动器会忽略继承的 `PYTHONPATH` 和 `PYTHONHOME`，同时保留显式设置的依赖下载和缓存配置。后续启动会自动修复无法导入必需 Runner 依赖的缓存环境，包括原生 TLS 信任支持；现有实例数据会保留。
+
 服务端和桌面端准备期间，npm、pip 和 Electron 下载缓存默认分别写入数据目录下的 `cache/npm`、`cache/pip` 和 `cache/electron`。非空的 `npm_config_cache`、`PIP_CACHE_DIR` 和 `electron_config_cache` 设置会保留其显式指定的位置，这些位置可以在数据目录之外。所有平台的准备流程还会创建 `cache/tmp`，并为子进程设置 `TMPDIR`、`TEMP` 和 `TMP`，让下载、解包和构建使用所选磁盘，不再沿用系统临时目录；当前终端的环境变量不变。停止启动器后，备份或迁移时可以跳过可再生的 `cache/`。
 
 Windows 桌面启动还会在本实例的应用副本中准备并校验命令运行环境（PortableGit），供 Agent 使用 Bash、Git 和常用命令。无需单独安装 Git 或配置 WSL。后续启动会保留运行环境和下载缓存，并再次检查可用性；准备失败时查看 `startup.log`，解决日志报告的问题后重跑同一入口。

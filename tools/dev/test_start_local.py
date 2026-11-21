@@ -15,6 +15,8 @@ import sys
 import tempfile
 import time
 import unittest
+import venv
+import zipfile
 from unittest.mock import MagicMock, patch
 
 from tools.dev import local_environment as build
@@ -1461,6 +1463,60 @@ class LocalStartupTests(unittest.TestCase):
             with self.assertRaises(build.DiskFullError):
                 build.prepare(self.state, self.state / 'startup.log')
         self.assertFalse(any('pip' in call.args[0] for call in run.call_args_list))
+
+    def test_private_dependency_install_does_not_accept_a_package_only_on_pythonpath(self):
+        source = Path(self.temp.name) / 'source'
+        backend = source / 'hub-backend'
+        frontend = source / 'hub-frontend'
+        backend.mkdir(parents=True)
+        frontend.mkdir()
+        (backend / 'requirements.txt').write_text('soduwork-bootstrap-fixture==1.0\n')
+        (backend / 'requirements-runner.txt').write_text('')
+        (frontend / 'package-lock.json').write_text('{}')
+        outside = Path(self.temp.name) / 'outside-pythonpath'
+        outside.mkdir()
+        metadata = 'Metadata-Version: 2.1\nName: soduwork-bootstrap-fixture\nVersion: 1.0\n'
+        info = 'soduwork_bootstrap_fixture-1.0.dist-info'
+        (outside / info).mkdir()
+        (outside / info / 'METADATA').write_text(metadata)
+        (outside / 'soduwork_bootstrap_fixture.py').write_text('origin = "outside"\n')
+        wheels = Path(self.temp.name) / 'wheels'
+        wheels.mkdir()
+        files = {
+            'soduwork_bootstrap_fixture.py': 'origin = "private-venv"\n',
+            info + '/METADATA': metadata,
+            info + '/WHEEL': 'Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n',
+        }
+        files[info + '/RECORD'] = ''.join(name + ',,\n' for name in [*files, info + '/RECORD'])
+        with zipfile.ZipFile(wheels / 'soduwork_bootstrap_fixture-1.0-py3-none-any.whl', 'w') as wheel:
+            for name, content in files.items():
+                wheel.writestr(name, content)
+        self.state.mkdir()
+        venv.EnvBuilder(with_pip=True).create(self.state / 'venv')
+        python = self.state / 'venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+
+        def run(command, **kwargs):
+            if 'pip' in command:
+                result = subprocess.run(command, cwd=kwargs['cwd'], env=kwargs['env'],
+                                        capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+        with patch.dict(os.environ, {'PYTHONPATH': str(outside), 'PIP_NO_INDEX': '1',
+                                     'PIP_FIND_LINKS': str(wheels)}), \
+                patch.object(build, 'ROOT', source), \
+                patch.object(build, 'check_dependencies', return_value=('node', 'npm')), \
+                patch.object(build, 'sync_source'), patch.object(build, 'shutil'), \
+                patch.object(build, 'source_files', return_value=[]), \
+                patch.object(build, 'digest_files', return_value='fixture-digest'), \
+                patch.object(build, 'read_stamp', return_value=None), \
+                patch.object(build, 'verify_runner_environment'), \
+                patch.object(build, 'run', side_effect=run):
+            build.prepare(self.state, self.state / 'startup.log')
+        result = subprocess.run([str(python), '-I', '-c',
+                                 'import soduwork_bootstrap_fixture; print(soduwork_bootstrap_fixture.origin)'],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'private-venv')
 
     def test_venv_command_success_without_interpreter_is_reported_and_logged(self):
         """创建命令返回成功、解释器仍缺失：必须报错，而且原因要写进 startup.log。"""
