@@ -52,7 +52,7 @@ def main():
                 variants += [('catalog-tabs', 1440, 1000, 'light'), ('catalog-tabs', 390, 1000, 'dark')]
                 variants += [('catalog', 1280, 1000, 'light'), ('catalog', 1920, 1000, 'light')]
                 variants += [('featured-cover', 1440, 1000, 'light'), ('featured-cover', 390, 1000, 'dark')]
-                variants.append(('bulk-import', 1440, 1000, 'light'))
+                variants += [('bulk-import', 1440, 1000, 'light'), ('simulation', 1440, 1000, 'light')]
                 unknown = set(args.variant or []) - {f'{v}-{w}-{t}' for v, w, _, t in variants}
                 if unknown:
                     raise ValueError('Unknown render variants: ' + ', '.join(sorted(unknown)))

@@ -100,7 +100,7 @@ api.pluginRecommendation = async (id) => {
 }
 api.pluginRollout = async () => ({ items: [], summary: { active: 0, eligible: 0, breaking: 0, blocked: 0 } })
 api.pluginEvaluations = async (id) => { calls.push(['evaluation', id]); return { items: [], gate: { caseCount: 0 } } }
-api.projects = async () => ({ items: [] })
+api.projects = async () => []
 api.pluginCategories = async () => ({ items: [{ key: 'general', name: '通用能力', enabled: true }] })
 api.updatePluginCatalogPolicy = async (id, patch) => {
   calls.push(['recommend', id, patch])
@@ -267,6 +267,37 @@ try {
     await click(q('#plugin-catalog-tab-app'))
     check(all('.plugin-card').length === 1, 'application matches combined search and recommendation filters')
     await click(q('.filter-clear[aria-label="清空搜索插件"]'))
+  } else if (view === 'simulation') {
+    await open(plugins[0].id)
+    await click(button('审核与版本'))
+    const preflight = button('预检')
+    await click(preflight.closest('details').querySelector('summary'))
+    await click(preflight)
+    let finish
+    api.simulatePluginVersion = () => new Promise(resolve => { finish = resolve })
+    await click(button('开始模拟'))
+    await until(() => Boolean(finish))
+    const modal = q('.plugin-page.modal')
+    const close = button('关闭', modal)
+    const mask = modal.closest('.modal-mask')
+    check(close.disabled, 'Footer close is disabled during preflight')
+    await click(close)
+    check(modal.isConnected, 'The footer keeps the pending report open')
+    await click(modal.querySelector('.mx'))
+    mask.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    await click(mask)
+    await escape()
+    check(modal.isConnected, 'Header, backdrop and Escape retain the pending report')
+    finish({ ok: true, checks: [], plan: [] })
+    await until(() => q('.plugin-sim-verdict.ok'))
+    await click(button('关闭', modal))
+    check(!modal.isConnected, 'The finished report can be closed')
+    await click(preflight)
+    api.simulatePluginVersion = async () => { throw new Error('Fixture failure') }
+    await click(button('开始模拟'))
+    await until(() => button('开始模拟') && !button('开始模拟').disabled)
+    await escape()
+    check(!q('.plugin-sim-empty'), 'A failed preflight can be dismissed with Escape')
   } else if (view === 'bulk-import') {
     const files = ['正常包.zip', '待检查.zip'].map(name => new File(['样本文本'], name))
     let rejectSingle

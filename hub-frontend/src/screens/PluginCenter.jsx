@@ -239,7 +239,7 @@ export default function PluginCenter({ setupContext, onNavigate }) {
   }
   function chooseBulkFiles() {
     const input = document.createElement('input')
-    input.type = 'file'; input.multiple = true; input.accept = '.soduwork-plugin,.soduwork-plugin,.soduwork-plugin,.zip'
+    input.type = 'file'; input.multiple = true; input.accept = '.soduwork-plugin,.zip'
     input.addEventListener('change', () => {
       const files = Array.from(input.files || []).slice(0, 30)
       if (files.length) setBulkImport({ files })
@@ -669,7 +669,11 @@ function SimulationModal({ plugin, version, initialProjectId = '', onClose }) {
     try { setResult(await api.simulatePluginVersion(version.id, { projectId, agentKind })) } catch (e) { toast(tx("模拟失败：") + e.message) }
     setBusy(false)
   }
-  return <Modal scope="plugin-page" wide title={tx("预检与模拟 · {0}", [plugin.name])} icon="check" onClose={onClose} foot={<><button className="btn btn-ghost" onClick={onClose}>{tx("关闭")}</button><button className="btn btn-primary" disabled={busy} onClick={run}>{busy ? tx("正在体检…") : result ? tx("重新模拟") : tx("开始模拟")}</button></>}>
+  return <Modal scope="plugin-page" wide title={tx("预检与模拟 · {0}", [plugin.name])} icon="check"
+    onClose={busy ? undefined : onClose} foot={dismiss => <>
+      <button className="btn btn-ghost" disabled={busy} onClick={dismiss}>{tx("关闭")}</button>
+      <button className="btn btn-primary" disabled={busy} onClick={run}>{busy ? tx("正在体检…") : result ? tx("重新模拟") : tx("开始模拟")}</button>
+    </>}>
     <p className="plugin-modal-intro">{tx("选择真实项目与执行器，SoduWork 只检查版本、技能、Runner、仓库和环境，不创建需求、不拉代码、也不启动进程。")}</p>
     {loadError && <LoadIssue message={loadError} onRetry={loadProjects} />}
     <div className="form-pair"><Field label={tx("模拟项目")}><SelectMenu className="f-in" value={projectId} onChange={(e) => setProjectId(e.target.value)}><option value="">{tx("组织通用场景")}</option>{projects.map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}</SelectMenu></Field><AgentChoice value={agentKind} onChange={setAgentKind} /></div>

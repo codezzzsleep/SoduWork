@@ -37,6 +37,14 @@ Direct development uses local configuration and data; keep it separate from real
 
 API documentation: **http://127.0.0.1:9080/docs**. Health check: `GET /healthz`.
 
+## Diagnosing queued dispatches
+
+When the Runner first accepts a dispatch, its log records the execution reference and queue position.
+While it is queued, `GET /api/v1/tasks/{tid}/ai-status` can return `runner.waitReason`.
+`resource_pressure` means the Runner's resource budget is blocking new starts.
+`execution_slot` means all slots available to this work are occupied.
+The field is optional. Poll the same task to see the current reason or its transition to running.
+
 ## Desktop-local Runner event recovery
 
 Desktop-local Runner executions persist their event destination separately from the
@@ -342,6 +350,8 @@ The check verifies the packaged native verifier, real TLS with a disposable trus
 
 ## API and trust boundaries
 
+When posting usage to `POST /api/v1/usage/events`, omit `occurredAt` to use the time the Hub receives the event. Supply an ISO 8601 timestamp to report an earlier instant. The Hub interprets a timestamp without an offset as UTC. If an event has an invalid timestamp, the Hub returns HTTP 422 before recording any event in the batch.
+
 - Devices enroll with `POST /api/v1/clients/enroll`, then use a short-lived device session. Device long-term keys remain in the Electron main process; Hub stores only their digest.
 - Business requests use `Authorization: Device <session>`. WebSocket connectivity uses the same short-lived session at `/api/v1/ws`.
 - Tasks use `/api/v1/tasks`, task-specific operations, batch updates, completed-task clearing, and agent run/retry/takeover routes. Device preferences use `GET /api/v1/config?withRevision=true`. Send edited fields and the returned `_configRevision` to `PUT /api/v1/config`. The versioned response lists writable fields in `_configKeys`. Unknown fields and invalid values return 422, a stale revision returns 409, and replacing a previously saved value without a revision returns 428.
@@ -357,6 +367,8 @@ See [OAuth deployment and validation](CONNECTOR_OAUTH.en.md) for connector crede
 ### Listing records
 
 Under `/api/v1`, `admin/users`, `admin/orgs`, `admin/roles`, `admin/domains`, `tasks` and `schedules` return their existing arrays when called without pagination. Supply `limit` (1–200) or `offset` (zero-based) to receive `{items, total}`. With only an offset, the page size defaults to 50. The total counts visible records before pagination. An offset past the end returns an empty page.
+
+`GET /api/v1/admin/ai-schedules/{sid}/runs` returns up to 20 recent runs by default. Pass an integer `limit` from 1 to 200. Values outside this range return HTTP 422.
 
 Use `GET /api/v1/admin/client-inventory` for an object containing `items`, `total`, `counts`, `page`, `pageSize` and `offset` on every call. Choose `page` and `pageSize` (1–100, default 25), or `offset` and `limit`. Existing callers of `admin/clients` can still request the legacy array or use `paged=1` for an object.
 

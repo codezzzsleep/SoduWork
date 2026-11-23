@@ -455,11 +455,6 @@ async def update_user(
     if not user.is_super or body.orgId is not None:
         await rbac.lock_org_tree(session, shared=True)
     await _assert_user_in_scope(session, user, target)
-    if body.password is not None:
-        if len(body.password) < 8:
-            raise HTTPException(status_code=422, detail="密码长度不能少于 8 个字符")
-        if len(body.password) > 128:
-            raise HTTPException(status_code=422, detail="密码长度不能超过 128 个字符")
     if body.orgId is not None:
         await _assert_org_in_scope(session, user, body.orgId)
         await _require_existing_org(session, body.orgId)
@@ -617,15 +612,18 @@ async def update_domain(
     if "name" in body and body["name"] is None:
         raise HTTPException(status_code=422, detail="领域名称必须为 1 到 64 个字符")
     try:
-        r = await rbac.update_domain(session, did, body.get("name"), sort)
+        change = await rbac.update_domain(session, did, body.get("name"), sort)
     except DuplicateName as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="领域名称必须为 1 到 64 个字符") from exc
-    if r is None:
+    if change is None:
         raise HTTPException(status_code=404, detail="领域不存在")
-    await audit.log(session, user, "domain.update", "domain", did, r["name"], {})
-    return r
+    before, after = change
+    audit.add(session, user, "domain.update", "domain", did, after["name"],
+              {"before": before, "after": after})
+    await session.commit()
+    return after
 
 
 @router.delete("/domains/{did}")

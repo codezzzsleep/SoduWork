@@ -45,6 +45,8 @@ check("release profile is deterministic-only", scripts_for("release") == RELEASE
 check("extended profile includes release and extended checks",
       scripts_for("extended") == RELEASE_SMOKES + EXTENDED_SMOKES)
 for profile in ("release", "extended"):
+    check("documented SQLite upgrade regression runs exactly once in " + profile,
+          scripts_for(profile).count("test_release_schema_history.py") == 1)
     check("fixed acceptance evidence regressions are selected once in " + profile,
           scripts_for(profile).count("test_acceptance_evidence_refs.py") == 1)
 check("live profile never pulls offline checks in implicitly", scripts_for("live") == LIVE_SMOKES)

@@ -346,16 +346,24 @@ export function takeNav(screen) {
 /* ---------- toast ---------- */
 export function toast(msg) { window.dispatchEvent(new CustomEvent('soduwork-hub-toast', { detail: msg })) }
 export function ToastHost() {
-  const uiLocale = useLocale();
-  const [msg, setMsg] = useState(null)
+  const [notice, setNotice] = useState(null)
   useEffect(() => {
     let timer
-    const h = (e) => { setMsg(e.detail); clearTimeout(timer); timer = setTimeout(() => setMsg(null), 2400) }
-    window.addEventListener('soduwork-hub-toast', h)
-    return () => { window.removeEventListener('soduwork-hub-toast', h); clearTimeout(timer) }
+    let sequence = 0
+    const handleToast = event => {
+      setNotice({ id: ++sequence, message: event.detail })
+      clearTimeout(timer)
+      timer = setTimeout(() => setNotice(null), 2400)
+    }
+    window.addEventListener('soduwork-hub-toast', handleToast)
+    return () => {
+      window.removeEventListener('soduwork-hub-toast', handleToast)
+      clearTimeout(timer)
+    }
   }, [])
-  if (!msg) return null
-  return <div className="toast">{msg}</div>
+  return <div role="status" aria-live="polite" aria-atomic="true">
+    {notice && <div className="toast" key={notice.id}>{notice.message}</div>}
+  </div>
 }
 
 /* Data-loading hook. */
@@ -504,8 +512,8 @@ export function BoxPick({ clients, selected, onToggle, onSet }) {
       <div className="bp-bar">
         <div className="searchbox sm filter-input"><Icon name="search" /><input ref={searchRef} aria-label={tx("搜索 SoduWork")} value={q} onChange={(e) => setQ(e.target.value)} placeholder={tx("搜索 SoduWork…")} />{q && <button type="button" className="filter-clear" aria-label={tx("清空搜索 SoduWork")} title={tx("清空")} onClick={() => { setQ(''); searchRef.current?.focus() }}>×</button>}</div>
         <span className="muted xsm">{tx("已选 ")}{selected.length}</span>
-        {onSet && <a className="bp-act" onClick={() => onSet(onlineIds)}>{tx("全选在线")}</a>}
-        {onSet && selected.length > 0 && <a className="bp-act" onClick={() => onSet([])}>{tx("清空")}</a>}
+        {onSet && <button type="button" className="bp-act" onClick={() => onSet(onlineIds)}>{tx("全选在线")}</button>}
+        {onSet && selected.length > 0 && <button type="button" className="bp-act" onClick={() => onSet([])}>{tx("清空")}</button>}
       </div>
       <div className="box-pick scroll">
         {shown.length === 0 && <span className="muted">{tx("无匹配 SoduWork")}</span>}

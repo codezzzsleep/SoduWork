@@ -367,6 +367,21 @@ class HubContractTests(unittest.IsolatedAsyncioTestCase):
         await self.request("POST", "admin/work-catalog/professions", 400,
                            json={"orgId": "row-0", "name": "Analyst", "category": "unlisted"})
 
+    async def test_profession_writes_identify_invalid_competencies(self):
+        for path in ("admin/work-catalog/professions", "admin/positions"):
+            with self.subTest(path=path):
+                profile = {"orgId": "row-0", "name": path.rsplit("/", 1)[-1]}
+                rejected = await self.request("POST", path, 400, json={**profile, "competencies": 12345})
+                self.assertEqual(rejected["detail"], "competencies 必须是数组")
+                created = await self.request("POST", path, json={**profile, "competencies": ["Planning"]})
+                endpoint = f"{path}/{created['id']}"
+                rejected = await self.request("PATCH", endpoint, 400, json={"competencies": 12345})
+                self.assertEqual(rejected["detail"], "competencies 必须是数组")
+                unchanged = await self.request("PATCH", endpoint, json={"description": "Updated profile"})
+                self.assertEqual(unchanged["competencies"], ["Planning"])
+                updated = await self.request("PATCH", endpoint, json={"competencies": ["Writing"]})
+                self.assertEqual(updated["competencies"], ["Writing"])
+
     async def test_users_and_positions_require_an_existing_department(self):
         body = {"username": "candidate", "password": "example-password", "orgId": "missing"}
         self.assertEqual((await self.request("POST", "admin/users", 400, json=body))["detail"], "部门不存在")
