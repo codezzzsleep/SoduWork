@@ -286,6 +286,58 @@ class AcceptanceReviewTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(caught.exception.status_code, 422)
                 self.assertEqual(self.request.status, "pending")
 
+    async def prepare_review_only_actor(self):
+        self.task.created_by = "creator"
+        self.task.owner_client_id = "executor-device"
+        self.task.owner_user_id = self.task.assignee_user_id = "executor"
+        self.task.requirement_content = {"title": "Public requirement", "note": "Public brief"}
+        self.task.note = "Private execution instruction"
+        self.task.work_routing = {"executionContext": {"note": "Private runtime configuration"}}
+        self.artifact.checksum = "a" * 64
+        self.request.policy_snapshot = {"reviewRoutingVersion": 2, "separationOfDuties": False}
+        self.session.add(models.Attachment(id="private-process", task_id=self.task.id,
+            filename="Private process.txt", role="process", size=7, evidence_meta={"sha256": "b" * 64}))
+        await self.session.commit()
+
+    async def test_review_only_actor_can_cite_fixed_evidence_and_retry_without_execution_access(self):
+        await self.prepare_review_only_actor()
+        context = await self.context()
+        self.assertTrue(context["canDecide"])
+        self.assertFalse(context["task"]["canViewExecution"])
+        self.assertEqual(context["task"]["note"], "Public brief")
+        self.assertNotIn("workRouting", context["task"])
+        self.assertEqual(context["optionalAttachments"], [])
+        ref = {"kind": "text", "ref": "artifact:artifact-1:text", "fingerprint": "a" * 64}
+        self.assertEqual(context["evidenceRefOptions"], [ref])
+        body = self.body()
+        body["report"]["checks"][0]["evidenceRefs"] = [ref]
+        result = await api.auto_review_task_artifact(self.task.id, body, self.client, self.session)
+        self.assertTrue(result["closed"])
+        self.assertFalse(result["task"]["canViewExecution"])
+        self.assertNotIn("workRouting", result["task"])
+        repeated = await api.auto_review_task_artifact(self.task.id, body, self.client, self.session)
+        self.assertTrue(repeated["already"])
+        self.assertEqual(repeated["task"]["note"], "Public brief")
+        self.assertNotIn("workRouting", repeated["task"])
+        saved = self.request.context["aiAcceptanceReports"][self.actor.id]["report"]
+        self.assertEqual(saved["checks"][0]["evidenceRefs"], [ref])
+        self.assertEqual(len((await self.session.scalars(select(am.ApprovalDecision))).all()), 1)
+
+    async def test_review_only_actor_cannot_cite_private_process_evidence_or_changed_fingerprint(self):
+        await self.prepare_review_only_actor()
+        for ref in ({"kind": "file", "ref": "private-process", "fingerprint": "b" * 64},
+                    {"kind": "text", "ref": "artifact:artifact-1:text", "fingerprint": "c" * 64}):
+            with self.subTest(ref=ref):
+                body = self.body()
+                body["report"]["checks"][0]["evidenceRefs"] = [ref]
+                with self.assertRaises(HTTPException) as caught:
+                    await api.auto_review_task_artifact(self.task.id, body, self.client, self.session)
+                self.assertEqual(caught.exception.status_code, 422)
+                self.assertNotIn("Private", str(caught.exception.detail))
+                self.assertEqual(self.request.status, "pending")
+        self.assertIsNone(self.task.reviewed_at)
+        self.assertEqual(len((await self.session.scalars(select(am.ApprovalDecision))).all()), 0)
+
     async def test_report_retains_per_check_references_to_the_fixed_artifact(self):
         self.artifact.checksum = "a" * 64
         await self.session.commit()
