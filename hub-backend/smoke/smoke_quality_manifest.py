@@ -44,6 +44,9 @@ check("manifest covers smoke files and explicitly registered unittest entries",
 check("release profile is deterministic-only", scripts_for("release") == RELEASE_SMOKES)
 check("extended profile includes release and extended checks",
       scripts_for("extended") == RELEASE_SMOKES + EXTENDED_SMOKES)
+for profile in ("release", "extended"):
+    check("fixed acceptance evidence regressions are selected once in " + profile,
+          scripts_for(profile).count("test_acceptance_evidence_refs.py") == 1)
 check("live profile never pulls offline checks in implicitly", scripts_for("live") == LIVE_SMOKES)
 check("every tier is non-empty", all((RELEASE_SMOKES, EXTENDED_SMOKES, LIVE_SMOKES)))
 with tempfile.TemporaryDirectory(prefix="soduwork-misplaced-smoke-") as temporary:
@@ -77,6 +80,16 @@ distributed = Counter(test_ids(loader.loadTestsFromNames([
     "test_handoff_maintenance_boundary", "test_notice_audience_regression", "test_requirement_review_access"])))
 check("distributed maintenance entries preserve every aggregate test exactly once",
       bool(expected) and expected == distributed and not loader.errors, loader.errors)
+evidence_loader = unittest.TestLoader()
+expected_evidence = Counter(test_ids(evidence_loader.loadTestsFromNames([
+    "tests.test_task_acceptance_review.AcceptanceReviewTests",
+    "tests.test_cloud_acceptance.MobileAcceptanceTests",
+])))
+gated_evidence = Counter(test_ids(evidence_loader.loadTestsFromName("test_acceptance_evidence_refs")))
+check("fixed evidence release entry preserves every desktop and cloud case exactly once",
+      bool(expected_evidence) and expected_evidence == gated_evidence
+      and max(gated_evidence.values(), default=0) == 1 and not evidence_loader.errors,
+      evidence_loader.errors)
 check("account deletion and device-channel revocation stay in the offline release gate",
       {"test_account_privacy.py", "test_device_connections.py"} <= set(RELEASE_SMOKES))
 check("tier entries stay sorted for reviewability",
