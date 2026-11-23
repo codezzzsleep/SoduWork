@@ -224,6 +224,7 @@ function buildPage() {
   for (const file of ['core/model-choice.js', 'core/plugin-icon.js', 'core/requirements.js', 'core/requirement-session-context.js',
     'components/panels/chat-collaboration.js', 'components/panels/chat-task-session.js', 'components/panels/agent-brand.js',
     'components/panels/panels-compose-runtime.js', 'components/panels/compose-execution.js', 'components/panels/panels-compose-model-picker.js',
+    'components/panels/compose-directory-preferences.js',
     'components/panels/compose-candidate-navigation.js', 'components/panels/panels-compose-capabilities.js',
     'components/panels/chat-plugin-mention-model.js', 'components/panels/chat-plugin-mention.js',
     'components/panels/chat-message-plugins.js', 'components/panels/plugin-ui-host.js',
@@ -313,11 +314,13 @@ async function restoreFromReenrolledDevice(savedCard, selection, changedHub = fa
   assert.equal(created.ok, true, created.reason);
   const card = structuredClone(savedCard); card.revision = 0; card.state.ownerScope = previousScope;
   const saved = await store.save(created.sessionId, card); assert.equal(saved.ok, true, saved.reason);
+  const savedBytes = fs.readFileSync(module.location(isolatedApp, created.sessionId), 'utf8');
   current = identity('device-after-reenrollment', changedHub ? 'https://another-fixture.invalid' : undefined);
   const result = await module.create(dependencies).read(created.sessionId);
-  assert.equal(JSON.parse(fs.readFileSync(module.location(isolatedApp, created.sessionId), 'utf8')).cards[0].state.ownerScope,
-    previousScope, 'reading never rewrites the persisted owner marker');
-  return { sessionId: created.sessionId, result, ownerScope: uiScope(current), previousScope };
+  assert.equal(fs.readFileSync(module.location(isolatedApp, created.sessionId), 'utf8'),
+    savedBytes, 'reading never rewrites the persisted archive');
+  return { sessionId: created.sessionId, result, ownerScope: uiScope(current), previousScope,
+    persisted: JSON.parse(savedBytes) };
 }
 async function mountAuthenticatedArchive(archive) {
   await reloadPage();
@@ -673,7 +676,7 @@ app.whenReady().then(async () => {
       assert.equal(await js('calls.creates.length'), 1, 'keeping or reopening the receipt never creates another requirement');
     });
   }
-  await runCase('empty default model archive opens the requirement plus picker and adds a ready task', async () => {
+  await runCase('empty model archive selects the first available model when adding a ready requirement', async () => {
     const sessionId = await createWorkDraft({ defaults: true });
     await js(`const archive=fixtureArchives['fixture-owner:'+NativeChat.sessionInfo().sessionId];
       archive.draftSelection={adapterId:'pi',modelName:'',modelLabel:'',reasoningEffort:'',thinkingLevel:''};
@@ -688,7 +691,7 @@ app.whenReady().then(async () => {
     await until('calls.sends.length===1', 'default model selected requirement sent');
     const state = await phase('default-empty-model-add-requirement');
     assert.equal(state.calls.opens.length, 1); assert.equal(state.calls.opens[0].chatId, sessionId);
-    assert.equal(state.calls.opens[0].adapterId, 'pi'); assert.equal(state.calls.opens[0].modelName, '');
+    assert.equal(state.calls.opens[0].adapterId, 'pi'); assert.equal(state.calls.opens[0].modelName, 'fixture-default');
     assert.equal(state.calls.sends[0].options.taskId, 'ready-existing');
     assert.equal(state.session.sessionId, sessionId); assert.equal(state.calls.creates.length, 0);
   });
@@ -823,10 +826,14 @@ app.whenReady().then(async () => {
     const saved = await js('structuredClone(calls.saves.at(-1).card)');
     const selection = await js("structuredClone(fixtureArchives['fixture-owner:'+NativeChat.sessionInfo().sessionId].draftSelection)");
     const archive = await restoreFromReenrolledDevice(saved, selection, true);
-    assert.equal(archive.result.ok, true, archive.result.reason);
-    assert.equal(archive.result.cards[0].state.ownerScope, archive.previousScope, 'cross-Hub scope is not rewritten');
-    assert.deepEqual(archive.result.cards[0].state.draft, saved.state.draft, 'rejected content is preserved exactly');
-    await mountAuthenticatedArchive(archive);
+    assert.equal(archive.result.ok, false, 'the actual main-process read rejects a different Hub');
+    assert.match(archive.result.reason, /另一个账号或服务/);
+    assert.equal(archive.result.cards, undefined, 'rejected reads disclose no saved cards');
+    assert.equal(archive.persisted.cards[0].state.ownerScope, archive.previousScope, 'cross-Hub scope is not rewritten');
+    assert.deepEqual(archive.persisted.cards[0].state.draft, saved.state.draft, 'rejected content is preserved exactly');
+    // Also retain the renderer's independent rejection of an incorrectly returned card.
+    await mountAuthenticatedArchive({ ...archive, result: { ok: true, workOnly: true,
+      cards: archive.persisted.cards, draftSelection: selection, draftSelectionRevision: 0 } });
     // The sheet's 120 ms repair loop must not replace an ownership rejection.
     await js('new Promise(resolve=>setTimeout(resolve,350))');
     const state = await phase('work-only-rejected-scope');
@@ -842,7 +849,7 @@ app.whenReady().then(async () => {
   await runCase('changing both draft Agent and model persists the explicit replacement across reload', async () => {
     const sessionId = await createWorkDraft();
     await click('#nchatRuntime');
-    assert.deepEqual(await js("[...document.querySelectorAll('[data-session-agent] .agent-monogram')].map(node=>node.textContent)"), ['PI', 'QW']);
+    assert.deepEqual(await js("[...document.querySelectorAll('[data-session-agent] [data-agent-brand]')].map(node=>node.dataset.agentBrand)"), ['pi', 'qwen']);
     await click('[data-session-agent="pi"]');
     await until("document.querySelector('#nchatRuntimeName').textContent==='Pi'", 'replacement draft Agent');
     await click('#nchatModel .nmodel-button'); await click('[data-model-name="fixture-default"]');
@@ -937,6 +944,7 @@ app.whenReady().then(async () => {
   });
   await require('./requirement-session-navigation-cases.cjs')({ runCase, js, click, until, phase, reloadPage,
     recordNavigation: sample => report.navigationTimings.push(sample) });
+  await require('./directory-session-defaults-cases.cjs')({ runCase, js, click, type, until, setup, reloadPage });
   report.ok = report.cases.length > 0 && report.cases.every(item => item.ok) && report.network.length === 0;
 }).catch(error => { report.error = error.stack; }).finally(() => {
   win?.destroy(); fs.writeFileSync(path.join(out, 'report.json'), JSON.stringify(report, null, 2));

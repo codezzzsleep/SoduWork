@@ -1,16 +1,19 @@
 """Automation execution validation, capability checks and machine preflight."""
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import models
+from .model_reference_privacy import is_local_model_reference
 from .schedule_repo_scope import resolve_repo
 from .schedule_timing import validate as validate_timing
 from .schedule_run_contracts import (
     clean_plugin_inputs, clean_required_capabilities,
     normalize_personal_plugin_snapshot,
+    schedule_model_source,
 )
 
 
@@ -40,6 +43,31 @@ def normalize_conversation_schedule(s):
 def required_skill_names(raw) -> list[str]:
     return [CAPABILITY_SKILLS[key] for key in clean_required_capabilities(raw)
             if key in CAPABILITY_SKILLS]
+
+
+def device_model_target_error(s) -> str:
+    """Reject a device-owned model when the selected Runner is not this desktop."""
+    if schedule_model_source(s) != "device":
+        return ""
+    assignee = str(getattr(s, "assignee_id", "") or "").strip()
+    runtime = assignee.replace("local:", "", 1) if assignee.startswith("local:") else ""
+    from ..agent_catalog import AGENTS
+    if runtime and AGENTS.get(runtime, {}).get("modelMode") == "managed":
+        return ""
+    match = re.fullmatch(r"runner:([^:]+):([a-z][a-z0-9-]{0,39})", assignee)
+    if not match or AGENTS.get(match.group(2), {}).get("modelMode") != "managed":
+        return "本地模型只能绑定本机托管型执行底座"
+    from . import runner_hub
+    runner = runner_hub.get(assignee.split(":", 2)[1])
+    if runner is None:
+        # An offline Runner may be the same desktop; preserve the existing
+        # waiting semantics and let the owning client verify its identity.
+        return ""
+    owner = str(getattr(s, "owner_client_id", "") or "").strip()
+    runner_client = str(getattr(runner, "client_id", "") or "").strip()
+    if not owner or runner_client != owner:
+        return "本地模型只能在本机托管型执行底座运行，不能派往其他执行机"
+    return ""
 
 
 def _capability_remediation(runner, verdict) -> tuple[str, str]:
@@ -82,6 +110,24 @@ def capability_save_blocker(s) -> str:
     return message
 
 
+async def _check_owner_client_org(session, s, org_ids):
+    """Ensure the owner client belongs to the authorized org scope."""
+    if org_ids is None:
+        return  # super admin or no scope restriction
+    client_id = str(getattr(s, "owner_client_id", "") or "")
+    if not client_id:
+        return
+    client = await session.get(models.Client, client_id)
+    if client is None:
+        raise ValueError("请先选择任务归属的 SoduWork")
+    # Resolve org through the client's user_ref
+    user_ref = str(getattr(client, "user_ref", "") or "")
+    if user_ref:
+        user = await session.get(models.User, user_ref)
+        if user and user.org_id and user.org_id not in org_ids:
+            raise ValueError("该 SoduWork 不在你的组织管辖范围内")
+
+
 async def validate_direct_execution(session: AsyncSession, s):
     """Validate policy and Skill availability without requiring a Runner online."""
     capabilities = clean_required_capabilities(
@@ -98,16 +144,46 @@ async def validate_direct_execution(session: AsyncSession, s):
         session, required_skill_names(capabilities), client)
 
 
-async def validate_selected_model(session: AsyncSession, s) -> None:
+def _owner_desktop_model_selection(s, client) -> bool:
+    """Only the original desktop may resolve a missing choice from private models."""
+    from ..agent_catalog import AGENTS
+    from . import runner_hub, schedule_access
+    if not schedule_access.is_owner(s, client):
+        return False
+    aid = str(getattr(s, "assignee_id", "") or "").strip()
+    if aid.startswith("local:"):
+        runtime = aid.split(":", 1)[1]
+    elif aid.startswith("runner:"):
+        parts = aid.split(":", 2)
+        if len(parts) != 3:
+            return False
+        runner = runner_hub.get(parts[1])
+        if runner is None or str(getattr(runner, "client_id", "") or "") != str(client.id):
+            return False
+        runtime = parts[2]
+    else:
+        return False
+    return AGENTS.get(runtime, {}).get("modelMode") == "managed"
+
+
+async def validate_selected_model(session: AsyncSession, s, *, allow_missing_model: bool = False) -> None:
     """Reject a saved model that the selected Agent cannot actually use.
 
     The editor performs the same check during preflight, but save and immediate
     run are also public API boundaries.  Keeping this validation here prevents
     older clients (or direct API callers) from persisting a gateway model that is
     unavailable for the selected Agent and only discovering it after dispatch.
-    An empty value deliberately means "follow the Agent default" for legacy rows.
+    An empty managed value is resolved by the execution endpoint. At run time,
+    the owning desktop can also replace a confirmed missing managed selection.
+    Device-owned selections retain only their source marker; the desktop
+    resolves their private model after verifying the local mapping's ownership.
     """
+    device_error = device_model_target_error(s)
+    if device_error:
+        raise ValueError(device_error)
     model_name = str(getattr(s, "model_name", "") or "").strip()
+    if model_name and schedule_model_source(s) == "device":
+        raise ValueError("本地模型只允许保存设备模型来源标记")
     if not model_name:
         return
     aid = str(getattr(s, "assignee_id", "") or "").strip()
@@ -123,6 +199,13 @@ async def validate_selected_model(session: AsyncSession, s) -> None:
         "local:" + aid.rsplit(":", 1)[-1] if aid.startswith("runner:") else aid)
     state = await _schedule_model_readiness(session, client, ctx, model_kind, model_name)
     if not state.get("ok"):
+        # Saving remains strict. At execution time, the authenticated owner
+        # desktop can select its first usable private/Hub model without sending
+        # that private selection back to the Hub. Catalog outages, native
+        # account models and other execution devices cannot take this path.
+        if (allow_missing_model and state.get("code") == "MODEL_NOT_IN_CATALOG"
+                and _owner_desktop_model_selection(s, client)):
+            return
         raise ValueError(str(state.get("detail") or "所选模型不可用")[:240])
 
 
@@ -137,6 +220,9 @@ async def _schedule_model_readiness(session, client, ctx: dict,
     from . import agent_execution_options, agent_route_selection, model_catalog
 
     model_kind, model_name = str(model_kind or "").strip(), str(model_name or "").strip()
+    if is_local_model_reference(model_name):
+        return {"ok": False, "model": "",
+                "detail": "本地模型只允许保存设备模型来源标记"}
     if not model_name:
         return {"ok": True, "model": "", "detail": "跟随底座默认模型"}
     if agent_execution_options.is_native_model_kind(model_kind) or not agent_execution_options.supports_soduwork_model_kind(model_kind):
@@ -144,15 +230,13 @@ async def _schedule_model_readiness(session, client, ctx: dict,
     try:
         choices = await model_catalog.choices(session, client)
     except Exception:
-        # Older isolated databases may not yet have the model catalog tables.
-        # Preserve the legacy readiness check there; current Hubs use the live
-        # catalog above and therefore do not silently accept removed models.
-        return agent_route_selection.model_readiness(ctx, model_kind, model_name)
+        return {"ok": False, "model": model_name,
+                "detail": "模型目录暂时无法读取，请刷新后重新选择模型"}
     allowed = {str(choices.get("default") or "").strip()}
     allowed.update(str(item or "").strip() for item in choices.get("list") or [])
     allowed.discard("")
     if model_name not in allowed:
-        return {"ok": False, "model": model_name,
+        return {"ok": False, "model": model_name, "code": "MODEL_NOT_IN_CATALOG",
                 "detail": f"模型「{model_name}」未在当前企业开放的模型清单中"}
     return {"ok": True, "model": model_name, "detail": f"模型「{model_name}」可用"}
 
@@ -160,6 +244,12 @@ async def _schedule_model_readiness(session, client, ctx: dict,
 async def preflight_execution(session: AsyncSession, s,
                               org_ids: set[str] | None = None) -> dict:
     """Hub owns runtime policy; device-only dependencies need a separate check."""
+    device_error = device_model_target_error(s)
+    if device_error:
+        mode = ("personal" if str(getattr(s, "personal_plugin_key", "") or "")
+                else "direct")
+        return {"state": "blocked", "mode": mode, "message": device_error,
+                "checks": [{"key": "model", "state": "blocked", "label": device_error}]}
     result = await _preflight_execution(session, s, org_ids=org_ids)
     if result.get("mode") != "personal" or result.get("state") == "blocked":
         return result
@@ -227,9 +317,9 @@ async def _preflight_execution(session: AsyncSession, s,
                 "message": "执行设备的登录账号已变更，请原账号登录后再执行"}
     if not aid:
         return {"state": "blocked", "mode": mode,
-                "message": "请先选择执行 Agent",
+                "message": "请先选择执行底座",
                 "checks": [{"key": "agent", "state": "blocked",
-                            "label": "尚未选择执行 Agent"}]}
+                            "label": "尚未选择执行底座"}]}
     from . import ai_exec
     try:
         ctx = await ai_exec.load(session, force=True)
@@ -330,10 +420,13 @@ async def _preflight_execution(session: AsyncSession, s,
 
 
 async def validate_execution(session: AsyncSession, s,
-                             org_ids: set[str] | None = None):
+                             org_ids: set[str] | None = None, *, allow_missing_model: bool = False):
     """Validate the selected immutable automation binding at save and run time."""
     normalize_conversation_schedule(s)
     validate_timing(s)
+    device_error = device_model_target_error(s)
+    if device_error:
+        raise ValueError(device_error)
     binding_id = str(getattr(s, "plugin_binding_id", "") or "")
     personal_key = str(getattr(s, "personal_plugin_key", "") or "")
     if personal_key and binding_id:
@@ -346,11 +439,13 @@ async def validate_execution(session: AsyncSession, s,
         if not str(getattr(s, "assignee_id", "") or ""):
             raise ValueError("个人插件自动化还需要选择执行 Agent")
         s.plugin_inputs = clean_plugin_inputs(getattr(s, "plugin_inputs", {}) or {})
-        await validate_selected_model(session, s)
+        await _check_owner_client_org(session, s, org_ids)
+        await validate_selected_model(session, s, allow_missing_model=allow_missing_model)
         await validate_direct_execution(session, s)
         return None
     if not binding_id:
-        await validate_selected_model(session, s)
+        await _check_owner_client_org(session, s, org_ids)
+        await validate_selected_model(session, s, allow_missing_model=allow_missing_model)
         await validate_direct_execution(session, s)
         return None
     if str(getattr(s, "model_name", "") or "").strip():

@@ -23,6 +23,23 @@ _OUTPUT_MAX = 512 * 1024 * 1024
 
 _ACTIVE_AGENT_KEYS = frozenset(AGENTS)
 
+# A local model is resolved from the Runner's encrypted local catalog.  When a
+# remote Runner response is relayed through Hub, keep that model reference on
+# the execution device instead of persisting it in the Hub response envelope.
+_MODEL_REFERENCE_KEYS = frozenset(("model", "modelName", "modelRef", "modelId", "localModel"))
+
+
+def _redact_local_model_fields(value):
+    """Remove local model references from a response crossing the Hub boundary."""
+    if isinstance(value, dict):
+        return {
+            key: ("" if key in _MODEL_REFERENCE_KEYS else _redact_local_model_fields(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_local_model_fields(item) for item in value]
+    return value
+
 
 def _active_agent_key(value: str) -> str:
     """Normalize a runner's portable CLI key for catalog admission."""
@@ -309,6 +326,15 @@ def dispatch_sync(cfg: dict, t, files: list | None = None,
     """Dispatch to the selected Runner and return the same result shape as ai_local, including
     issueId as the execution ref.
     """
+    from .schedule_run_contracts import is_local_model_reference
+    configs = [cfg or {}, *(dict(ctx or {}).get(key) or {} for key in ("cfg", "localCfg"))]
+    selection = dict((assignee or {}).get("selection") or {})
+    if (any(dict(config.get("llm") or {}).get("localOnly") is True or
+            is_local_model_reference(dict(config.get("llm") or {}).get("model"))
+            for config in configs if isinstance(config, dict)) or
+            any(is_local_model_reference(selection.get(key)) for key in ("model", "modelName"))):
+        return {"ok": False, "code": "LOCAL_MODEL_REMOTE_FORBIDDEN",
+                "error": "本地模型只能在本机使用，不能进入远程执行请求"}
     aid = (assignee or {}).get("id") or ""
     rid, cli = _parse(aid)
     r = runner_hub.get(rid)
@@ -424,11 +450,12 @@ def dispatch_sync(cfg: dict, t, files: list | None = None,
             note_accepted(dispatch_state == "queued")
     agent = next((item for item in (r.agents or [])
                   if str(item.get("key") or "") == cli), {})
-    fallback_model = (dict((cfg or {}).get("llm") or {}).get("model")
-                      if "local:" + cli in GATEWAY_MODEL_KINDS else "")
-    model = str(d.get("model") or fallback_model or "")
+    llm = dict((cfg or {}).get("llm") or {})
+    local_only = d.get("localOnly") is True
+    fallback_model = (llm.get("model") if "local:" + cli in GATEWAY_MODEL_KINDS else "")
+    model = "" if local_only else str(d.get("model") or fallback_model or "")
     from . import turn_correlation
-    return {"ok": True, "issueId": d.get("ref", ""), "identifier": d.get("identifier", ""),
+    result = {"ok": True, "issueId": d.get("ref", ""), "identifier": d.get("identifier", ""),
             **turn_correlation.public(d),
             "url": "", "provider": "runner", "assigneeType": "agent",
             "assigneeId": aid,
@@ -450,6 +477,12 @@ def dispatch_sync(cfg: dict, t, files: list | None = None,
             "queued": dispatch_state == "queued",
             "queuePosition": max(0, int(d.get("queuePosition") or 0)),
             "queueClass": str(d.get("queueClass") or "task")}
+    # Keep local model references on the Runner.  The Hub still receives the
+    # dispatch acknowledgement and execution identity, but cannot persist the
+    # local catalog's opaque reference in its response or task projection.
+    from .schedule_run_contracts import sanitize_schedule_model_payload
+    return (_redact_local_model_fields(result) if local_only else
+            sanitize_schedule_model_payload(result))
 
 
 def _runner_of_ref(ref: str):
@@ -488,11 +521,18 @@ async def runner_of_ref_async(ref: str):
     return None
 
 
-def status_sync(cfg: dict, ref: str) -> dict:
-    r = _runner_of_ref(ref)
+def status_sync(cfg: dict, ref: str, *, runner_id: str = "") -> dict:
+    r = runner_hub.get(runner_id) if runner_id else _runner_of_ref(ref)
     if r is None:
         return {"ok": False, "error": "这条活所在的执行机不在线"}
     res = runner_hub.call_sync(r, "job.status", {"ref": ref}, timeout=60)
+    if runner_id and res.get("ok"):
+        snapshot = res.get("data") or {}
+        if not snapshot.get("ok") and not snapshot.get("done"):
+            # job.has can reclaim an archived ref missing from the Runner's live map.
+            found = runner_hub.call_sync(r, "job.has", {"ref": ref}, timeout=15)
+            if found.get("ok") and (found.get("data") or {}).get("has"):
+                res = runner_hub.call_sync(r, "job.status", {"ref": ref}, timeout=60)
     if not res.get("ok"):
         return {"ok": False, "error": res.get("error") or "问不到状态"}
     d = dict(res.get("data") or {})
@@ -555,6 +595,37 @@ def runner_info_sync(cfg: dict, ref: str) -> dict:
     if d:
         d["device"] = r.host
     return d
+
+
+async def read_session(ref: str, since: int = 0, limit: int = 400, *, runner_id: str = "") -> dict:
+    """Read only the authorized execution endpoint; keep all RPCs cancellable."""
+    runner = runner_hub.get(runner_id) if runner_id else await runner_of_ref_async(ref)
+    if runner is None:
+        return {"ok": False, "items": [], "error": "这条活所在的执行机不在线"}
+    packet = {
+        "ref": ref, "since": max(0, int(since or 0)),
+        "limit": min(1000, max(1, int(limit or 400))),
+    }
+    # A durable owner is authoritative. Only legacy records without one retain
+    # rolling-upgrade discovery when an old Runner lacks job.session support.
+    candidates = [runner] if runner_id else [runner] + [r for r in runner_hub.online() if r.id != runner.id]
+    error = "远程会话拿不到"
+    for index, candidate in enumerate(candidates):
+        if index:
+            found = await candidate.call("job.has", {"ref": ref}, timeout=15)
+            owner = found.get("data") or {}
+            if not found.get("ok") or not (owner.get("has") or owner.get("found")):
+                continue
+        result = await candidate.call("job.session", packet, timeout=30)
+        if not result.get("ok"):
+            error = result.get("error") or error
+            continue
+        data = dict(result.get("data") or {})
+        data.setdefault("ok", True)
+        data.update(runnerId=candidate.id, host=candidate.host)
+        remember(ref, candidate.id)
+        return data
+    return {"ok": False, "items": [], "error": error}
 
 
 def session_sync(cfg: dict, ref: str, since: int = 0, limit: int = 400) -> dict:
@@ -642,11 +713,11 @@ def _download(r, ref: str, att_id: str) -> bytes | None:
             return None
 
 
-def fetch_attachment_for_sync(cfg: dict, ref: str, att_id: str) -> bytes | None:
+def fetch_attachment_for_sync(cfg: dict, ref: str, att_id: str, *, runner_id: str = "") -> bytes | None:
     """Fetch an artifact from its execution's Runner and workspace. The execution ref prevents
     collisions between identical relative paths in different tasks.
     """
-    r = _runner_of_ref(ref)
+    r = runner_hub.get(runner_id) if runner_id else _runner_of_ref(ref)
     if r is None:
         return None
     return _download(r, ref, att_id)
@@ -663,8 +734,8 @@ def fetch_attachment_sync(cfg: dict, att_id: str) -> bytes | None:
     return None
 
 
-def stop_sync(cfg: dict, ref: str) -> dict:
-    r = _runner_of_ref(ref)
+def stop_sync(cfg: dict, ref: str, *, runner_id: str = "") -> dict:
+    r = runner_hub.get(runner_id) if runner_id else _runner_of_ref(ref)
     if r is None:
         return {"ok": False, "error": "这条活所在的执行机不在线"}
     res = runner_hub.call_sync(r, "job.stop", {"ref": ref}, timeout=60)

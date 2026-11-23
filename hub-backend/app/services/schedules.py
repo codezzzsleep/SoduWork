@@ -34,7 +34,8 @@ from .schedule_run_contracts import (
     automation_conversation_title, begin_run, claim_run,
     clean_personal_plugin_checksum, clean_personal_plugin_key,
     clean_personal_plugin_version, clean_personal_plugin_version_policy,
-    clean_plugin_inputs, clean_required_capabilities,
+    clean_plugin_inputs, clean_required_capabilities, is_local_model_reference,
+    sanitize_schedule_model_payload, schedule_model_source,
     error_text, normalize_personal_plugin_snapshot, personal_plugin_spec,
 )
 
@@ -50,8 +51,24 @@ EVERY = schedule_timing.EVERY
 DEFAULT_TIME_ZONE = "Asia/Shanghai"
 
 
+def validate_time_zone(value) -> str:
+    """Validate new input without silently changing its intended wall clock."""
+    if value is None or value == "":
+        return DEFAULT_TIME_ZONE
+    if not isinstance(value, str):
+        raise ValueError("timeZone 必须是有效的 IANA 时区名称")
+    name = value.strip()
+    if not name or len(name) > 64:
+        raise ValueError("timeZone 必须是有效的 IANA 时区名称")
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ValueError("timeZone 必须是有效的 IANA 时区名称") from None
+    return name
+
+
 def clean_time_zone(value: str | None) -> str:
-    """Return a validated IANA timezone name.
+    """Read a historical timezone with the existing migration fallback.
 
     The client sends its browser timezone with the schedule. Asia/Shanghai is
     the migration default for schedules created before this field existed.
@@ -59,7 +76,7 @@ def clean_time_zone(value: str | None) -> str:
     name = str(value or DEFAULT_TIME_ZONE).strip()[:64] or DEFAULT_TIME_ZONE
     try:
         ZoneInfo(name)
-    except ZoneInfoNotFoundError:
+    except (ZoneInfoNotFoundError, ValueError):
         if name not in (DEFAULT_TIME_ZONE, "UTC", "Etc/UTC"):
             return DEFAULT_TIME_ZONE
     return name
@@ -249,7 +266,7 @@ def due(s, now: datetime | None = None) -> bool:
         return target is not None and target <= current
     retry_at = getattr(s, "next_retry_at", None)
     if retry_at is not None:
-        return _utc(retry_at) <= current
+        return schedule_timing.retry_within_dates(s, retry_at, current) and _utc(retry_at) <= current
 
     base = s.last_run_at or s.created_at
     if base is None:
@@ -585,7 +602,7 @@ def run_to_api(run) -> dict:
         "state": run.state, "attempt": int(run.attempt or 1),
         "startedAt": _run_iso(run.started_at),
         "finishedAt": _run_iso(run.finished_at), "durationSeconds": duration,
-        "error": run.error, "receipt": dict(run.receipt or {}),
+        "error": run.error, "receipt": sanitize_schedule_model_payload(dict(run.receipt or {})),
         "conversationId": dict(run.receipt or {}).get('conversationId', ''),
         "conversationTitle": dict(run.receipt or {}).get('conversationTitle', ''),
     }
@@ -623,7 +640,7 @@ async def run_one(session: AsyncSession, s, who: str = "SoduWork（定时）",
     normalize_conversation_schedule(s)
     try:
         repo = await resolve_repo(session, s, client=client)
-        await validate_execution(session, s)
+        await validate_execution(session, s, allow_missing_model=True)
         personal = personal_plugin_spec(s)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)[:300]}
@@ -646,6 +663,10 @@ async def run_one(session: AsyncSession, s, who: str = "SoduWork（定时）",
             str(getattr(runner, 'client_id', '') or '') != str(client.id or '') or
             not str(getattr(runner, 'client_id', '') or '')))
         if cross_device:
+            if (schedule_model_source(s) == 'device' or
+                    is_local_model_reference(getattr(s, 'model_name', ''))):
+                return {'ok': False, 'code': 'AUTOMATION_LOCAL_MODEL_REMOTE',
+                        'error': '本地模型只能在本机托管型执行底座运行，不能派往其他执行机'}
             if not schedule_run_id:
                 return {'ok': False, 'code': 'AUTOMATION_RUN_REQUIRED',
                         'error': '自动化运行记录尚未建立，请从自动化入口重新执行'}

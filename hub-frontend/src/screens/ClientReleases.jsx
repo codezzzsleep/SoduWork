@@ -103,7 +103,7 @@ export default function ClientReleases() {
   const [uploadOpen, setUploadOpen] = useState(false)
   const [confirmEnable, setConfirmEnable] = useState(null)   // Release awaiting enablement.
   const [toggling, setToggling] = useState('')
-  const [downloading, setDownloading] = useState('')
+  const [pendingDownloads, setPendingDownloads] = useState([])
   // Per-device update version and stage.
   const [attempts, setAttempts] = useState([])
   const [counts, setCounts] = useState({})
@@ -205,6 +205,7 @@ export default function ClientReleases() {
                 <summary>{tx("更新内容")}</summary><div data-user-content>{notes}</div>
               </details>)}
             {group.rows.map((row) => {
+              const downloading = pendingDownloads.find(id => id === row.id)
               const plat = PLATFORM_META[row.platform] || { label: row.platform || '?', mark: '?' }
               return <div key={row.id} className="cr-row">
                 <span className="cr-platform">
@@ -224,10 +225,10 @@ export default function ClientReleases() {
                 <span className="cr-actions">
                   {manage && <button className="admin-text-action" disabled={!!downloading}
                     onClick={async () => {
-                      setDownloading(row.id)
+                      setPendingDownloads(ids => [...ids, row.id])
                       try { await api.downloadClientRelease(row.id, row.artifactName) }
                       catch (error) { toast(error.message || tx("请稍后重试")) }
-                      finally { setDownloading('') }
+                      finally { setPendingDownloads(ids => ids.filter(id => id !== row.id)) }
                     }}>{tx(downloading === row.id ? "下载中" : "下载")}</button>}
                   {manage && (row.enabled
                     ? <button className="admin-text-action" disabled={toggling === row.id}
@@ -354,6 +355,9 @@ function UploadModal({ onClose, onDone }) {
   const [bundleName, setBundleName] = useState('')
   const [installerName, setInstallerName] = useState('')
   const [busy, setBusy] = useState(false)
+  const controller = useRef(null)
+  const [progress, setProgress] = useState({ loaded: 0, total: 0, sent: false })
+  useEffect(() => () => controller.current?.abort(), [])
   const [error, setError] = useState('')
 
   async function submit() {
@@ -361,24 +365,32 @@ function UploadModal({ onClose, onDone }) {
     const installer = installerRef.current && installerRef.current.files[0]
     if (!bundle) { setError(tx("请选择签名清单（bundle.json）")); return }
     if (!installer) { setError(tx("请选择安装包文件")); return }
+    if (controller.current) return
+    controller.current = new AbortController()
+    setProgress({ loaded: 0, total: 0, sent: false })
     setBusy(true)
     setError('')
     try {
-      const data = await api.uploadClientRelease(bundle, installer)
+      const data = await api.uploadClientRelease(bundle, installer, {
+        signal: controller.current.signal, onProgress: (loaded, total, sent) => setProgress({ loaded, total, sent }),
+      })
       const rel = data && data.release
       toast(rel
         ? tx("已上传 {0}（{1} / {2}），当前为停用状态，确认后请点「启用」", [rel.version, rel.platform, rel.arch])
         : tx("上传成功"))
       onDone()
     } catch (e) {
-      setError(e.message || tx("上传失败，请稍后重试"))
+      setError(e.name === 'AbortError' ? tx("已取消上传") : e.message || tx("上传失败，请稍后重试"))
     }
+    controller.current = null
     setBusy(false)
   }
 
-  return <Modal title={tx("上传客户端发布")} icon="send" onClose={busy ? undefined : onClose}
-    foot={<>
-      <button className="btn btn-ghost" disabled={busy} onClick={onClose}>{tx("取消")}</button>
+  return <Modal dirty={!busy && Boolean(bundleName || installerName)} title={tx("上传客户端发布")} icon="send" onClose={busy ? undefined : onClose}
+    foot={dismiss => <>
+      <button className="btn btn-ghost" disabled={busy && progress.sent} onClick={() => busy ? controller.current?.abort() : dismiss()}>
+        {busy ? tx("上传中，请勿关闭") : tx("取消")}
+      </button>
       <button className="btn btn-primary" disabled={busy} onClick={submit}>
         {busy ? tx("上传中，安装包较大请稍候…") : tx("上传")}
       </button>
@@ -405,6 +417,11 @@ function UploadModal({ onClose, onDone }) {
         </span>
         <small>{tx("SoduWork-x.y.z-Setup.exe / .dmg / .deb / .rpm / .tar.gz / .AppImage")} / SoduWork-Mobile-x.y.z.apk</small>
       </label>
+      {busy && <div className="cr-upload-status">
+        <progress aria-label={tx("上传进度")} value={progress.total ? progress.loaded : undefined} max={progress.total || 1} />
+        <span>{progress.sent ? tx("上传完成，正在等待服务端校验。") : progress.total
+          ? `${Math.floor(progress.loaded / progress.total * 100)}% · ${progress.loaded.toLocaleString()} / ${progress.total.toLocaleString()} B` : tx("上传中…")}</span>
+      </div>}
       {error && <div className="cr-upload-error">{error}</div>}
     </div>
   </Modal>

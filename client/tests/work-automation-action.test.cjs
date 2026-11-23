@@ -66,7 +66,7 @@ test('automation sheet translates model selector text on initial render and refr
   context.window = context;
   context.SoduWorkI18n = { translateText: value => translations[value] || value };
   const marker = '  global.WorkAutomationSheet = { open, active, refine, close };';
-  vm.runInNewContext(automation.replace(marker,
+  vm.runInNewContext(cardState + '\n' + automation.replace(marker,
     '  global.probe = { state, modelRows, modelField, refreshModelField };\n' + marker), context);
   const { state, modelRows, modelField, refreshModelField } = context.probe;
   state.agents = [
@@ -76,24 +76,45 @@ test('automation sheet translates model selector text on initial render and refr
   state.modelOptions = [{ name: 'gpt-5', label: 'gpt-5' }];
 
   const initial = modelField('', 'local:pi');
-  assert.match(initial, /Choose a model/);
-  assert.match(initial, /The model is saved independently and each run uses this choice/);
+  assert.match(initial, /value="gpt-5" selected/);
+  assert.match(initial, /<span>Model<\/span>/);
   assert.doesNotMatch(initial, /请选择模型|模型与执行底座独立保存/);
+  assert.match(modelRows('missing-model', 'local:pi'), /value="gpt-5" selected/);
+  state.modelOptions = [];
   assert.match(modelRows('missing-model', 'local:pi'), /missing-model \(saved; currently unavailable\)/);
+  state.modelOptions = [{ name: 'gpt-5', label: 'gpt-5' }];
 
   const select = { value: '', options: [], disabled: false, replaceChildren(...options) { this.options = options; } };
   const form = { elements: { modelName: select, assigneeId: { value: 'local:pi' } } };
   state.layer = { querySelector(selector) { return selector === '#wazForm' ? form : null; } };
   refreshModelField();
-  assert.equal(select.options[0].textContent, 'Choose a model');
-  assert.equal(select.options[0].disabled, true);
+  assert.equal(select.options[0].textContent, 'gpt-5');
+  assert.equal(select.options[0].disabled, false);
+  assert.equal(select.value, 'gpt-5');
   assert.equal(select.disabled, false);
 
   assert.match(modelField('', 'local:codex'), /Managed by this runtime/);
-  assert.match(modelField('', 'local:codex'), /This runtime manages its model/);
   assert.doesNotMatch(modelField('', 'local:codex'), /由底座自身管理模型|当前底座自行管理模型/);
   state.modelOptions = [];
   assert.match(modelRows('', 'local:pi'), /No models are available/);
+});
+
+test('automation sheet exposes local models for Pi even when modelPick is false', () => {
+  const context = { Intl, setTimeout, clearTimeout, document: { createElement: tag => ({ tagName: tag }) } };
+  context.window = context;
+  const marker = '  global.WorkAutomationSheet = { open, active, refine, close };';
+  vm.runInNewContext(cardState + '\n' + automation.replace(marker,
+    '  global.probe = { state, modelField };\n' + marker), context);
+  const { state, modelField } = context.probe;
+  state.agents = [{ id: 'local:pi', cli: 'pi', modelPick: false, nativeModelPick: false }];
+  state.modelOptions = [
+    { name: 'local:model-abcdefabcdefabcdefabcdefabcdefab', label: 'glm5.2 · 本机', localOnly: true },
+    { name: 'managed-model', label: '托管模型' },
+  ];
+  const field = modelField('', 'local:pi');
+  assert.match(field, /local:model-abcdefabcdefabcdefabcdefabcdefab/);
+  assert.doesNotMatch(field, /<select[^>]+disabled/);
+  assert.doesNotMatch(field, /由底座自身管理模型/);
 });
 
 test('automation remains an iterative plugin form inside the conversation', () => {
@@ -142,11 +163,11 @@ test('both desktop entrypoints load automation styles and runtime in dependency 
 
 test('automation payload permissions come from explicit choices and the selected method', () => {
   const context = { Intl, setTimeout, clearTimeout }; context.window = context;
-  for (const name of ['schedule-timing.js', 'work-automation-bindings.js']) {
+  for (const name of ['schedule-timing.js', 'work-automation-bindings.js', 'work-automation-card-state.js']) {
     vm.runInNewContext(read('components', 'panels', name), context);
   }
   const marker = '  global.WorkAutomationSheet = { open, active, refine, close };';
-  vm.runInNewContext(automation.replace(marker,
+  vm.runInNewContext(cardState + '\n' + automation.replace(marker,
     '  global.probe = { state, proposalOf, bodyOf };\n' + marker), context);
   const { state, proposalOf, bodyOf } = context.probe;
   state.agents = [{ id: 'local:pi', available: true }];
@@ -162,6 +183,16 @@ test('automation payload permissions come from explicit choices and the selected
   assert.deepEqual(Array.from(manual.requiredCapabilities), ['computer']);
   assert.deepEqual(Array.from(bodyOf(manual).requiredCapabilities), ['computer', 'office']);
   assert.deepEqual(Array.from(manual.requiredCapabilities), ['computer'], 'derived method permissions stay out of editable choices');
+  const model = 'local:model-0123456789abcdef0123456789abcdef';
+  state.defaultModels = { pi: model }; state.defaultModelErrors = { pi: 'Deleted local default' };
+  state.modelOptions = [{ name: 'managed-alternative' }];
+  assert.equal(proposalOf({}, 'Choose the sole available model', {}).modelName, 'managed-alternative');
+  assert.equal(proposalOf({ modelName: 'unavailable:default' }, 'Do not persist a UI placeholder', {}).modelName, 'managed-alternative');
+  const invalid = proposalOf({}, 'Keep the explicitly saved model', { modelName: model });
+  assert.equal(invalid.modelName, 'managed-alternative');
+  assert.equal(bodyOf(invalid).modelName, 'managed-alternative');
+  state.defaultModelErrors = {}; state.modelOptions.push({ name: model, localOnly: true });
+  assert.equal(bodyOf(proposalOf({}, 'Use the configured model', {})).modelName, model);
 });
 
 test('automation editor keeps a saved model when the model control is temporarily disabled', () => {
@@ -176,7 +207,7 @@ test('automation editor keeps a saved model when the model control is temporaril
   }
   context.FormData = FakeFormData;
   const marker = '  global.WorkAutomationSheet = { open, active, refine, close };';
-  vm.runInNewContext(automation.replace(marker,
+  vm.runInNewContext(cardState + '\n' + automation.replace(marker,
     '  global.probe = { state, valueFromForm };\n' + marker), context);
   const form = {
     values: {
@@ -212,7 +243,9 @@ test('rhythm parser reads Chinese clocks and preserves periodic scheduling', () 
   assert.equal(rhythm('每天14:10打卡提醒'), 'daily 14:10');
   assert.equal(rhythm('每天下午14:10打卡'), 'daily 14:10');
   assert.equal(rhythm('每天下午2点10分打卡'), 'daily 14:10');
-  assert.equal(rhythm('每小时第10分巡检'), 'hourly 18:10');
-  /* Use the default time only when no explicit time is present. */
-  assert.equal(rhythm('每天提醒我喝水'), 'daily 18:00');
+  assert.equal(rhythm('每小时第10分巡检'), 'hourly 00:10');
+  /* Missing clocks must be completed explicitly, never defaulted to 18:00. */
+  const missing = window.ScheduleTiming.infer('每天提醒我喝水');
+  assert.equal(missing.atHour, null);
+  assert.ok(window.ScheduleTiming.validate(missing));
 });

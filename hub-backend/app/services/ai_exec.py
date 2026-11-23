@@ -366,7 +366,8 @@ def with_llm(ctx: dict, llm: dict | None) -> dict:
     and model. Resolve personal settings before organization defaults. Empty llm preserves
     existing configuration.
     """
-    if not llm or not (llm.get("base") and llm.get("key") and llm.get("model")):
+    if not llm or not (llm.get("base") and llm.get("model") and
+                       (llm.get("key") or llm.get("localOnly") is True)):
         return ctx
     resolved_window = context_window.resolve({
         "contextWindow": llm.get("contextWindow") or llm.get("ctxWindow"),
@@ -380,14 +381,16 @@ def with_llm(ctx: dict, llm: dict | None) -> dict:
             c2 = dict(c)
             # Keep the allowed-model list; it controls selection, not this dispatch's resolved model.
             c2["llm"] = {**(c.get("llm") or {}), "base": llm["base"],
-                         "key": llm["key"], "model": llm["model"],
+                         "key": llm.get("key") or "", "model": llm["model"],
                          "kind": llm.get("kind") or "openai-compat",
+                         "localOnly": llm.get("localOnly") is True,
+                         "authMode": llm.get("authMode") or "api-key",
                          "contextWindow": resolved_window["contextWindow"],
                          "contextWindowKnown": resolved_window["contextWindowKnown"],
                          "contextWindowEstimated": resolved_window["contextWindowEstimated"],
                          "contextWindowSource": resolved_window["contextWindowSource"]}
             from .runtime_images import model_fields
-            for field in ("input", "imageRouting", "visionFallbackAvailable", "maxOutputTokens", "capabilityProfile", "configRevision", "runtimeRevision"):
+            for field in ("input", "imageRouting", "visionFallbackAvailable", "maxOutputTokens", "capabilityProfile", "configRevision", "runtimeRevision", "compatibility"):
                 c2["llm"].pop(field, None)
             c2["llm"].update(model_fields(llm))
             from .model_definition_contracts import _clean_thinking_config
@@ -699,6 +702,25 @@ def runner_info_sync(ctx: dict, ref: str) -> dict:
     except Exception as e:  # noqa: BLE001 - Missing recovery hints must not interrupt execution.
         log.warning("取执行机信息失败: %s", type(e).__name__)
         return {}
+
+
+async def read_session(ctx: dict, ref: str, since: int = 0, *, runner_id: str = "", limit: int = 400) -> dict:
+    """HTTP reads use durable routing, not synchronous cross-machine discovery."""
+    import asyncio
+    from . import ai_remote
+    try:
+        if runner_id and runner_id != "backend-local":
+            return await ai_remote.read_session(ref, since, limit, runner_id=runner_id)
+        if runner_id != "backend-local" and ref not in getattr(_ai_local, "_RUNS", {}):
+            # Older dispatches without a durable route retain async discovery.
+            remote = await ai_remote.read_session(ref, since, limit)
+            if remote.get("ok"):
+                return remote
+        # Also retain archived backend-local sessions after a Hub restart.
+        return await asyncio.to_thread(_ai_local.session_sync, _cfg_of(ctx, _ai_local), ref, since, limit)
+    except Exception as exc:  # Cancellation must propagate to the underlying RPC.
+        log.warning("取执行会话失败: %s", type(exc).__name__)
+        return {"ok": False, "items": [], "error": "会话拿不到"}
 
 
 def session_sync(ctx: dict, ref: str, since: int = 0) -> dict:

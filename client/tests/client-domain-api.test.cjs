@@ -12,7 +12,11 @@ async function fixture(bridge = {}, values = new Map([['soduwork_work_hub_url', 
       deviceAuthBootstrap: async () => ({ok: true, stored: true, authState: 'active', user: {id: 'alice'},
         clientId: 'desktop', session: 'fixture', expiresIn: 1800}), configureRunner: async () => ({ok: true}), ...bridge},
     fetch: async (url, options) => { requests.push({url, options}); return {ok: true, status: 200,
-      text: async () => JSON.stringify({id: 'project-one', name: 'Saved', revision: 1})}; },
+      text: async () => JSON.stringify(url.endsWith('/client-auth/me')
+        ? {user: {id: 'alice'}, quota: {enabled: true, exceeded: false, limit: 1000, used: 10}}
+        : url.endsWith('/my-models') && options.method !== 'PUT'
+          ? {providers: [{id: 'provider', personal: true}], usable: [], myModels: []}
+          : {id: 'project-one', name: 'Saved', revision: 1})}; },
   };
   context.window = context; vm.createContext(context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../api.js'), 'utf8'), context);
@@ -65,6 +69,116 @@ test('model and config reads use shared snapshots and successful writes invalida
   assert.deepEqual(reads, ['models', 'config']);
   assert.deepEqual(invalidated, ['models', 'models', 'models', 'config']);
 });
+
+test('config writes send edited public fields and the revision seen by this editor', async () => {
+  const f = await fixture({clientDomainRead: async () => ({ok: true, value: {
+    theme: 'dark', locale: 'en-US', _configRevision: 'old', _configKeys: ['theme', 'locale']
+  }})});
+  const taskKey = f.api.taskStorageKey('tasks');
+  f.values.set(taskKey, JSON.stringify([{id: 'saved-task'}]));
+  const cfg = await f.api.getConfig();
+  assert.equal(f.values.get(taskKey), JSON.stringify([{id: 'saved-task'}]));
+  assert.deepEqual(Object.keys(cfg).sort(), ['locale', 'theme']);
+  const writes = [];
+  f.context.fetch = async (_url, opts) => {
+    writes.push(JSON.parse(opts.body));
+    return {ok: true, status: 200, text: async () => JSON.stringify({
+      theme: 'blue', locale: 'en-US', _configRevision: 'next', _configKeys: ['theme', 'locale']
+    })};
+  };
+  assert.equal(await f.api.syncConfig({...cfg, theme: 'blue', obsoleteField: true}), true);
+  assert.deepEqual(writes[0], {theme: 'blue', _configRevision: 'old'});
+  await f.api.syncConfig({...cfg, theme: 'blue', locale: 'ja-JP'});
+  assert.deepEqual(writes[1], {locale: 'ja-JP', _configRevision: 'next'});
+  assert.equal(f.values.get(taskKey), JSON.stringify([{id: 'saved-task'}]));
+});
+
+test('a stale editor preserves independent edits and exposes the conflicting Hub preference', async () => {
+  const f = await fixture({clientDomainRead: async () => ({ok: true, value: {
+    theme: 'dark', locale: 'en-US', _configRevision: 'old', _configKeys: ['theme', 'locale']
+  }})});
+  await f.api.getConfig();
+  const current = {theme: 'green', locale: 'en-US', _configRevision: 'new', _configKeys: ['theme', 'locale']};
+  let writes = 0;
+  f.context.fetch = async (_url, opts) => {
+    if (opts.method === 'PUT') {
+      writes++;
+      return {ok: false, status: 409, text: async () => JSON.stringify({detail: 'stale'})};
+    }
+    return {ok: true, status: 200, text: async () => JSON.stringify(current)};
+  };
+  const result = await f.api.syncConfig({theme: 'blue', locale: 'ja-JP'});
+  assert.equal(writes, 1);
+  assert.equal(result.conflict, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.current)), {theme: 'green'});
+  // A later edit can invalidate the response in the store while the conflict GET is pending.
+  // Until accepted, even a follow-up write must still use the previous baseline.
+  const versions = [];
+  f.context.fetch = async (_url, opts) => {
+    if (opts.method === 'PUT') {
+      versions.push(JSON.parse(opts.body));
+      return {ok: false, status: 409, text: async () => JSON.stringify({detail: 'stale'})};
+    }
+    return {ok: true, status: 200, text: async () => JSON.stringify(current)};
+  };
+  await f.api.syncConfig({theme: 'dark', locale: 'ko-KR'});
+  assert.deepEqual(versions[0], {locale: 'ko-KR', _configRevision: 'old'});
+  result.accept({theme: 'green', locale: 'ja-JP'});
+  await f.api.syncConfig({theme: 'green', locale: 'ja-JP'});
+  assert.deepEqual(versions[1], {locale: 'ja-JP', _configRevision: 'new'});
+});
+
+for (const readFirst of [true, false]) test('a late config read keeps the acknowledged revision, read first=' + readFirst, async () => {
+  let release, entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const base = {theme: 'dark', _configRevision: 'one', _configKeys: ['theme']};
+  let loads = 0;
+  const f = await fixture({clientDomainRead: async () => {
+    if (loads++) { entered(); await new Promise(resolve => { release = resolve; }); }
+    return {ok: true, value: base};
+  }});
+  await f.api.getConfig();
+  let finishWrite;
+  const writes = [];
+  f.context.fetch = async (_url, opts) => {
+    const patch = JSON.parse(opts.body);
+    writes.push(patch);
+    if (writes.length === 1) await new Promise(resolve => { finishWrite = resolve; });
+    return {ok: true, status: 200, text: async () => JSON.stringify({...base, theme: patch.theme, _configRevision: 'two'})};
+  };
+  let late = readFirst && f.api.getConfig();
+  if (readFirst) await started;
+  const save = f.api.syncConfig({theme: 'green'});
+  await new Promise(resolve => setImmediate(resolve));
+  if (!readFirst) { late = f.api.getConfig(); await started; }
+  finishWrite();
+  await save;
+  release();
+  await late;
+  await f.api.syncConfig({theme: 'blue'});
+  assert.deepEqual(writes[1], {theme: 'blue', _configRevision: 'two'});
+});
+
+test('offline local catalogs disclose unreadable Hub models without inventing their deletion', async () => {
+  const localName = 'local:model-' + 'a'.repeat(32);
+  for (const response of [
+    { ok: false, status: 503, online: true, body: { detail: 'Unavailable' } },
+    { ok: true, value: { ok: false, usable: [{ name: 'invalid-hub-model' }] } },
+    { ok: true, value: { providers: [] } },
+  ]) {
+    const f = await fixture({
+      clientDomainRead: async () => response,
+      localModels: { get: async () => ({ providers: [{ id: 'private' }],
+        usable: [{ name: localName, providerId: 'private', localOnly: true }] }) },
+    });
+    const result = await f.api.myModels();
+    assert.equal(result.managedCatalogUnavailable, true);
+    assert.deepEqual(Array.from(result.usable, row => row.name), [localName]);
+  }
+  const f = await fixture({ clientDomainRead: async () => ({ ok: true,
+    value: { providers: [], usable: [], myModels: [] } }) });
+  assert.equal((await f.api.myModels()).managedCatalogUnavailable, false);
+});
 test('message cache preserves conditional response shape and leaves pagination requests unchanged', async () => {
   const f = await fixture({clientDomainRead: async domain => {
     assert.equal(domain, 'team-messages-received');
@@ -89,14 +203,17 @@ test('host HTTP failures preserve the renderer error metadata and reachability s
     error.message === 'Busy' && error.retryable === true && error.phase === 'read' && error.attemptId === 'fixture');
   assert.equal(f.api.online, true);
 });
-test('quota errors keep their structured authorization behavior and 401 does not force logout', async () => {
+test('cached quota errors retain their details but refresh account truth, while 401 does not force logout', async () => {
   let result = {ok: false, status: 403, online: true,
     body: {detail: {code: 'TOKEN_QUOTA_EXCEEDED', message: 'Quota exceeded', quota: {exceeded: true}}}};
   const f = await fixture({clientDomainRead: async () => result});
   await assert.rejects(f.api.myModels(), error => error.code === 'TOKEN_QUOTA_EXCEEDED' && error.payload.quota.exceeded);
   assert.equal(f.api.clientAuthSnapshot().user.id, 'alice');
   assert.equal(f.api.clientAuthSnapshot().state, 'active');
-  assert.equal(f.api.clientAuthSnapshot().quota.exceeded, true);
+  await new Promise(setImmediate);
+  assert.equal(f.api.clientAuthSnapshot().quota.exceeded, false);
+  assert.equal(f.api.clientAuthSnapshot().quota.limit, 1000);
+  assert.equal(f.requests.filter(row => row.url.endsWith('/client-auth/me')).length, 1);
   result = {ok: false, status: 401, online: true, body: {detail: {code: 'SESSION_EXPIRED'}}};
   await assert.rejects(f.api.myModels(), error => error.status === 401 && error.code === 'SESSION_EXPIRED');
   assert.equal(f.api.clientAuthSnapshot().state, 'active'); assert.equal(f.api.clientAuthSnapshot().user.id, 'alice');
@@ -117,7 +234,7 @@ test('local snapshots and cached errors cannot change offline status while a fre
 
 test('notification reconciliation revalidates company access within the shared-cache TTL, including a new renderer', async t => {
   const { create } = require('../main/client-domain-cache.cjs');
-  const identity = {hub: 'http://127.0.0.1:18989', clientId: 'desktop',
+  const identity = {hub: 'https://service.soduwork.ai', clientId: 'desktop',
     session: Buffer.from(JSON.stringify({typ: 'device', uid: 'alice', cid: 'desktop', ver: 1})).toString('base64url') + '.fixture'};
   const rows = [
     {id: 'plugin-private', kind: 'plugin_lifecycle', text: 'Former company plugin', recipientId: 'alice'},
@@ -156,4 +273,20 @@ test('notification reconciliation revalidates company access within the shared-c
     assert.deepEqual(visible.map(row => row.serverMessageId), ['coworker-history']);
     assert.equal(visible[0].text, 'Keep coworker history');
   }
+});
+
+test('quota domain wake-ups preserve renderer account boundaries and carry no quota snapshot', async () => {
+  let changed;
+  const f = await fixture({onClientDomainChanged: callback => { changed = callback; }});
+  const events = [];
+  f.context.dispatchEvent = event => events.push(event);
+  const scope = {hub: f.api.hubConfig().hub, clientId: 'desktop', userId: 'alice'};
+  for (const other of [{...scope, userId: 'bob'}, {...scope, clientId: 'other-device'},
+    {...scope, hub: 'https://other-hub.invalid'}]) changed({domain: 'quota', scope: other});
+  assert.equal(events.length, 0);
+  changed({domain: 'quota', scope, quota: {exceeded: false, limit: 999999}});
+  assert.equal(events.length, 1);
+  assert.equal(events[0].type, 'soduwork-domain-changed');
+  assert.deepEqual(Object.keys(events[0].detail), ['domain']);
+  assert.equal(events[0].detail.domain, 'quota');
 });

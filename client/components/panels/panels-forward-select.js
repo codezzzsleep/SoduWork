@@ -30,8 +30,11 @@
     const {select, trigger, value, wrap} = record;
     const chosen = select.options[select.selectedIndex];
     const label = labelOf(select), text = chosen?.textContent || select.dataset.placeholder || '请选择';
+    const userContent = chosen?.hasAttribute('data-user-content');
+    setAttr(value, 'data-user-content', userContent ? '' : null);
+    setAttr(trigger, 'data-user-attributes', userContent ? 'title aria-label' : null);
     setText(value, text);
-    setAttr(trigger, 'title', text);
+    setAttr(trigger, 'title', chosen?.title || text);
     setAttr(trigger, 'aria-label', label + '：' + text);
     setAttr(trigger, 'aria-describedby', select.getAttribute('aria-describedby'));
     const disabled = select.disabled || select.matches(':disabled');
@@ -110,7 +113,9 @@
       if (option.hidden || option.parentElement?.hidden || (query && !option.textContent.toLocaleLowerCase().includes(query))) return;
       const node = document.createElement('div'), disabled = optionDisabled(option);
       node.className = 'fwd-select-option'; node.id = opened.id + '-option-' + index;
+      if (option.hasAttribute('data-user-content')) node.setAttribute('data-user-content', '');
       node.dataset.value = option.value; node.setAttribute('role', 'option');
+      if (option.title) node.title = option.title;
       node.setAttribute('aria-selected', String(index === record.select.selectedIndex));
       node.setAttribute('aria-disabled', String(Boolean(disabled)));
       const text = document.createElement('span'); text.textContent = option.textContent; node.appendChild(text);
@@ -250,7 +255,7 @@
     if (!roots.has(root)) {
       const observer = new MutationObserver(() => enhance(root));
       observer.observe(root, {subtree: true, childList: true, characterData: true, attributes: true,
-        attributeFilter: ['disabled', 'hidden', 'selected', 'label', 'aria-label', 'aria-labelledby', 'aria-describedby', 'style']});
+        attributeFilter: ['disabled', 'hidden', 'selected', 'label', 'title', 'aria-label', 'aria-labelledby', 'aria-describedby', 'style']});
       roots.set(root, observer);
     }
   }

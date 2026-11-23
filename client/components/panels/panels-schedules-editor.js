@@ -40,6 +40,7 @@ function _schRecipeValues(item) {
     every: item.every || 'daily', atHour: item.atHour, atMinute: item.atMinute,
     ...(item.every === 'custom' ? {customRule: item.customRule || ''} : {}),
     weekday: item.weekday, timeZone: item.timeZone,
+    startDate: item.startDate || '', endDate: item.endDate || '',
     requiredCapabilities: item.requiredCapabilities || [], retryLimit: item.retryLimit,
     retryDelayMinutes: item.retryDelayMinutes, pluginBindingId: item.pluginBindingId || '',
     pluginInputs: item.pluginInputs || {},
@@ -94,7 +95,7 @@ function _schNormalizeExecutionAgents(result) {
     const locations = Array.isArray(item.locations) && item.locations.length
       ? item.locations : [null];
     for (const location of locations) {
-      const remote = location && location.mode === 'remote';
+      const remote = location ? location.mode === 'remote' : item.locationMode === 'remote' || item.remote === true;
       const locationId = String((location && (location.assigneeId || location.id)) || item.key);
       const locationLabel = String((location && location.label) || item.locationLabel || '');
       rows.push({
@@ -114,9 +115,9 @@ function _schNormalizeExecutionAgents(result) {
         modelSource: String(item.modelSource || ''),
         locationLabel,
         onlineSeats: locations.length > 1 ? 1 : Math.max(0, Number(item.onlineSeats) || 0),
-        mode: String((location && location.mode) || 'local'),
-        runnerId: String((location && location.runnerId) || ''),
-        clientId: String((location && location.clientId) || ''),
+        mode: String((location && location.mode) || item.locationMode || (remote ? 'remote' : 'local')),
+        runnerId: String((location && location.runnerId) || item.runnerId || ''),
+        clientId: String((location && location.clientId) || item.clientId || ''),
         runnerKind: String((location && location.runnerKind) || ''),
         host: String((location && location.host) || ''),
       });
@@ -133,7 +134,8 @@ function _schNormalizeModelOptions(result) {
   const add = raw => {
     const name = typeof raw === 'string' ? raw : (raw && (raw.name || raw.id));
     const value = String(name || '').trim();
-    if (!value || seen.has(value)) return;
+    if (!value || /^(?:unavailable:|local:unavailable$)/.test(value) ||
+        raw?.available === false || raw?.unavailable === true || seen.has(value)) return;
     seen.add(value);
     out.push({ name: value, label: String((raw && raw.label) || value) });
   };
@@ -147,11 +149,37 @@ function _schNormalizeNativeModelOptions(result) {
   const seen = new Set();
   rows.forEach(raw => {
     const name = String((raw && (raw.id || raw.name)) || raw || '').trim();
-    if (!name || seen.has(name)) return;
+    if (!name || /^(?:unavailable:|local:unavailable$)/.test(name) ||
+        raw?.available === false || raw?.unavailable === true || seen.has(name)) return;
     seen.add(name);
     out.push({ name, label: String((raw && (raw.label || raw.displayName)) || name) });
   });
   return out;
+}
+
+function _schNormalizeLocalModelOptions(result) {
+  const rows = Array.isArray(result?.usable) ? result.usable : [];
+  const out = [];
+  const seen = new Set();
+  rows.forEach(raw => {
+    if (!raw || (raw.localOnly !== true && !String(raw.name || raw.id || '').startsWith('local:'))) return;
+    if (raw.available === false || raw.unavailable === true || raw.modality === 'image' || raw.modality === 'video') return;
+    const name = String(raw.name || raw.id || '').trim();
+    if (!/^local:model-[a-f0-9]{32}$/.test(name) || seen.has(name)) return;
+    seen.add(name);
+    const label = String(raw.label || raw.modelName || name).trim();
+    const provider = String(raw.providerName || '').trim();
+    out.push({ name, label: [label, provider, '本机'].filter(Boolean).join(' · '), localOnly: true });
+  });
+  return out;
+}
+
+function _schLocalModelAgent(agent) {
+  if (!agent) return false;
+  const runtime = String(agent.cli || agent.id || '').replace(/^local:/, '').replace(/^runner:[^:]+:/, '');
+  if (!runtime || ['codex'].includes(runtime)) return false;
+  if (!String(agent.id || '').startsWith('local:') && !String(agent.id || '').startsWith('runner:')) return false;
+  return agent.mode !== 'remote' && agent.locationMode !== 'remote';
 }
 
 function _schNativeOptionsFor(agentId) {
@@ -160,7 +188,11 @@ function _schNativeOptionsFor(agentId) {
 
 function _schModelOptionsFor(agentId) {
   const agent = _schAgents.find(item => String(item.id) === String(agentId || ''));
-  return agent && agent.nativeModelPick ? _schNativeOptionsFor(agent.id) : _schModelOptions;
+  if (agent && agent.nativeModelPick) return _schNativeOptionsFor(agent.id);
+  const runtime = String(agent?.cli || agentId || '').replace(/^local:/, '').replace(/^runner:[^:]+:/, '');
+  if (['codex'].includes(runtime)) return [];
+  const local = _schLocalModelAgent(agent) ? _schLocalModelOptions : [];
+  return local.concat(_schModelOptions);
 }
 
 async function _schLoadNativeModelOptions(agents) {
@@ -170,7 +202,7 @@ async function _schLoadNativeModelOptions(agents) {
   const bridge = window.soduWorkAPI && (window.soduWorkAPI.conversationSession || window.soduWorkAPI.piSession);
   if (!bridge || typeof bridge.runtimeModels !== 'function') return;
   await Promise.all(nativeAgents.map(async agent => {
-    const adapterId = String(agent.cli || agent.id || '').replace(/^local:/, '');
+    const adapterId = String(agent.cli || agent.id || '').replace(/^local:/, '').replace(/^runner:[^:]+:/, '');
     if (!adapterId) return;
     try {
       const result = await bridge.runtimeModels(adapterId);
@@ -190,7 +222,7 @@ async function _schLoadExecutionAgents(context) {
   if (_schAgentLoading) return _schAgentLoading;
   const scope = _schScope;
   _schNativeModelOptions = Object.create(null);
-  _schAgentLoading = (async () => {
+  const loading = (async () => {
     if (SoduWorkAPI.taskExecutionOptions) {
       try {
         const result = await SoduWorkAPI.taskExecutionOptions({
@@ -200,8 +232,25 @@ async function _schLoadExecutionAgents(context) {
         });
         if (scope === _schScope) {
           _schModelOptions = _schNormalizeModelOptions(result);
+          _schLocalModelOptions = [];
+          _schAgentDefaultModels = {}; _schAgentDefaultErrors = {}; _schModelCatalogError = false;
           _schDefaultModel = String((result && result.defaultModel) ||
             (_schModelOptions[0] && _schModelOptions[0].name) || '').trim();
+          if (typeof SoduWorkAPI.myModels === 'function') {
+            try {
+              const catalog = await SoduWorkAPI.myModels();
+              // Account, Hub, and device changes invalidate an in-flight catalog.
+              // Do not let a late response repopulate the next identity's picker.
+              if (scope !== _schScope) return [];
+              _schLocalModelOptions = _schNormalizeLocalModelOptions(catalog);
+              _schAgentDefaultModels = catalog.defaultModels || {};
+              _schAgentDefaultErrors = catalog.defaultModelErrors || {};
+            } catch (_) {
+              if (scope !== _schScope) return [];
+              _schLocalModelOptions = [];
+              _schModelCatalogError = true;
+            }
+          }
         }
         const agents = _schNormalizeExecutionAgents(result);
         if (scope !== _schScope) return [];
@@ -214,6 +263,8 @@ async function _schLoadExecutionAgents(context) {
       } catch (_) {
         if (scope !== _schScope) return [];
         _schModelOptions = []; _schDefaultModel = '';
+        _schLocalModelOptions = [];
+        _schAgentDefaultModels = {}; _schAgentDefaultErrors = {}; _schModelCatalogError = false;
         /* Fall back to legacy agent lists only when the unified-contract API fails. */
       }
     }
@@ -236,18 +287,13 @@ async function _schLoadExecutionAgents(context) {
     if (scope !== _schScope) return [];
     _schAgents = Array.isArray(agents) ? agents : [];
     return _schAgents;
-  }).finally(() => { if (scope === _schScope) _schAgentLoading = null; });
-  return _schAgentLoading;
-}
-
-function _schAgentOptionLabel(agent) {
-  /* Translate option-label fragments when constructing them; retain names and timezones as data. */
-  const _tx = value => (window.SoduWorkI18n && window.SoduWorkI18n.translateText)
-    ? window.SoduWorkI18n.translateText(value) : value;
-  const suffix = [agent.locationLabel,
-    agent.onlineSeats ? _tx(agent.onlineSeats + ' 个在线席位') : '',
-    agent.available === false ? _tx('当前未就绪') : ''].filter(Boolean);
-  return String(agent.name || agent.id) + (suffix.length ? ' · ' + suffix.join(' · ') : '');
+  }).finally(() => {
+    // A stale request must release the coalescing slot too. Compare identity so
+    // an older request cannot clear a newer refresh started for the new scope.
+    if (_schAgentLoading === loading) _schAgentLoading = null;
+  });
+  _schAgentLoading = loading;
+  return loading;
 }
 
 function _schAgentOptionsHtml(current) {
@@ -263,9 +309,7 @@ function _schAgentOptionsHtml(current) {
       ? window.SoduWorkI18n.translateText('当前设备没有可选执行底座') : '当前设备没有可选执行底座';
     return '<option value="">' + esc(empty) + '</option>';
   }
-  return rows.map(agent => '<option value="' + esc(agent.id) + '"' +
-    (String(agent.id) === selected ? ' selected' : '') + '>' +
-    esc(_schAgentOptionLabel(agent)) + '</option>').join('');
+  return rows.map(agent => window.WorkAutomationView.agentOptionHtml(agent, selected)).join('');
 }
 
 function _schEditorTx(value) {
@@ -281,7 +325,7 @@ function _schRefreshAgentField(preferred) {
   select.disabled = !_schAgents.length && !current;
   const hint = document.getElementById('schWhoHint');
   if (hint) hint.textContent = _schAgentReason || (_schAgents.length
-    ? '保存的是执行底座类型；每次运行会在当前设备选择可用席位'
+    ? ''
     : '请打开 Agent 管理，确认 Runner 已启动并已连接当前环境');
   // Refreshing a catalog must not impersonate a user's substrate change.
   const event = new Event('change', { bubbles: true }); event.catalogRefresh = true;
@@ -294,7 +338,9 @@ function _schModelOptionsHtml(current, options) {
     ? '' : String(current || '').trim();
   const rows = (options || _schModelOptions).slice();
   if (selected && !rows.some(item => item.name === selected)) {
-    rows.unshift({ name: selected, label: selected + _schEditorTx('（已保存，当前不可用）'), stale: true });
+    rows.unshift({ name: selected, label: selected === 'local:unavailable'
+      ? '本机模型选择已失效，请重新选择' : selected === 'unavailable:default'
+        ? '默认模型不可用，请重新选择' : selected + _schEditorTx('（已保存，当前不可用）'), stale: true });
   }
   if (!selected) rows.unshift({ name: '', label: _schEditorTx('请选择模型'), placeholder: true });
   if (!rows.length) return '<option value="">' + esc(_schEditorTx('当前没有可用模型')) + '</option>';
@@ -304,40 +350,55 @@ function _schModelOptionsHtml(current, options) {
     esc(item.label || item.name) + '</option>').join('');
 }
 
-function _schAgentAllowsModel(agentId) {
+function _schAgentAllowsModel(agentId, currentModel) {
   // Gateway and native-per-run runtimes accept an explicit model. A runtime
   // that owns its account/model remains the one case where an override is not
   // valid, even though the substrate itself is selectable independently.
   const id = String(agentId || '').trim();
   const agent = _schAgents.find(item => String(item.id) === id);
-  return !agent || agent.modelPick !== false || agent.nativeModelPick === true;
+  // Pi can expose a local catalog even when its runtime owns the default
+  // model. In that case the local picker is still an explicit, safe override.
+  const localOverride = _schLocalModelAgent(agent) && _schLocalModelOptions.length > 0;
+  const savedLocal = _schLocalModelAgent(agent) &&
+    (/^local:model-[a-f0-9]{32}$/.test(String(currentModel || '').trim()) || currentModel === 'local:unavailable');
+  return !agent || _schLocalModelAgent(agent) || localOverride || savedLocal || agent.modelPick !== false || agent.nativeModelPick === true;
+}
+
+function _schResolveModelFor(agentId, current) {
+  const selected = String(current || '').trim();
+  const agent = _schAgents.find(item => String(item.id) === String(agentId || ''));
+  const options = _schModelOptionsFor(agentId);
+  if (selected === 'local:unavailable') return selected;
+  if (agent?.nativeModelPick) return selected || (options.length === 1 ? options[0].name : '');
+  if (!_schAgentAllowsModel(agentId, selected)) return '';
+  if (_schModelCatalogError && _schLocalModelAgent(agent)) return selected;
+  return options.some(item => item.name === selected) ? selected : String(options[0]?.name || selected);
+}
+
+function _schDefaultModelFor(agentId) {
+  return _schResolveModelFor(agentId, '');
 }
 
 function _schModelFieldHtml(current, agentId) {
-  const selected = current === undefined || current === null
-    ? '' : String(current || '').trim();
-  if (!_schAgentAllowsModel(agentId)) {
+  const selected = _schResolveModelFor(agentId, current);
+  if (!_schAgentAllowsModel(agentId, selected)) {
     return '<label class="sch-f-lbl" for="schModel">' + esc(_schEditorTx('模型')) +
       '</label><select class="sch-in" id="schModel" disabled>' +
-      '<option value="">' + esc(_schEditorTx('由底座自身管理模型')) + '</option></select>' +
-      '<small class="sch-executor-hint" id="schModelHint">' +
-      esc(_schEditorTx('当前底座不接受自动化单独指定模型。')) + '</small>';
+      '<option value="">' + esc(_schEditorTx('由底座自身管理模型')) + '</option></select>';
   }
   const options = _schModelOptionsFor(agentId);
   return '<label class="sch-f-lbl" for="schModel">' + esc(_schEditorTx('模型')) +
-    '</label><select class="sch-in" id="schModel" aria-describedby="schModelHint">' +
-    _schModelOptionsHtml(selected, options) + '</select>' +
-    '<small class="sch-executor-hint" id="schModelHint">' +
-    esc(_schEditorTx('模型与执行底座独立保存；每次自动化运行都使用这里选择的模型。')) + '</small>';
+    '</label><select class="sch-in" id="schModel">' + _schModelOptionsHtml(selected, options) + '</select>';
 }
 
 function _schRefreshModelField(preferred) {
   const select = document.getElementById('schModel');
   if (!select) return;
-  const current = preferred !== undefined ? String(preferred || '').trim() :
+  let current = preferred !== undefined ? String(preferred || '').trim() :
     String(select.value || '').trim();
   const agent = document.getElementById('schWho');
-  if (!_schAgentAllowsModel(agent && agent.value)) {
+  current = _schResolveModelFor(agent?.value, current);
+  if (!_schAgentAllowsModel(agent && agent.value, current)) {
     const option = document.createElement('option'); option.value = '';
     option.textContent = _schEditorTx('由底座自身管理模型');
     select.replaceChildren(option);
@@ -347,9 +408,8 @@ function _schRefreshModelField(preferred) {
   }
   const options = _schModelOptionsFor(agent && agent.value);
   select.innerHTML = _schModelOptionsHtml(current, options);
-  // Do not replace the explicit model with the substrate default. If the
-  // catalog is temporarily unavailable, retain the saved value so the user
-  // can still see and edit the automation instead of losing its selection.
+  // Keep an explicit available choice. Catalog read failures retain the draft
+  // and block saving rather than being interpreted as model deletion.
   select.disabled = !options.length && !current;
 }
 
@@ -358,11 +418,9 @@ function _schEditorDrawerHtml() {
   const isEdit = Boolean(editing && editing.id);
   return '<header class="sch-editor-head"><span class="sch-editor-mark" aria-hidden="true">' +
     '<svg viewBox="0 0 24 24"><path d="M7 3h7l3 3v15H7z"/><path d="M14 3v4h4M10 12h5M10 16h5"/></svg></span>' +
-    '<span class="sch-editor-title"><small>自动化配置</small><h2 id="schEditorTitle">' +
-    (isEdit ? '编辑自动化' : '新建自动化') + '</h2><p>' +
-    (isEdit ? '调整触发方式、执行方法和运行条件，保存后按新设置生效。' :
-      '把重复工作交代清楚，SoduWork 会按时执行，并在对话中保留过程和结果。') +
-    '</p></span><button class="sch-editor-close" data-editor-close aria-label="关闭自动化配置">' +
+    '<span class="sch-editor-title"><h2 id="schEditorTitle">' +
+    (isEdit ? '编辑自动化' : '新建自动化') +
+    '</h2></span><button class="sch-editor-close" data-editor-close aria-label="关闭自动化配置">' +
     '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></header>' +
     '<div class="sch-editor-scroll">' + _schFormHtml(editing) + '</div>';
 }
@@ -399,14 +457,19 @@ function _schRenderEditorDrawer(focusDrawer) {
 }
 
 function _schAgentFieldHtml(current) {
-  return '<label class="sch-f-lbl" for="schWho">执行底座</label><select class="sch-in" id="schWho" aria-describedby="schWhoHint"' +
+  const proposedModel = String(_schEditing?.modelName || '');
+  const initialModel = _schEditing?.id ? _schEditing.modelName
+    : proposedModel && !proposedModel.startsWith('unavailable:') ? proposedModel : _schDefaultModelFor(current);
+  return '<div class="sch-executor-grid"><div><div class="sch-executor-label">' +
+    '<label class="sch-f-lbl" for="schWho">执行底座</label>' +
+    '<button type="button" class="automation-refresh-runtime" id="schReloadAgents" aria-label="刷新底座" title="刷新底座">' +
+    '<svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.5-1L20 9M4 15l2.4 3A7 7 0 0 0 17.9 17"/></svg></button></div>' +
+    '<select class="sch-in" id="schWho" aria-describedby="schWhoHint"' +
     (!_schAgents.length && !current ? ' disabled' : '') + '>' + _schAgentOptionsHtml(current) + '</select>' +
-    '<div class="sch-executor-tools"><small class="sch-executor-hint" id="schWhoHint">' +
-    esc(_schAgentReason || (_schAgents.length ? '保存的是执行底座类型；运行时选择可用席位' :
+    '<small class="sch-executor-hint" id="schWhoHint">' +
+    esc(_schAgentReason || (_schAgents.length ? '' :
       '请打开 Agent 管理，确认 Runner 已启动并已连接当前环境')) + '</small>' +
-    '<button type="button" class="btn-mini" id="schReloadAgents">刷新底座</button></div>' +
-    _schModelFieldHtml(_schEditing && _schEditing !== 'new'
-      ? _schEditing.modelName : '', current);
+    '</div><div>' + _schModelFieldHtml(initialModel, current) + '</div></div>';
 }
 
 async function _schPrepareEditor(value, source) {
@@ -426,6 +489,11 @@ async function _schPrepareEditor(value, source) {
     if (request !== _schEditorRequest || !document.getElementById('schPanel')?.classList.contains('show')) return false;
     // Capture edited fields before replacing catalog-dependent controls.
     const current = save?.scheduleDraft?.();
+    // A loading shell may show a partial directory. Only user changes or a
+    // saved draft may become explicit choices after the full catalog arrives.
+    if (current && document.getElementById('schModel')?.dataset.modelTouched !== 'true') {
+      current.modelName = String(draft.modelName || '');
+    }
     const focused = content?.contains(document.activeElement) ? document.activeElement.id : '';
     const selection = document.activeElement?.selectionStart;
     const selectionEnd = document.activeElement?.selectionEnd;
@@ -487,7 +555,9 @@ function _schResetScope() {
   closeSchedulePanel();
   _schRows = null; _schLoading = null; _schLoadError = '';
   _schAgents = []; _schAgentReason = ''; _schAgentLoading = null;
-  _schModelOptions = []; _schDefaultModel = ''; _schNativeModelOptions = Object.create(null);
+  _schModelOptions = []; _schLocalModelOptions = []; _schDefaultModel = '';
+  _schAgentDefaultModels = {}; _schAgentDefaultErrors = {}; _schModelCatalogError = false;
+  _schNativeModelOptions = Object.create(null);
   _schRepos = []; _schTemplates = [];
   _schPluginCache = Object.create(null); _schPluginLoading = Object.create(null);
   _schmGeneration++; _schmItems = []; _schmLoading = null;
@@ -601,7 +671,7 @@ function _schBindCreateMenu() {
 
 function _schOnceFieldsHtml(value) {
   const zone = value.timeZone || _schBrowserTimeZone();
-  const local = window.ScheduleTiming?.localInput(value.runAt, zone) || '';
+  const local = window.ScheduleTiming?.localMinute(value.runAt, zone) || '';
   return '<label class="sch-once-field" id="schOnceWrap"' + (value.every === 'once' ? '' : ' style="display:none"') + '>' +
     '<span>执行日期时间 · ' + esc(_schTimeZoneLabel(zone)) + '</span>' +
     '<input class="sch-in" id="schRunAt" type="datetime-local" step="60" value="' + esc(local) +
@@ -622,15 +692,9 @@ function _schReadTiming() {
   let runAt = '';
   if (every === 'once') {
     const local = document.getElementById('schRunAt')?.value || '';
-    const original = window.ScheduleTiming?.localInput(existing.runAt, timeZone) || '';
-    // Native datetime-local can shorten .120 to .12. Compare the wall fields,
-    // preserving the original ISO (including microseconds) when left unchanged.
-    const canonical = value => {
-      const parts = value.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/);
-      return parts ? parts[1] + ':' + (parts[2] || '00') + '.' + (parts[3] || '').padEnd(3, '0') : '';
-    };
-    const same = local && original && canonical(local) === canonical(original);
-    runAt = existing.every === 'once' && same ? existing.runAt
+    const original = window.ScheduleTiming?.localMinute(existing.runAt, timeZone);
+    // Preserve the stored instant when the displayed minute has not changed.
+    runAt = existing.every === 'once' && local && local === original ? existing.runAt
       : window.ScheduleTiming?.fromLocalInput(local, timeZone) || '';
   }
   const startControl = document.getElementById('schStartDate');

@@ -35,6 +35,7 @@ const fmt = (ms) => ms ? new Date(ms).toLocaleString(getLocale(), { hour12: fals
 export default function PluginCenter({ setupContext, onNavigate }) {
   const uiLocale = useLocale();
   const [navigation] = useState(() => setupContext || takeNav('plugins'))
+  const requestedWorkflow = useRef(navigation?.workflowPluginId)
   const setupProject = navigation && navigation.target === 'plugin' ? navigation : null
   const [data, setData] = useState(null)
   const [selected, setSelected] = useState('')
@@ -47,6 +48,7 @@ export default function PluginCenter({ setupContext, onNavigate }) {
   const [busy, setBusy] = useState('')
   const [recommendationOpen, setRecommendationOpen] = useState(false)
   const [bulkImport, setBulkImport] = useState(null)
+  const [bulkImportPending, setBulkImportPending] = useState(false)
   const [simulation, setSimulation] = useState(null)
   const [bindingOpen, setBindingOpen] = useState(false)
   const [bindingEdit, setBindingEdit] = useState(null)
@@ -125,7 +127,13 @@ export default function PluginCenter({ setupContext, onNavigate }) {
     }
     try {
       setData(items)
-      setSelected((old) => old || (items[0] && items[0].id) || '')
+      if (requestedWorkflow.current && items.some(item => item.id === requestedWorkflow.current)) {
+        setSelected(requestedWorkflow.current)
+        setDetailOpen(true)
+      } else {
+        setSelected((old) => old || (items[0] && items[0].id) || '')
+      }
+      requestedWorkflow.current = null
       setError(null)
     } catch (e) { setError(e); setData(null); return }
     if (detailOpen) await refreshRuns(true)
@@ -238,9 +246,16 @@ export default function PluginCenter({ setupContext, onNavigate }) {
     }, { once: true })
     input.click()
   }
+  function closeBulkImport() {
+    if (bulkImportPending) return
+    setBulkImport(null)
+    setTimeout(() => {
+      if (document.activeElement === document.body) moreMenuRef.current?.querySelector('summary')?.focus()
+    }, 0)
+  }
   async function confirmBulkImport(options) {
-    if (!bulkImport || !(bulkImport.files || []).length) return
-    setBusy('bulk-import')
+    if (bulkImportPending || !bulkImport?.files.length) return
+    setBulkImportPending(true)
     try {
       const out = await api.bulkImportPlugins(
         bulkImport.files, options.rightsConfirmed, options.sourceLabel)
@@ -254,8 +269,9 @@ export default function PluginCenter({ setupContext, onNavigate }) {
       }
     } catch (e) {
       toast(tx("批量导入失败：") + e.message)
+    } finally {
+      setBulkImportPending(false)
     }
-    setBusy('')
   }
   async function trust(version, enabled, confirmWithoutEvaluation = false, note = '') {
     setBusy(version.id)
@@ -502,7 +518,7 @@ export default function PluginCenter({ setupContext, onNavigate }) {
             <summary className="btn btn-ghost">{tx("更多")}<Icon name="chevron" /></summary>
             <div className="plugin-admin-more-menu">
               <button type="button" onClick={() => { closeMoreMenu(); setPublishersOpen(true) }}><Icon name="shield" /><span><b>{tx("发布身份")}</b><small>{tx("核对可信发布者")}</small></span></button>
-              <button type="button" disabled={busy === 'bulk-import'} onClick={() => { closeMoreMenu(); chooseBulkFiles() }}><Icon name="plus" /><span><b>{tx("批量导入")}</b><small>{tx("一次检查多个插件包")}</small></span></button>
+              <button type="button" disabled={bulkImportPending} onClick={() => { closeMoreMenu(); chooseBulkFiles() }}><Icon name="plus" /><span><b>{tx("批量导入")}</b><small>{tx("一次检查多个插件包")}</small></span></button>
               <button type="button" onClick={() => { closeMoreMenu(); load() }}><Icon name="refresh" /><span><b>{tx("刷新目录")}</b><small>{tx("重新获取上架与待处理状态")}</small></span></button>
             </div>
           </details>}
@@ -553,8 +569,8 @@ export default function PluginCenter({ setupContext, onNavigate }) {
         {syncIssue && <div className="plugin-sync-alert"><Icon name="alert" /><span><b>{tx("运行数据暂时没有更新")}</b><small>{syncIssue}{lastSyncedAt ? tx(" · 上次同步 {0}", [fmt(lastSyncedAt)]) : ''}</small></span><button onClick={() => refreshRuns(false)}>{tx("重新连接")}</button></div>}
     </PluginDetailDrawer>}
 
-    {bulkImport && <BulkImportModal data={bulkImport} busy={busy === 'bulk-import'}
-      onClose={() => setBulkImport(null)} onConfirm={confirmBulkImport} />}
+    {bulkImport && <BulkImportModal data={bulkImport} busy={bulkImportPending}
+      onClose={closeBulkImport} onConfirm={confirmBulkImport} />}
     {simulation && <SimulationModal plugin={simulation.plugin} version={simulation.version} initialProjectId={setupProject && setupProject.projectId} onClose={() => setSimulation(null)} />}
     {bindingOpen && detail && <BindingForm plugin={detail} binding={bindingEdit} onClose={() => { setBindingOpen(false); setBindingEdit(null) }} onSaved={async () => { setBindingOpen(false); setBindingEdit(null); setDetail(await api.pluginDetail(selected)); await refreshGovernance(true) }} />}
     {can('plugin.run') && runOpen && detail && <PluginRunForm plugin={detail} onClose={() => setRunOpen(false)} onStarted={(run) => { setRunOpen(false); setRunDetail(run); load() }} />}
@@ -600,13 +616,14 @@ function BulkImportModal({ data, busy, onClose, onConfirm }) {
   const [rightsConfirmed, setRightsConfirmed] = useState(false)
   const files = data.files || []
   const result = data.result
-  return <Modal scope="plugin-page" title={tx("批量导入插件包")} icon="box" onClose={onClose} foot={<>
-    <button className="btn btn-ghost" onClick={onClose}>{result ? tx("关闭") : tx("取消")}</button>
+  return <Modal draft={result ? undefined : { sourceLabel, rightsConfirmed }} scope="plugin-page" title={tx("批量导入插件包")} icon="box" onClose={onClose} foot={dismiss => <>
+    <button className="btn btn-ghost" onClick={dismiss}>{result ? tx("关闭") : tx("取消")}</button>
     {!result && <button className="btn btn-primary" disabled={busy || !files.length}
       onClick={() => onConfirm({ sourceLabel, rightsConfirmed })}>
       {busy ? tx("正在校验并导入…") : tx("提交 {0} 个包审核", [files.length])}
     </button>}
-  </>}>
+  </>}
+    key={result ? 'result' : 'form'}>
     <div className="plugin-bulk-import">
       <section className="plugin-bulk-summary"><Icon name="shield" /><div>
         <b>{tx("只导入有明确使用权的插件包")}</b>

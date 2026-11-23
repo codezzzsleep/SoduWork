@@ -150,6 +150,7 @@ _WANT_COLUMNS = {
         ("created_by", "VARCHAR(36)"),
         ("created_by_name", "VARCHAR(64) DEFAULT ''"),
         ("assignee_user_id", "VARCHAR(36)"),
+        ("review_recipient_user_id", "VARCHAR(36)"),
         ("recur", "VARCHAR(16)"),
         ("recur_at", "{ts}"),
         ("progress", "{json}"),
@@ -179,6 +180,7 @@ _WANT_COLUMNS = {
         # Legacy adoption stamps head without replaying the source-provenance revision.
         ("source_requirement", "{json} NOT NULL DEFAULT '{{}}'"),
         ("model_name", "VARCHAR(300) NOT NULL DEFAULT ''"),
+        ("model_source", "VARCHAR(16) NOT NULL DEFAULT 'managed'"),
         ("created_by", "VARCHAR(36)"),
         ("time_zone", "VARCHAR(64) NOT NULL DEFAULT 'Asia/Shanghai'"),
         ("required_capabilities", "{json} NOT NULL DEFAULT '[]'"),
@@ -259,6 +261,7 @@ _WANT_COLUMNS = {
         ("competencies", "{json}"),
     ],
     "app_user": [
+        ("is_test_account", "BOOLEAN"),
         ("auth_version", "INTEGER DEFAULT 1"),
         ("positions", "{json}"),
         ("domains", "{json}"),
@@ -293,12 +296,16 @@ _LEGACY_DROP = {
 
 
 def _ensure_columns(conn) -> None:
+    from importlib import import_module
     from sqlalchemy import inspect, text
     is_pg = conn.dialect.name == "postgresql"
     ts = "TIMESTAMP WITH TIME ZONE" if is_pg else "DATETIME"
     json_t = "JSONB" if is_pg else "TEXT"
     now = "CURRENT_TIMESTAMP" if is_pg else "'1970-01-01 00:00:00'"
     insp = inspect(conn)
+    # Legacy adoption stamps the latest head instead of replaying its revisions.
+    # create_all leaves existing VARCHAR columns unchanged on PostgreSQL.
+    import_module("migrations.versions.0092_task_text_storage").migrate_schema(conn)
     for table, cols in _WANT_COLUMNS.items():
         try:
             existing = {c["name"] for c in insp.get_columns(table)}
@@ -449,6 +456,14 @@ def _backfill_data(conn) -> None:
          "WHERE created_by IS NULL OR created_by = ''"),
     ):
         conn.execute(text(sql))
+
+    model_privacy = import_module("migrations.versions.0089_schedule_model_source")
+    model_privacy.scrub_schedule_models(conn)
+    model_privacy.scrub_receipts(conn)
+    import_module("migrations.versions.0090_requirement_creator").migrate_data(conn)
+    # Adoption stamps head directly; retain the same original-value audit and
+    # safe rank repair as the numbered SQLite upgrade.
+    import_module("migrations.versions.0091_domain_sort_validation").repair_domain_sorts(conn)
 
     # Pre-Alembic ledgers predate occurrence identities. Backfill before adding the unique
     # index so adoption remains safe even when the historical table already has many rows.

@@ -1,20 +1,26 @@
 'use strict';
 
 /* Task attachment viewing belongs to Electron's trusted main process.
-   The renderer only submits the short-lived attachment URL it received from Hub.
-   This module binds that URL to the active Hub, fetches it without cookies, and
-   chooses a safe native preview or an explicit system-app handoff. */
+   Bind signed attachment URLs to the active Hub. For saved evidence containing
+   only an attachment ID, request a signed URL under the current account. */
 const fs = require('fs');
 const path = require('path');
-const { marked } = require('../vendor/markdown/marked.umd.js');
+const { marked } = require('../core/markdown.js');
 
 const ATTACHMENT_PATH = /^\/api\/v1\/attachments\/([A-Za-z0-9-]{8,64})$/;
+const ATTACHMENT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TICKET = /^[A-Za-z0-9._~-]{16,4096}$/;
 const INLINE_PREVIEW_TYPES = new Set([
   'image/png', 'image/jpeg', 'image/gif', 'image/webp',
   'image/bmp', 'image/avif', 'image/x-icon',
   'application/pdf', 'application/json',
   'text/plain', 'text/markdown', 'text/csv',
+]);
+const PASSIVE_PREVIEW_EXTENSIONS = new Map([
+  ['.txt', 'text/plain'], ['.csv', 'text/csv'], ['.json', 'application/json'],
+  ['.png', 'image/png'], ['.jpg', 'image/jpeg'], ['.jpeg', 'image/jpeg'],
+  ['.gif', 'image/gif'], ['.webp', 'image/webp'], ['.bmp', 'image/bmp'],
+  ['.avif', 'image/avif'], ['.ico', 'image/x-icon'], ['.pdf', 'application/pdf'],
 ]);
 // Opening received files is not permission to execute programs or shell scripts.
 const SYSTEM_OPEN_EXTENSIONS = new Set([
@@ -88,11 +94,18 @@ function renderMarkdownPreview(filename, data) {
 function safeFilename(raw, fallback) {
   let name = path.basename(String(raw || '')).replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_');
   name = name.replace(/[. ]+$/g, '');
-  if (name.length > 180) {
+  if (Buffer.byteLength(name, 'utf8') > 180) {
     // Preview routing and system associations depend on the final extension.
     const extension = path.extname(name);
-    name = extension.length < 180
-      ? name.slice(0, 180 - extension.length) + extension : name.slice(0, 180);
+    const suffix = Buffer.byteLength(extension, 'utf8') < 180 ? extension : '';
+    let shortened = '', bytes = Buffer.byteLength(suffix, 'utf8');
+    for (const character of suffix ? name.slice(0, -suffix.length) : name) {
+      const size = Buffer.byteLength(character, 'utf8');
+      if (bytes + size > 180) break;
+      shortened += character;
+      bytes += size;
+    }
+    name = shortened + suffix;
   }
   if (!name || WINDOWS_RESERVED.test(name)) name = String(fallback || 'attachment');
   return name;
@@ -361,6 +374,12 @@ async function preview(event, raw) {
   const filename = safeFilename(payload.filename, parsed.id);
   const result = await fetchAttachment(parsed.url, undefined, () => refreshAttachment(event, found, parsed, 'preview'));
   assertCurrent(event, found);
+  // Local message uploads intentionally store a generic MIME type. Route only
+  // known passive extensions to existing isolated viewers, never the OS shell.
+  // Explicit server types, including HTML and SVG, remain authoritative.
+  if (!result.contentType || result.contentType === 'application/octet-stream') {
+    result.contentType = PASSIVE_PREVIEW_EXTENSIONS.get(path.extname(filename).toLowerCase()) || result.contentType;
+  }
   if (payload.inlineText === true) {
     if (!/\.(?:md|markdown|txt)$/i.test(filename)) return { ok: false, reason: '这份附件不支持文本预览' };
     const cap = 2 * 1024 * 1024;
@@ -385,7 +404,9 @@ async function preview(event, raw) {
 async function download(event, raw) {
   const payload = raw || {};
   const found = identityFor(event);
-  const parsed = downloadSource(payload, found);
+  const idOnly = payload.deliveryBundle !== true && (payload.url == null || payload.url === '') &&
+    typeof payload.attachmentId === 'string' && ATTACHMENT_UUID.test(payload.attachmentId);
+  const parsed = idOnly ? { id: payload.attachmentId } : downloadSource(payload, found);
   const filename = safeFilename(payload.filename, parsed.id);
   const picked = await DEPS.dialog.showSaveDialog(found.parent, require("./native-locale.cjs").dialogOptions({
     title: '\u4e0b\u8f7d\u9644\u4ef6',
@@ -400,7 +421,9 @@ async function download(event, raw) {
     await saveArchive(response, picked.filePath, () => assertCurrent(event, found));
     return { ok: true };
   }
-  const result = await fetchAttachment(parsed.url, undefined, () => refreshAttachment(event, found, parsed));
+  const renew = () => refreshAttachment(event, found, parsed);
+  const source = idOnly ? await renew() : parsed;
+  const result = await fetchAttachment(source.url, undefined, idOnly ? undefined : renew);
   assertCurrent(event, found);
   fs.writeFileSync(picked.filePath, result.data);
   return { ok: true };

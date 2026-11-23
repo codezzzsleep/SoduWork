@@ -370,7 +370,11 @@
       const owned = draftPlacement?.target(file, snapshot, messages);
       const old = root.querySelector('[data-plugin-draft-identity="' + escapeSelector(identity) + '"]');
       const revision = String(file.pluginRevision || file.at || 0);
-      const sameRevision = old && (old.dataset.pluginDraftRevision || old.dataset.pluginDraftAt) === revision;
+      const validation = file.pluginValidation || { state: 'pending' };
+      const validationKey = JSON.stringify(validation);
+      const installable = validation.state === 'ready' && file.pluginInstallable !== false;
+      const sameRevision = old && (old.dataset.pluginDraftRevision || old.dataset.pluginDraftAt) === revision &&
+        old.dataset.pluginDraftValidation === validationKey;
       if (owned === false) continue;
       if (owned === null && old && (sameRevision || !file.pluginRevision)) {
         const previousMessage = old.closest('.nmsg.ai');
@@ -393,23 +397,44 @@
       }
       old?.remove();
       const card = root.ownerDocument.createElement('div'); card.className = 'nplugin-draft';
+      card.dataset.skillPackage = String(file.skillPackage === true);
       card.dataset.chatNode = 'plugin-draft:' + key(file);
       card.dataset.pluginDraftIdentity = identity; card.dataset.pluginDraftAt = String(file.at || 0);
       card.dataset.pluginDraftRevision = revision;
+      card.dataset.pluginDraftValidation = validationKey;
       card.dataset.pluginDraftHistorical = String(owned === null);
       if (owned) card.dataset.pluginDraftOwner = draftPlacement.ownerIndex(target, snapshot);
       const mark = root.ownerDocument.createElement('span'); mark.className = 'nplugin-draft-icon'; mark.setAttribute('aria-hidden', 'true');
-      mark.innerHTML = '<svg viewBox="0 0 24 24"><path d="M9 4H5a1 1 0 0 0-1 1v4h2a3 3 0 0 1 0 6H4v4a1 1 0 0 0 1 1h4v-2a3 3 0 0 1 6 0v2h4a1 1 0 0 0 1-1v-4h-2a3 3 0 0 1 0-6h2V5a1 1 0 0 0-1-1h-4V3a3 3 0 0 0-6 0z"/></svg>';
+      mark.innerHTML = file.skillPackage
+        ? '<svg viewBox="0 0 24 24"><path d="m15 3 6 6-9 10-9 2 2-9zM3 21l7-7M13 5l6 6"/><circle cx="11" cy="13" r="2"/></svg>'
+        : '<svg viewBox="0 0 24 24"><path d="M9 4H5a1 1 0 0 0-1 1v4h2a3 3 0 0 1 0 6H4v4a1 1 0 0 0 1 1h4v-2a3 3 0 0 1 6 0v2h4a1 1 0 0 0 1-1v-4h-2a3 3 0 0 1 0-6h2V5a1 1 0 0 0-1-1h-4V3a3 3 0 0 0-6 0z"/></svg>';
       const copy = root.ownerDocument.createElement('div'); copy.className = 'nplugin-draft-copy';
-      const label = root.ownerDocument.createElement('b'); label.textContent = file.pluginName || '插件已生成';
+      const label = root.ownerDocument.createElement('b'); label.textContent = file.pluginName || (file.skillPackage ? '技能已生成' : '插件已生成');
       if (file.pluginName) label.setAttribute('data-user-content', '');
-      const hint = root.ownerDocument.createElement('span'); hint.textContent = owned === null ? '会话中已生成的插件，可检查并安装' : '检查内容后，安装到我的 SoduWork';
+      const hint = root.ownerDocument.createElement('span'); hint.textContent = file.skillPackage ? '检查内容后，安装到我的技能库'
+        : owned === null ? '会话中已生成的插件，可检查并安装' : '检查内容后，安装到我的 SoduWork';
+      if (!installable) hint.textContent = validation.state === 'invalid' ? '\u63d2\u4ef6\u8349\u7a3f\u672a\u901a\u8fc7\u68c0\u67e5\uff0c\u8bf7\u4fee\u590d\u540e\u518d\u5b89\u88c5'
+        : validation.state === 'repairing' ? '\u6b63\u5728\u4fee\u590d\u63d2\u4ef6\u8349\u7a3f' : '\u6b63\u5728\u68c0\u67e5\u63d2\u4ef6\u8349\u7a3f';
       copy.append(label, hint);
       const install = root.ownerDocument.createElement('button'); install.type = 'button';
       install.className = 'btn-mini primary'; install.dataset.installPluginDraft = key(file);
       install.dataset.pluginDraftRef = ref; install.textContent = '检查并安装';
       const error = root.ownerDocument.createElement('p'); error.className = 'nplugin-draft-error'; error.setAttribute('role', 'alert'); error.hidden = true;
-      card.append(mark, copy, install, error); target.appendChild(card);
+      if (validation.diagnostic) {
+        const issue = validation.diagnostic;
+        error.textContent = [issue.file, issue.line ? issue.line + ':' + (issue.column || 1) : '', issue.field, issue.message].filter(Boolean).join(' | ');
+        error.hidden = false;
+      }
+      card.append(mark, copy);
+      if (installable) card.append(install);
+      if (!file.skillPackage) {
+        const note = root.ownerDocument.createElement('p'); note.className = 'nplugin-verification-note';
+        const text = '安装检查仅验证包结构与声明，不代表真实 AI 或业务功能已验证。';
+        note.setAttribute('data-i18n', text); note.setAttribute('data-i18n-source', text);
+        note.textContent = global.SoduWorkI18n?.translateText?.(text) || text;
+        note.setAttribute('role', 'note'); card.append(note);
+      }
+      card.append(error); target.appendChild(card);
     }
   }
   const isImage = file => /\.(?:png|jpe?g|gif|webp|ico)$/i.test(String(file?.name || file?.relative || file?.path || ''));
@@ -441,6 +466,24 @@
     caption.append(name,hint); card.append(caption);
     return card;
   }
+  function localImageDeclaration(code, files) {
+    if (code.className && !code.classList.contains('language-soduwork-media') &&
+        !code.classList.contains('language-json')) return null;
+    const source = code.textContent.trim();
+    if (!source.startsWith('{') || source.length > 4096) return null;
+    let value;
+    try { value = JSON.parse(source); } catch (_) { return null; }
+    if (value?.type !== 'image' || Object.keys(value).some(name => !['type', 'items'].includes(name)) ||
+        !Array.isArray(value.items) || value.items.length !== 1) return null;
+    const item = value.items[0], url = item?.url;
+    if (typeof url !== 'string' || !url || /[:\\?#]/.test(url) ||
+        Object.keys(item).some(name => !['url', 'title'].includes(name))) return null;
+    const relative = url.replace(/^\.\//, '');
+    if (relative.split('/').some(part => !part || part === '.' || part === '..')) return null;
+    const matches = files.filter(file => file.artifactId && !file.deleted && isImage(file) &&
+      file.relative === relative);
+    return matches.length === 1 ? matches[0] : null;
+  }
   function inlineImages(root, files, ref) {
     files = asFiles(files);
     const doc = root.ownerDocument, shown = new Set([...root.querySelectorAll('[data-output-image],[data-delivery-preview]')]
@@ -459,6 +502,15 @@
       if (message.dataset.deliveryFinal !== 'false') owners.set(task, message);
       const target = owners.get(task);
       const candidates = new Map(), available = scoped(message,files);
+      if (target === message) {
+        message.querySelectorAll('.nmd pre > code').forEach(code => {
+          const file = localImageDeclaration(code, available);
+          if (!file) return;
+          const preview = shown.has(key(file)) ? button(doc, file, file.name) : imageCard(doc, file, ref);
+          shown.add(key(file));
+          code.parentElement.replaceWith(preview);
+        });
+      }
       message.querySelectorAll('[data-output-image-ref]').forEach(node => {
         const file = fileTarget(node.dataset.outputImageRef,available);
         if (file && !file.deleted && isImage(file)) {
@@ -535,7 +587,7 @@
     if(!row || !/^\/(?:api\/v1\/)?attachments\/[^/?#]+\?/.test(row.url||'')) throw Error('这份成果暂时不可用，请刷新后重试');
     return {...row,url:hub.attachmentUrl(row)};
   }
-  async function readPreview(file, api, ref, mode='read') {
+  async function readPreview(file, api, ref, mode='read', current = () => true) {
     if (file.cloudPending && !file.processEvidence) file = await materialize(file, api, ref, { previewOnly: true });
     if (file.taskId && file.attachmentId) {
       const row = await taskAttachment(file,global.SoduWorkAPI);
@@ -546,7 +598,17 @@
       }
       return global.soduWorkAPI.previewAttachment({...row,inlineText:mode==='read',inlineImage:mode!=='read'});
     }
-    if (file.artifactId && api?.artifactAction) return api.artifactAction(ref,file.artifactId,mode);
+    if (file.artifactId && api?.artifactAction) {
+      const scope = global.SoduWorkAPI?.taskStorageKey?.('ops');
+      const reply = await api.artifactAction(ref,file.artifactId,mode);
+      // A runtime switch can invalidate an in-flight scan. Reauthorize the
+      // same read once; never replay file actions or bypass an access failure.
+      if (reply?.ok === false && reply.code === 'ARTIFACT_SOURCE_CHANGED' &&
+          ['read', 'image', 'image-full', 'preview'].includes(mode) && current() &&
+          scope === global.SoduWorkAPI?.taskStorageKey?.('ops'))
+        return api.artifactAction(ref,file.artifactId,mode);
+      return reply;
+    }
     if (mode==='read' && file.path && api?.readOutput) return api.readOutput(ref,file.path);
     return {ok:false,reason:'当前成果暂时不能预览，请刷新后重试'};
   }
@@ -580,7 +642,7 @@
           const current = mediaOwnerCurrent(owner, options);
           owner.onkeydown = event => { if (event.target === owner && ['Enter', ' '].includes(event.key)) { event.preventDefault(); owner.click(); } };
           global.ChatMedia.load(node, async () => {
-            const reply = await readPreview(file, options.api, options.ref, 'image-full');
+            const reply = await readPreview(file, options.api, options.ref, 'image-full', current);
             return current() ? imageUrl(reply) : '';
           });
         }
@@ -601,7 +663,7 @@
       const hint = node.querySelector('small');
       if (hint) hint.textContent = '正在加载图片…';
       try {
-        const reply = await readPreview(file, options.api, options.ref, 'image');
+        const reply = await readPreview(file, options.api, options.ref, 'image', valid);
         const src = imageUrl(reply);
         if (!src) throw Error(reply?.reason || '图片暂时无法预览');
         if (!valid()) return;
@@ -626,7 +688,7 @@
           const current = mediaOwnerCurrent(owner, options);
           owner.onkeydown = event => { if (event.target === owner && ['Enter', ' '].includes(event.key)) { event.preventDefault(); owner.click(); } };
           global.ChatMedia.load(node, async () => {
-            const reply = await readPreview(file, options.api, options.ref, 'preview');
+            const reply = await readPreview(file, options.api, options.ref, 'preview', current);
             return current() ? videoUrl(reply) : '';
           });
         }

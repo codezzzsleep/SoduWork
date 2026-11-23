@@ -121,14 +121,14 @@ test('opening a stale menu refreshes once while typing and fresh reopen remain l
 });
 
 function apiFixture() {
-  let user = 'alice'; const values = new Map([['soduwork_work_hub_url', 'http://fixture.invalid']]);
+  let user = 'alice', sessionVersion = 0; const values = new Map([['soduwork_work_hub_url', 'http://fixture.invalid']]);
   const events = new Map(), notifications = [], calls = [];
   const f = { fetch: async () => new Response('{"ok":true}'), calls, notifications };
   class Event { constructor(type) { this.type = type; } }
   const g = { CustomEvent: Event, addEventListener(name, fn) { events.set(name, fn); },
     dispatchEvent(event) { notifications.push(event.type); events.get(event.type)?.(event); },
     soduWorkAPI: { deviceAuthBootstrap: async () => ({ ok: true, stored: true, clientId: 'device-1',
-      user: { id: user }, session: 'session-' + user, expiresIn: 1800 }) } };
+      user: { id: user }, session: 'session-' + user + '-' + ++sessionVersion, expiresIn: 1800 }) } };
   vm.runInNewContext(require('./renderer-source.cjs').readFileSync(path.join(__dirname, '../api.js'), 'utf8'), {
     window: g, User: { id: 'device-1' }, navigator: { platform: 'test' }, CustomEvent: Event,
     localStorage: { getItem: k => values.get(k) ?? null, setItem: (k, v) => values.set(k, String(v)), removeItem: k => values.delete(k) },
@@ -145,6 +145,37 @@ const mutations = [a => a.createMySkill({ name: 'code-motion-film' }),
   a => a.deleteMySkill('code-motion-film', 'checksum'), a => a.setMySkills(['code-motion-film']),
   a => a.refreshMySkills()];
 
+test('strict skill reads preserve authoritative identity and propagate lookup failures', async () => {
+  const f = apiFixture(); await f.signIn('alice');
+  const catalog = { skills: [{ name: 'fixture', scope: 'personal', checksum: 'a'.repeat(64), enabled: true }], enabled: ['fixture'] };
+  f.fetch = async () => Response.json(catalog);
+  assert.deepEqual(JSON.parse(JSON.stringify(await f.api.mySkills({ strict: true }))), catalog);
+  f.fetch = async () => new Response('{"detail":"catalog unavailable"}', { status: 503 });
+  await assert.rejects(f.api.mySkills({ strict: true }), error => error.status === 503);
+  assert.deepEqual(Array.from((await f.api.mySkills()).skills), []);
+  f.fetch = async () => { throw new Error('Network unavailable'); };
+  await assert.rejects(f.api.mySkills({ strict: true }), /Network unavailable/);
+});
+
+test('strict skill reads reject malformed catalogs instead of reporting no installation', async () => {
+  const f = apiFixture(); await f.signIn('alice');
+  for (const payload of [null, {}, { skills: null }, { skills: {} }]) {
+    f.fetch = async () => Response.json(payload);
+    await assert.rejects(f.api.mySkills({ strict: true }), /技能目录/);
+  }
+});
+
+test('strict skill reads reject responses after account changes including returning to the original account', async () => {
+  for (const returnToA of [false, true]) {
+    const f = apiFixture(); await f.signIn('alice');
+    let complete; f.fetch = () => new Promise(resolve => { complete = resolve; });
+    const pending = f.api.mySkills({ strict: true }); await flush();
+    await f.signIn('bob'); if (returnToA) await f.signIn('alice');
+    complete(Response.json({ skills: [{ name: 'stale-private-skill', enabled: true }] }));
+    await assert.rejects(pending, error => error.code === 'STALE_TASK_SCOPE');
+  }
+});
+
 test('successful skill mutations notify mounted pickers; failed and silent refresh requests do not', async () => {
   const f = apiFixture(); await f.signIn('alice'); f.notifications.length = 0;
   for (const mutate of mutations) await mutate(f.api);
@@ -156,17 +187,55 @@ test('successful skill mutations notify mounted pickers; failed and silent refre
   assert.equal(f.notifications.filter(x => x === 'soduwork:skills-changed').length, mutations.length);
 });
 
-test('late mutation success cannot notify a different account or a later login of the same account', async () => {
+test('account changes cancel skill mutations and reject late success even after returning to the original account', async () => {
   for (const returnToA of [false, true]) for (const mutate of mutations) {
     const f = apiFixture(); await f.signIn('alice');
     let complete; f.fetch = () => new Promise(resolve => { complete = resolve; });
     const pending = mutate(f.api); await flush();
+    const rejected = assert.rejects(pending, { code: 'STALE_TASK_SCOPE' });
+    const signal = f.calls[0].options.signal;
+    assert.equal(signal.aborted, false);
     await f.signIn('bob'); if (returnToA) await f.signIn('alice');
+    assert.equal(signal.aborted, true);
     f.notifications.length = 0;
     complete(new Response('{"ok":true}'));
-    if (returnToA) await pending;
-    else await assert.rejects(pending, error => error.code === 'STALE_TASK_SCOPE');
+    await rejected;
+    assert.equal(f.calls.length, 1, 'an old mutation cannot replay under the new login');
     assert.equal(f.notifications.includes('soduwork:skills-changed'), false);
+  }
+});
+
+test('same-account session renewal preserves pending skill mutations and their single notification', async () => {
+  for (const mutate of mutations) {
+    const f = apiFixture(); await f.signIn('alice');
+    let complete; f.fetch = () => new Promise(resolve => { complete = resolve; });
+    const pending = mutate(f.api); await flush();
+    const signal = f.calls[0].options.signal;
+    await f.signIn('alice');
+    assert.equal(signal.aborted, false, 'renewing the same account must not cancel its request');
+    f.notifications.length = 0;
+    complete(new Response('{"ok":true}'));
+    assert.equal((await pending).ok, true);
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.notifications.filter(type => type === 'soduwork:skills-changed').length, 1);
+  }
+});
+
+test('skill previews cannot retry an old account upload with a new account session', async () => {
+  for (const preview of [
+    api => api.preflightMySkill(new File(['private skill'], 'fixture.skill')),
+    api => api.previewSkillContent(new File(['private skill'], 'fixture.skill'), 'SKILL.md', 0),
+  ]) {
+    const f = apiFixture(); await f.signIn('alice');
+    let complete;
+    f.fetch = () => new Promise(resolve => { complete = resolve; });
+    const pending = preview(f.api); await flush();
+    assert.equal(f.calls.length, 1);
+    await f.signIn('bob');
+    f.fetch = async () => new Response('{"ok":true}');
+    complete(new Response('{"detail":"expired"}', { status: 401 }));
+    await assert.rejects(pending, error => error.code === 'STALE_TASK_SCOPE');
+    assert.equal(f.calls.length, 1);
   }
 });
 

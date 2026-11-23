@@ -22,6 +22,7 @@ function environment() {
   for (const [key, value] of Object.entries(process.env)) {
     if (/^(?:PATH|PATHEXT|HOME|USERPROFILE|APPDATA|LOCALAPPDATA|PROGRAMDATA|PROGRAMFILES(?:\(X86\))?|SYSTEMROOT|WINDIR|COMSPEC|SHELL|TMP|TEMP|TMPDIR|LANG|LC_.*|TZ|USER|USERNAME|LOGNAME|XDG_.*|DISPLAY|WAYLAND_DISPLAY|DBUS_SESSION_BUS_ADDRESS|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|SODUWORK_DESKTOP_CONTROL_ENDPOINT|SODUWORK_OPEN_TIMING)$/i.test(key)) result[key] = value;
   }
+  if (process.env.SODUWORK_SOURCE_SESSION === '1') result.SODUWORK_SOURCE_SESSION = '1';
   if (process.env.SODUWORK_RUNTIME_MANAGED === '1') {
     for (const key of ['SODUWORK_RUNTIME_MANAGED', 'SODUWORK_MANAGED_PYTHON', 'SODUWORK_OFFICE_PYTHON',
       'PYTHONNOUSERSITE', 'PYTHONDONTWRITEBYTECODE']) {
@@ -59,6 +60,7 @@ function createProcessHost(app, options = {}) {
   let watchdogProbe = null, powerSuspended = false, powerEpoch = 0, powerListenersInstalled = false;
   let cleanupPromise = null, cleanupPending = false, cleanupError = null;
   let startupSettled = null, processJob = null;
+  let localPrivacyQueue = Promise.resolve();
   let lastHeartbeat = now(), lastWatchdogTick = now(), initialized = false;
   const fail = message => Object.assign(Error(message), { code: 'RUNTIME_PROCESS_GONE' });
   function resetHeartbeatWindow() { lastHeartbeat = lastWatchdogTick = now(); }
@@ -271,9 +273,24 @@ function createProcessHost(app, options = {}) {
         async localModel(modelRef) {
           return require('../local-model-store.cjs').resolve(String(modelRef || ''));
         },
+        async localAgentModel(id, agentId) {
+          const auth = auths.get(id); if (!auth) throw Error('执行身份已失效');
+          await auth.ensureSession();
+          const store = require('../local-agent-model-store.cjs');
+          return store.configured() ? store.fromIdentity(auth.publicIdentity(), String(agentId || '')) : null;
+        },
         async prepareLocalModels() {
-          require('../local-model-privacy.cjs').ensure(app);
-          return true;
+          // Session opens can arrive concurrently. Serialize privacy migration so
+          // two callers never publish competing atomic replacements of the same
+          // encrypted catalog or archived metadata file.
+          const previous = localPrivacyQueue.catch(() => {});
+          let release;
+          localPrivacyQueue = new Promise(resolve => { release = resolve; });
+          await previous;
+          try {
+            require('../local-model-privacy.cjs').ensure(app);
+            return true;
+          } finally { release(); }
         },
         async authRequest(id, url, init) {
           const auth = auths.get(id); if (!auth) throw Error('执行身份已失效');

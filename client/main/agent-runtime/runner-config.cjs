@@ -3,6 +3,7 @@
 const contextWindow = require('../conversation/context-window');
 const modelSelection = require('../conversation/model-selection');
 const thinkingCapabilities = require('../conversation/thinking-capabilities');
+const capabilityContract = require('../model-capability-contract.cjs');
 
 // Ordinary turns and workflow nodes use the same managed-model contract,
 // including when a running node receives a renewed model ticket.
@@ -12,10 +13,27 @@ function create(model, adapterId, capabilityIds) {
   const requiredCapabilities = Array.from(new Set((Array.isArray(capabilityIds)
     ? capabilityIds : []).map(value => String(value || '').trim().toLowerCase()).filter(Boolean)));
   if (requiredCapabilities.length) cfg.requiredCapabilities = requiredCapabilities;
-  if (model && model.baseUrl && model.key && model.id) {
+  capabilityContract.assertRequired(model, [
+    ...(adapterId === 'pi' ? ['streaming'] : []),
+    ...(requiredCapabilities.length ? ['toolCalling'] : []),
+  ]);
+  // Local providers may intentionally have no API key (for example an
+  // Ollama-compatible endpoint). Keep the opaque local reference out of the
+  // child process and use the provider's wire model id instead.
+  const wireModel = model && model.localOnly
+    ? String(model.wireModelId || model.modelName || model.id || '')
+    : String(model && model.id || '');
+  const hasModelConfig = model && model.baseUrl && wireModel &&
+    (model.localOnly || model.key);
+  if (hasModelConfig) {
     const thinking = thinkingCapabilities.profile(model);
     cfg.llm = {
-      base: String(model.baseUrl), key: String(model.key), model: String(model.id),
+      base: String(model.baseUrl), key: String(model.key || ''), model: wireModel,
+      ...(model.localOnly ? { localOnly: true, authMode: model.authMode || 'api-key' } : {}),
+      ...(model.quotaVersion === 2 && model.quotaUsageToken && !model.localOnly ? {
+        quotaVersion: 2, quotaUsageToken: model.quotaUsageToken,
+        quotaProvider: model.quotaProvider || '',
+      } : {}),
       maxOutputTokens: modelSelection.outputLimit(model),
       ...(['none', 'always', 'controllable'].includes(model.thinkingMode)
         ? { thinkingMode: model.thinkingMode } : {}),
@@ -28,6 +46,7 @@ function create(model, adapterId, capabilityIds) {
         ...(thinking.thinkingLevelMap ? { thinkingLevelMap: { ...thinking.thinkingLevelMap } } : {}),
       } : {}),
       ...(model.capabilityProfile ? { capabilityProfile: model.capabilityProfile } : {}),
+      ...(model.compatibility ? { compatibility: capabilityContract.compatibility(model.compatibility) } : {}),
       ...(model.configRevision ? { configRevision: model.configRevision } : {}),
       ...(model.runtimeRevision ? { runtimeRevision: model.runtimeRevision } : {}),
       ...(Array.isArray(model.input) ? { input: model.input.filter(value => value === 'text' || value === 'image') } : {}),

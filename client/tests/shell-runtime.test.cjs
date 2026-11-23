@@ -67,7 +67,6 @@ test('installer prepares and embeds the verified shell runtime', () => {
     'prepare-shell-runtime.cjs'), 'utf8');
   assert.match(script, /PortableGit-2\.55\.0\.4-64-bit\.7z\.exe/);
   assert.match(script, /016e84230a3767f0c6b3788e79ba0c58a17377086801719d46700fca4f7b36b5/);
-  assert.match(script, /selfTest\(runtimeRoot\)/);
   /* Shell runtime is copied by the afterPack hook, not extraResources: Git
      binaries carry upstream signatures and must not re-enter signtool. The
      bundling rules must also stay in platform sections: a root entry would

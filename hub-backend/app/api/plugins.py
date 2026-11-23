@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import automation_models as am
 from ..db import get_session
-from ..deps import require_any_perm, require_perm
+from ..deps import has_perm, require_any_perm, require_perm
 from ..models import Task, User
 from ..services import (audit, plugin_audience, plugin_evaluations,
                         plugin_governance, plugin_marketplace, plugin_mcp_gateway,
@@ -49,7 +49,7 @@ async def plugins(
     user: User = Depends(require_any_perm("plugin.manage", "plugin.run")),
     session: AsyncSession = Depends(get_session),
 ):
-    return {"items": await plugin_service.list_plugins(session, await _scope(session, user))}
+    return {"items": await plugin_service.management_catalog(session, await _scope(session, user))}
 
 @router.get("/governance")
 async def plugin_governance_overview(
@@ -138,6 +138,8 @@ async def bulk_import_plugins(
                                ("enterprise-rights-confirmed" if rightsConfirmed else "")),
             })
         except (ValueError, RuntimeError) as exc:
+            await session.rollback()
+            await session.refresh(user)
             results.append({"filename": filename, "ok": False,
                             "error": str(exc)[:500]})
     imported = sum(1 for item in results if item["ok"])
@@ -217,8 +219,14 @@ async def apply_plugin_rollout(
 ):
     plugin = await _plugin(session, user, plugin_id)
     target_version_id = str(body.get("targetVersionId") or "")
-    binding_ids = list(body.get("bindingIds") or [])
-    expected_versions = dict(body.get("expectedVersions") or {})
+    raw_binding_ids = body.get("bindingIds") or []
+    raw_expected_versions = body.get("expectedVersions") or {}
+    if not isinstance(raw_binding_ids, list):
+        raise HTTPException(status_code=400, detail="bindingIds 必须是数组")
+    if not isinstance(raw_expected_versions, dict):
+        raise HTTPException(status_code=400, detail="expectedVersions 必须是对象")
+    binding_ids = list(raw_binding_ids)
+    expected_versions = dict(raw_expected_versions)
     try:
         result = await plugin_rollout.execute(
             session, plugin, target_version_id,
@@ -530,10 +538,16 @@ async def simulate_version(
     if project is not None and scope is not None and project.org_id not in scope:
         raise HTTPException(status_code=403, detail="这个项目不在你的组织范围内")
     org_id = project.org_id if project is not None else (plugin.org_id or user.org_id)
+    config = body.get("config") or {}
+    secret_refs = body.get("secretRefs") or {}
+    if not isinstance(config, dict):
+        raise HTTPException(status_code=400, detail="插件配置必须是对象")
+    if not isinstance(secret_refs, dict):
+        raise HTTPException(status_code=400, detail="插件密钥引用必须是对象")
     try:
         return await plugin_service.simulate(
             session, version, project, org_id, str(body.get("agentKind") or ""),
-            dict(body.get("config") or {}), dict(body.get("secretRefs") or {}))
+            config, secret_refs)
     except ValueError as exc:
         raise _conflict(exc) from exc
 
@@ -741,8 +755,46 @@ async def run_detail(
     run = await session.get(am.WorkflowRun, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="插件运行不存在")
-    await task_or_404(session, user, run.task_id)
-    return await workflow_engine.run_api(session, run)
+    task = await task_or_404(session, user, run.task_id)
+    detail = await workflow_engine.run_api(session, run)
+    if has_perm(user, "plugin.run"):
+        await _add_retry_models(session, run, task, detail)
+    return detail
+
+
+async def _add_retry_models(session, run, task, detail):
+    from ..services import agent_execution_options, llm, model_catalog, task_assignment
+    nodes = [node for node in detail["nodes"] if node["type"] in ("ai", "ai_review")
+             and node["diagnosis"].get("actionKey") == "retry-gate"]
+    if not nodes:
+        return
+    version = await session.get(am.PluginVersion, run.plugin_version_id)
+    if not version:
+        return
+    definitions = {node["key"]: node for node in (version.workflow or {}).get("nodes", [])}
+    binding = await session.get(am.PluginBinding, run.binding_id) if run.binding_id else None
+    project = await task_assignment.project_route(session, task.project_id)
+    choices = None
+    inherited_model = ""
+    for node in nodes:
+        key = node["key"]
+        if key not in definitions:
+            continue
+        config = task_assignment.apply_project_agent_default(binding.config if binding else {}, project, key)
+        route = workflow_engine.execution_route(run.context, config, definitions[key].get("config"), key)
+        if route["agentKind"] in agent_execution_options.GATEWAY_MODEL_KINDS:
+            if choices is None:
+                catalog = await model_catalog.choices(session)
+                choices = [name for name in [catalog["default"], *catalog["list"]] if name]
+                shared = await llm.load(session)
+                if llm.enabled(shared):
+                    inherited_model = shared.get("llm_model", "")
+            executor = node["executor"]
+            previous = ((executor.get("resolved") or {}).get("model")
+                        or (executor.get("requested") or {}).get("model")
+                        or route["model"] or inherited_model)
+            previous = model_catalog.canonical_model_name(previous)
+            node["retryModels"] = [name for name in choices if name != previous]
 
 
 @run_router.post("/plugin-runs/{run_id}/cancel")
@@ -808,6 +860,7 @@ async def admin_retry_gate(
             session, run, actor=user.display_name or user.username,
             node_key=str(body.get("nodeKey") or ""),
             execution=dict(body.get("execution") or {}) or None,
+            source_node_id=str(body.get("sourceNodeId") or ""),
             resume_rework=bool(body.get("resumeRework")))
     except ValueError as e:
         raise _conflict(e) from e

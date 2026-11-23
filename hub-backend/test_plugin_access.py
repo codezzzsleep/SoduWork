@@ -120,6 +120,60 @@ class PluginAccessTests(unittest.IsolatedAsyncioTestCase):
         self.temporary._storage_patch.stop()
         self.temporary.cleanup()
 
+    async def test_simulate_rejects_nonempty_non_object_fields(self):
+        self.version.workflow = {"nodes": []}
+        await self.session.commit()
+        path = "/api/v1/admin/plugins/versions/permission-v1/simulate"
+        for field, message in (("config", "插件配置必须是对象"),
+                               ("secretRefs", "插件密钥引用必须是对象")):
+            for value in ("abc", 123, True, [1, 2], [["name", "value"]]):
+                with self.subTest(field=field, value=value):
+                    response = await self.http.post(path, json={field: value})
+                    self.assertEqual(response.status_code, 400, response.text)
+                    self.assertEqual(response.json(), {"detail": message})
+
+    async def test_simulate_preserves_empty_field_defaults(self):
+        self.version.workflow = {"nodes": []}
+        await self.session.commit()
+        path = "/api/v1/admin/plugins/versions/permission-v1/simulate"
+        baseline = await self.http.post(path, json={})
+        self.assertEqual(baseline.status_code, 200, baseline.text)
+        self.assertTrue(baseline.json()["dryRun"])
+        for field in ("config", "secretRefs"):
+            for value in (None, {}, False, 0, "", []):
+                with self.subTest(field=field, value=value):
+                    response = await self.http.post(path, json={field: value})
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(response.json(), baseline.json())
+
+    async def test_simulate_preserves_config_and_secret_readiness(self):
+        self.version.workflow = {"nodes": []}
+        await self.session.commit()
+        self.version.capability_report = {"secrets": ["fixture"]}
+        self.session.add(am.SecretReference(
+            id="fixture-ref", name="Fixture reference", org_id="company",
+            provider="runner-env", locator="FIXTURE_UNUSED", enabled=True))
+        await self.session.commit()
+        path = "/api/v1/admin/plugins/versions/permission-v1/simulate"
+        missing = await self.http.post(path, json={})
+        self.assertEqual(missing.status_code, 200, missing.text)
+        self.assertTrue(any("fixture" in item for item in missing.json()["blockers"]))
+        response = await self.http.post(path, json={
+            "config": {"fallbackMode": "strict"},
+            "secretRefs": {"fixture": "fixture-ref"}})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["dryRun"])
+        self.assertFalse(any("fixture" in item for item in response.json()["blockers"]))
+        expected = await plugin_service.simulate(
+            self.session, self.version, None, "company", "",
+            {"fallbackMode": "strict"}, {"fixture": "fixture-ref"})
+        self.assertEqual(response.json(), expected)
+        invalid_route = await self.http.post(path, json={
+            "config": {"fallbackMode": "unknown"},
+            "secretRefs": {"fixture": "fixture-ref"}})
+        self.assertEqual(invalid_route.status_code, 200, invalid_route.text)
+        self.assertIn("执行降级策略不合法", invalid_route.json()["blockers"])
+
     async def save(self, **rules):
         return await plugin_access.save(self.session, self.plugin, rules, "admin")
 
@@ -456,6 +510,24 @@ class PluginAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail["latestVersion"]["compatibility"]["fromVersion"], "1.0.9")
         self.assertEqual(detail["latestVersion"]["trustState"], "quarantined")
         self.assertFalse(detail["latestVersion"]["enabled"])
+
+    async def test_catalog_install_and_review_counts_follow_scope_and_version(self):
+        def review(org_id, verdict, version_id):
+            return am.PluginEvaluationRun(plugin_id=self.plugin.id, version_id=version_id, case_key="sample",
+                                          state="completed", verdict=verdict, org_id=org_id)
+        self.session.add_all([
+            am.PluginInstallation(plugin_id=self.plugin.id, version_id=self.version.id, user_id="outside"),
+            am.PluginInstallation(plugin_id=self.plugin.id, version_id=self.version.id, user_id="author", enabled=False),
+            review("company", "passed", self.version.id), review("company", "failed", self.version.id),
+            review("company", "pending", self.version.id), review("other", "failed", self.version.id),
+            review("company", "passed", "old-version"),
+        ])
+        await self.session.commit()
+        for scope, installs, total in (({"company", "subteam"}, 1, 2), (None, 2, 3)):
+            with self.subTest(scope=scope):
+                row, = await plugin_service.management_catalog(self.session, scope)
+                self.assertEqual(row["activeInstallCount"], installs)
+                self.assertEqual(row["latestVersion"]["reviewedEvaluations"], {"passed": 1, "total": total})
 
     async def test_submission_time_still_precedes_semver_for_management_history(self):
         stamp = datetime(2026, 10, 20, tzinfo=timezone.utc)

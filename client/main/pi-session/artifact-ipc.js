@@ -7,6 +7,7 @@ const attachmentContract = require('./attachment-contract');
 const artifactRuntime = require('../conversation/artifact-runtime');
 const shareArchive = require('../conversation/zip-archive');
 const mateMessageIpc = require('./mate-message-ipc');
+const { readOutputText } = require('./read-output-text.cjs');
 const { shell, nativeImage, dialog } = require('electron');
 const imageClipboard = require('../conversation/image-clipboard');
 
@@ -57,7 +58,7 @@ async function _attachmentImage(handle, ref, token) {
 }
 
 
-  ipcMain.handle('pi-session-outputs', async (event, ref) => { const s = session.get(ref); if (!s) return { ok: false, reason: '\u4f1a\u8bdd\u4e0d\u5728\u4e86' }; try { const { got, delivery, items } = await artifactRuntime.snapshotAsync(await resolveSession(s)); const artifacts = artifactRuntime.decorate(ref, { items }); return { ok: true, files: got.files || [], deliverables: delivery.items || [], artifacts, delivery, cloudOutputs: got.cloudOutputs, truncated: Boolean(got.truncated) }; } catch (e) { return { ok: false, reason: String((e && e.message) || e) }; } });
+  ipcMain.handle('pi-session-outputs', async (event, ref) => { const s = session.get(ref); if (!s) return { ok: false, reason: '\u4f1a\u8bdd\u4e0d\u5728\u4e86' }; try { const { got, delivery, items } = await artifactRuntime.snapshotAsync(await resolveSession(s)); const artifacts = await artifactRuntime.decorateForSharing(ref, { items }); return { ok: true, files: got.files || [], deliverables: delivery.items || [], artifacts, delivery, cloudOutputs: got.cloudOutputs, truncated: Boolean(got.truncated) }; } catch (e) { return { ok: false, reason: String((e && e.message) || e) }; } });
 
   ipcMain.handle('mate-message-pick-folder', mateMessageIpc.createPickFolderHandler({ BrowserWindow, dialog, shareArchive }));
   ipcMain.handle('pi-session-artifact-action', async (event, ref, artifactId, action) => {
@@ -66,7 +67,8 @@ async function _attachmentImage(handle, ref, token) {
     try {
       return await artifactRuntime.action(await resolveSession(s), ref, artifactId, action, { shell, nativeImage });
     } catch (error) {
-      return { ok: false, reason: String((error && error.message) || error) };
+      return { ok: false, reason: String((error && error.message) || error),
+        ...(error?.code === 'ARTIFACT_SOURCE_CHANGED' ? { code: error.code } : {}) };
     }
   });
 
@@ -194,13 +196,7 @@ async function _attachmentImage(handle, ref, token) {
     const outputs = require('./outputs');
     if (!outputs.inside(s.cwd, target)) return { ok: false, reason: '这个文件不在这条对话的工作目录里' };
     try {
-      const st = fs.statSync(target);
-      const CAP = 2 * 1024 * 1024;
-      if (st.size > CAP) {
-        return { ok: true, tooBig: true, size: st.size,
-                 text: fs.readFileSync(target, 'utf8').slice(0, 20000) };
-      }
-      return { ok: true, size: st.size, text: fs.readFileSync(target, 'utf8') };
+      return await readOutputText(target);
     } catch (e) {
       return { ok: false, reason: String((e && e.message) || e) };
     }

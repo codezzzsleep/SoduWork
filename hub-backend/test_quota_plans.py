@@ -20,7 +20,7 @@ from app import models
 from app.api import ai_proxy, client_auth, quotas, usage
 from app.auth import sign_token
 from app.db import get_session
-from app.services import client_access, device_auth, model_transport, quota_plans as qp, quota_usage
+from app.services import client_access, client_domain_events, device_auth, model_transport, quota_plans as qp, quota_usage
 from tests.sqlite_schema import create_fresh_sqlite_schema
 
 
@@ -29,6 +29,7 @@ class QuotaPlanTests(unittest.IsolatedAsyncioTestCase):
         return create_async_engine("sqlite+aiosqlite:///:memory:")
 
     async def asyncSetUp(self):
+        await client_domain_events.stop()
         self.engine = await self.create_database()
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         async with self.engine.begin() as connection:
@@ -66,6 +67,7 @@ class QuotaPlanTests(unittest.IsolatedAsyncioTestCase):
         client_access._policy_cache = None
 
     async def asyncTearDown(self):
+        await client_domain_events.stop()
         await self.http.aclose()
         await self.engine.dispose()
         client_access._policy_cache = None
@@ -101,6 +103,100 @@ class QuotaPlanTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.status())["limit"], 500)
         await self.assign({"revision": 1, "mode": "inherit"})
         self.assertEqual((await self.status())["limit"], 99999)
+
+    async def test_plan_preview_aggregates_individual_balances_in_scope_without_saving(self):
+        catalog = await self.configure(200)
+        await self.assign()
+        await self.assign(uid="other")
+        self.assertEqual((await self.receipt(120)).status_code, 200)
+        plan = {**catalog["plans"][1], "totalLimit": 100}
+        body = {"revision": catalog["revision"], "plan": plan}
+        url = "/api/v1/admin/quotas/plans/preview"
+        response = await self.http.post(url, headers=self.headers, json=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual([result[k] for k in ("previousLimit", "newLimit", "affectedMembers", "used",
+                                              "remaining", "pausedMembers", "scopeLimited")],
+                         [200, 100, 2, 120, 100, 1, False])
+        scoped = {"Authorization": "Bearer " + sign_token("scoped")}
+        visible = (await self.http.post(url, headers=scoped, json=body)).json()
+        self.assertEqual((visible["affectedMembers"], visible["remaining"], visible["scopeLimited"]), (1, 0, True))
+        self.assertEqual((await self.status())["limit"], 200)
+        stale = await self.http.post(url, headers=self.headers, json={**body, "revision": 0})
+        self.assertEqual(stale.status_code, 409)
+        plan.update(totalLimit=None, models=[{"provider": "provider", "model": "a", "limit": 120}])
+        partial = (await self.http.post(url, headers=self.headers, json=body)).json()
+        self.assertEqual((partial["remaining"], partial["pausedMembers"], partial["modelLimitedMembers"]),
+                         (None, 0, 1))
+
+    async def test_preview_does_not_persist_settings_or_audit_events(self):
+        catalog = await self.configure(200)
+        await self.assign()
+        plan = {**catalog["plans"][1], "totalLimit": 100}
+        previews = (
+            ("plans/preview", {"revision": catalog["revision"], "plan": plan}),
+            ("members/owner/preview", {"revision": 1, "mode": "custom", "custom": {"totalLimit": 50}}),
+        )
+
+        async def persisted_state():
+            async with self.sessions() as session:
+                settings = dict((await session.execute(select(models.AppSetting.key, models.AppSetting.value))).all())
+                audit_count = await session.scalar(select(func.count()).select_from(models.AuditLog))
+                return settings, audit_count
+
+        before = await persisted_state()
+        for path, body in previews:
+            response = await self.http.post("/api/v1/admin/quotas/" + path, headers=self.headers, json=body)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(await persisted_state(), before)
+
+    async def test_preview_uses_original_trial_grant_and_target_usage_window(self):
+        async with self.sessions() as session:
+            await qp.register_trial(session, "owner")
+            session.add(models.AIUsageEvent(id="old-usage", idempotency_key="old-usage", billing_user_id="owner",
+                        total_tokens=70, occurred_at=datetime.now(timezone.utc) - timedelta(days=40)))
+            await session.commit()
+        await self.assign({"revision": 1, "mode": "plan", "planId": "standard"})
+        self.assertEqual((await self.receipt(30)).status_code, 200)
+        trial = {**qp.DEFAULT_CATALOG["plans"][0], "totalLimit": 80}
+        preview = await self.http.post("/api/v1/admin/quotas/plans/preview", headers=self.headers,
+                                        json={"revision": 0, "plan": trial})
+        self.assertEqual(preview.status_code, 200, preview.text)
+        future = preview.json()
+        self.assertEqual((future["affectedMembers"], future["used"], future["remaining"]), (0, 0, 80))
+        url = "/api/v1/admin/quotas/members/owner/preview"
+        restore = {"revision": 2, "mode": "plan", "planId": "trial"}
+        result = (await self.http.post(url, headers=self.headers, json=restore)).json()
+        self.assertEqual((result["newLimit"], result["used"], result["remaining"]), (100000, 100, 99900))
+        custom = {"revision": 2, "mode": "custom", "custom": {"totalLimit": None, "restrictModels": True,
+                  "models": [{"provider": "provider", "model": "a", "limit": 30}]}}
+        after = (await self.http.post(url, headers=self.headers, json=custom)).json()
+        self.assertEqual((after["previousLimit"], after["newLimit"], after["used"], after["remaining"],
+                          after["pausedMembers"], after["reason"]), (1000000, None, 30, None, 1, "model_exhausted"))
+        self.assertTrue(after["models"][0]["exceeded"])
+        self.assertEqual((await self.status())["planId"], "standard")
+        self.assertEqual((await self.http.post(url, headers={"Authorization": "Bearer " + sign_token("owner")},
+                                               json=custom)).status_code, 403)
+        denied = await self.http.post(url.replace("/owner/", "/other/"),
+                    headers={"Authorization": "Bearer " + sign_token("scoped")}, json=restore)
+        self.assertEqual(denied.status_code, 403)
+
+    async def test_member_assignment_cannot_save_a_plan_changed_since_preview(self):
+        url = "/api/v1/admin/quotas/members/owner"
+        body = {"revision": 0, "mode": "plan", "planId": "standard", "catalogRevision": 0}
+        before = await self.http.post(url + "/preview", headers=self.headers, json=body)
+        self.assertEqual(before.status_code, 200, before.text)
+        self.assertEqual(before.json()["newLimit"], 1000000)
+        catalog = await self.configure(75)
+        for call in (self.http.post(url + "/preview", headers=self.headers, json=body),
+                     self.http.put(url, headers=self.headers, json=body)):
+            self.assertEqual((await call).status_code, 409)
+        self.assertEqual((await self.http.get(url, headers=self.headers)).json()["assignment"]["revision"], 0)
+        body["catalogRevision"] = catalog["revision"]
+        refreshed = await self.http.post(url + "/preview", headers=self.headers, json=body)
+        self.assertEqual(refreshed.json()["newLimit"], 75)
+        await self.assign(body)
+        self.assertEqual((await self.status())["limit"], 75)
 
     async def test_default_trial_is_once_and_does_not_reset_on_login_or_month(self):
         start = datetime(2026, 1, 30, 12, tzinfo=timezone.utc)
@@ -197,6 +293,103 @@ class QuotaPlanTests(unittest.IsolatedAsyncioTestCase):
         await self.assign({"revision": 1, "mode": "custom", "custom": {"totalLimit": None}})
         self.assertFalse((await self.status())["enabled"])
         self.assertIsNone((await self.status())["remaining"])
+
+    async def test_trial_reallocation_notifies_only_its_active_account_after_commit(self):
+        body = copy.deepcopy(qp.DEFAULT_CATALOG)
+        body["plans"][0]["totalLimit"] = 10
+        response = await self.http.put("/api/v1/admin/quotas", headers=self.headers, json=body)
+        self.assertEqual(response.status_code, 200)
+        async with self.sessions() as session:
+            await qp.register_trial(session, "owner")
+            session.add_all([
+                models.Client(id="owner-second", user_ref="owner", auth_state="active"),
+                models.Client(id="owner-revoked", user_ref="owner", auth_state="revoked"),
+                models.Client(id="other-device", user_ref="other", auth_state="active"),
+            ])
+            await session.commit()
+        self.assertEqual((await self.receipt(12855)).status_code, 200)
+        self.assertEqual((await self.http.get("/api/v1/client-auth/authorize-ai",
+                                            headers=self.device_headers)).status_code, 403)
+        queued = client_domain_events.account_changed
+        async def after_commit(session, owner, topic):
+            self.assertFalse(session.in_transaction())
+            async with self.sessions() as reader:
+                self.assertEqual((await client_access.quota_status(reader, owner))["limit"], 1000000000)
+            await queued(session, owner, topic)
+        with patch.object(client_domain_events, "account_changed", side_effect=after_commit), \
+                patch.object(client_domain_events.native_discovery, "wake", new_callable=AsyncMock) as wake:
+            await self.assign({"revision": 1, "mode": "custom", "custom": {"totalLimit": 1000000000}})
+            wake.assert_not_awaited()
+            await client_domain_events.flush_for_test(self.sessions)
+            self.assertEqual({call.args for call in wake.await_args_list}, {
+                ("plans-device", "owner", "quota"), ("owner-second", "owner", "quota")})
+        restored = await self.http.get("/api/v1/client-auth/authorize-ai", headers=self.device_headers)
+        self.assertEqual(restored.status_code, 200, restored.text)
+        self.assertEqual(restored.json()["quota"]["used"], 12855)
+        self.assertEqual(restored.json()["quota"]["planId"], "custom")
+
+    async def test_quota_hint_failure_preserves_committed_assignment_response(self):
+        with patch.object(client_domain_events, "account_changed", new_callable=AsyncMock,
+                          side_effect=OSError("isolated notification failure")):
+            result = await self.assign()
+        self.assertEqual(result, {"ok": True, "revision": 1})
+        self.assertEqual((await self.status())["planId"], "standard")
+
+    async def test_failed_commit_or_conflict_never_queues_quota_hint(self):
+        with patch.object(client_domain_events, "quota_changed", new_callable=AsyncMock) as notify:
+            async with self.sessions() as session:
+                with patch.object(session, "commit", new_callable=AsyncMock, side_effect=RuntimeError("commit failed")):
+                    with self.assertRaisesRegex(RuntimeError, "commit failed"):
+                        await quotas.assign("owner", quotas.Assignment(revision=0, mode="plan", planId="standard"),
+                                            self.admin, session)
+                await session.rollback()
+            conflict = await self.http.put("/api/v1/admin/quotas/members/owner", headers=self.headers,
+                json={"revision": 1, "mode": "plan", "planId": "standard"})
+            self.assertEqual(conflict.status_code, 409)
+            scoped = {"Authorization": "Bearer " + sign_token("scoped")}
+            denied = await self.http.put("/api/v1/admin/quotas/members/other", headers=scoped,
+                json={"revision": 0, "mode": "plan", "planId": "standard"})
+            self.assertEqual(denied.status_code, 403)
+            notify.assert_not_awaited()
+
+    async def test_catalog_hints_follow_changed_plans_and_inherited_default_only(self):
+        assignments = {
+            "owner": {"mode": "plan", "planId": "standard"},
+            "other": {"mode": "plan", "planId": "pro"},
+            "trial": {"mode": "plan", "planId": "trial"},
+            "custom": {"mode": "custom", "custom": {"totalLimit": 500}},
+            "inherited": {"mode": "inherit"},
+        }
+        async with self.sessions() as session:
+            for uid in ("trial", "custom", "inherited", "default", "limited", "unlimited"):
+                session.add(models.User(id=uid, username=uid, org_id="one"))
+            await session.flush()
+            for uid in ("other", "trial", "custom", "inherited", "default", "limited", "unlimited"):
+                session.add(models.Client(id=uid + "-device", user_ref=uid, auth_state="active"))
+            for uid, grant in assignments.items():
+                session.add(models.AppSetting(key=qp.GRANT_PREFIX + uid, value=json.dumps(grant)))
+            for uid, mode in (("limited", "limited"), ("unlimited", "unlimited")):
+                await client_access.save_user_quota(session, uid, {"mode": mode, "limit": 100})
+            await session.commit()
+        body = copy.deepcopy(qp.DEFAULT_CATALOG)
+        body["plans"][0]["totalLimit"] += 10
+        body["plans"][1]["totalLimit"] += 10
+        body["defaultLimit"] = 500
+        with patch.object(client_domain_events.native_discovery, "wake", new_callable=AsyncMock) as wake:
+            saved = await self.http.put("/api/v1/admin/quotas", headers=self.headers, json=body)
+            self.assertEqual(saved.status_code, 200, saved.text)
+            wake.assert_not_awaited()
+            await client_domain_events.flush_for_test(self.sessions)
+            self.assertEqual({call.args for call in wake.await_args_list}, {
+                ("plans-device", "owner", "quota"), ("inherited-device", "inherited", "quota"),
+                ("default-device", "default", "quota")})
+            wake.reset_mock()
+            body = saved.json()
+            body["plans"][0]["totalLimit"] += 10
+            unchanged = await self.http.put("/api/v1/admin/quotas", headers=self.headers, json=body)
+            self.assertEqual(unchanged.status_code, 200, unchanged.text)
+            await client_domain_events.flush_for_test(self.sessions)
+            wake.assert_not_awaited()
 
     async def test_conflicts_invalid_values_and_deletion_are_rejected(self):
         saved = await self.configure()

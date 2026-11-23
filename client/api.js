@@ -3,8 +3,8 @@
  * Hub is authoritative for tasks. store.js queues per-task put/patch/delete
  * operations and replays them on reconnect instead of overwriting the task table.
  * Exposes task operations, configuration sync, registerClient, and connectWS.
- * The default Hub is http://127.0.0.1:18989; the login gate can change it through
- * the main-process hub-endpoint policy. Identities and pending operations remain
+ * The main-process hub-endpoint policy selects the default: local for source runs,
+ * hosted for packaged clients. The login gate can change it. Identities and pending operations remain
  * isolated by service. X-Soduwork-Device identifies the installation using Electron
  * secure storage; User.id is only a legacy first-migration hint.
  * window.SoduWorkAPI is canonical; compatibility aliases remain at the end.
@@ -47,12 +47,12 @@
   'use strict';
   var TASK_STORAGE_BASE = {
     tasks: 'soduwork_work_tasks_v5', ops: 'soduwork_work_task_ops_v1', shadow: 'soduwork_work_task_shadow_v1',
-    notices: 'soduwork_work_notices_v1'
+    notices: 'soduwork_work_notices_v1', 'config-edit-base': 'soduwork_work_cfg_edit_base_v1'
   };
   var LS_CFG = 'soduwork_work_cfg_v5';
   // An unscoped legacy credential has no trustworthy destination. Quarantine it
   // rather than guessing a former deployment or sending it to a new service.
-  var DEFAULT_PRODUCTION_HUB = 'http://127.0.0.1:18989';
+  var DEFAULT_PRODUCTION_HUB = 'https://service.soduwork.ai';
   var LEGACY_PRODUCTION_HUB = 'https://unassigned-legacy-hub.invalid';
   var DEFAULT_DEVELOPMENT_HUB = 'http://127.0.0.1:18989';
   var HUB_CONNECTIONS_KEY = 'soduwork_work_hub_connections_v2';
@@ -66,6 +66,17 @@
   }
   function writeLocal(key, value) {
     try { localStorage.setItem(key, String(value)); } catch (e) { /* Allow this session to continue when storage is read-only. */ }
+  }
+  function loginAccount(value) {
+    return typeof value === 'string' && value.trim().length <= 320 && !/[\x00-\x1f\x7f]/.test(value)
+      ? value.trim() : '';
+  }
+  function loginAccountKey() {
+    return 'soduwork_work_last_login_account_v1@' + encodeURIComponent(normalizeHub(base()));
+  }
+  function rememberLoginAccount(value, result) {
+    var account = loginAccount(value);
+    if (account && result?.ok && result.user?.id) writeLocal(loginAccountKey(), account);
   }
   function normalizeHub(raw) {
     var value = String(raw || '').trim();
@@ -106,7 +117,7 @@
   // Expose endpoint editing only when the main process permits it; refresh when policy is restored.
   var runtimeEditable = false;
   function legacyHubConfig() {
-    var row;
+    var row, credentialHub;
     try { row = JSON.parse(readLocal(HUB_CONNECTIONS_KEY)); } catch (_) {}
     if (!row || !['production', 'development'].includes(row.environment)) {
       var previous = readLocal(HUB_ENV_KEY), legacy = safeHub(readLocal(LEGACY_HUB_KEY), '');
@@ -117,6 +128,7 @@
       var production = !existed ? runtimeForm() !== 'local-code' :
         previous === 'production' || (previous !== 'development' &&
           (legacy === LEGACY_PRODUCTION_HUB || (!legacy && existed)));
+      credentialHub = (production ? legacy : dev || legacy) || LEGACY_PRODUCTION_HUB;
       row = { environment: production ? 'production' : 'development',
         productionHub: existed ? (legacy || LEGACY_PRODUCTION_HUB) : DEFAULT_PRODUCTION_HUB,
         developmentHub: dev || (!production && legacy) ||
@@ -126,7 +138,8 @@
     var team = safeHub(row.productionHub, ''), local = safeHub(row.developmentHub, DEFAULT_DEVELOPMENT_HUB);
     var environment = row.environment === 'production' && team ? 'production' : 'development';
     var hub = environment === 'production' ? team : local;
-    if (readLocal('soduwork_work_device_secret') && !readLocal(LEGACY_AUTH_HUB_KEY)) writeLocal(LEGACY_AUTH_HUB_KEY, hub);
+    if (readLocal('soduwork_work_device_secret') && !readLocal(LEGACY_AUTH_HUB_KEY))
+      writeLocal(LEGACY_AUTH_HUB_KEY, credentialHub || safeHub(row.environment === 'production' ? row.productionHub : row.developmentHub, LEGACY_PRODUCTION_HUB));
     return { environment: environment, hub: hub, productionHub: team, developmentHub: local, editable: true };
   }
   function hubConfig() {
@@ -184,16 +197,32 @@
     }
     var committed = await bridge.selectHubEnvironment(target);
     if (!committed || !committed.ok) throw new Error(committed && committed.error || '无法切换服务');
+    runtimeHub = target;
     if (previous !== target) {
       invalidateRegistrations();
       _deviceSession = ''; _deviceSessionUntil = 0; _deviceAuthState = 'legacy';
       _deviceId = ''; _clientUser = null; _clientQuota = null;
       try { window.dispatchEvent(new CustomEvent('soduwork-data-scope-changed')); } catch (_) {}
     }
-    runtimeHub = target;
     return hubConfig();
   }
   var _savedHubRestore = null;
+  async function migrateLegacyCredential(bridge) {
+    var key = 'soduwork_work_device_secret', legacySecret = readLocal(key);
+    if (!legacySecret || !bridge.deviceAuthMigrateLegacy) return;
+    var origin = readLocal(LEGACY_AUTH_HUB_KEY);
+    if (!origin) { legacyHubConfig(); origin = readLocal(LEGACY_AUTH_HUB_KEY); }
+    function legacyDevice() { return readLocal('soduwork_work_user_id') || (typeof User !== 'undefined' && User?.id); }
+    var clientId = legacyDevice();
+    if (!clientId || clientId === 'u-unknown' || !origin || origin === LEGACY_PRODUCTION_HUB || safeHub(origin, '') !== origin) return;
+    try {
+      var receipt = await bridge.deviceAuthMigrateLegacy({hub:origin, clientId, legacySecret});
+      if (receipt?.stored === true && receipt.hub === origin && receipt.clientId === clientId &&
+          readLocal(LEGACY_AUTH_HUB_KEY) === origin && readLocal(key) === legacySecret &&
+          legacyDevice() === clientId)
+        localStorage.removeItem(key);
+    } catch (_) { /* Keep the original until secure storage acknowledges this exact identity. */ }
+  }
   // Resolve the trusted main-process policy before enrollment. Saved environment
   // selection is consulted only by explicitly enabled internal fixtures.
   function restoreSavedHub() {
@@ -214,6 +243,7 @@
             !(connection && connection.editable === true)) throw new Error('客户端服务配置无效');
         runtimeHub = target;
         runtimeEditable = !!(connection && connection.editable === true);
+        return migrateLegacyCredential(fixedBridge);
       }).catch(function (error) { _savedHubRestore = null; throw error; });
       return _savedHubRestore;
     }
@@ -372,12 +402,63 @@
   var _deviceAuthState = 'legacy';
   var _clientUser = null;
   var _clientQuota = null;
+  var _requestLifetime = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  function authRequired() {
+    var error = new Error('请先登录');
+    error.code = 'CLIENT_AUTH_REQUIRED'; error.connectivityHandled = true;
+    return error;
+  }
+  function requestsAllowed() {
+    // Older browser clients still use their legacy device credential. Electron
+    // must restore its secure account session before accessing business APIs.
+    return _deviceAuthState === 'active' || (_deviceAuthState === 'legacy' &&
+      !window.soduWorkAPI?.deviceAuthBootstrap);
+  }
+  function publicRequest(path) {
+    return path === '/clients/register' || path === '/client-auth/policy' ||
+      /^\/client-auth\/legal-documents(?:\/|$)/.test(path);
+  }
+  function admitRequest(path, startedAt) {
+    if (publicRequest(path)) return;
+    if (['pending', 'quota'].includes(_deviceAuthState)) throw authRequired();
+    if (!hasValidDeviceSession() && window.soduWorkAPI?.deviceAuthBootstrap) {
+      return refreshDeviceSession('', startedAt).then(function (restored) {
+        if (!restored || !requestsAllowed()) throw authRequired();
+      });
+    }
+    if (!requestsAllowed()) throw authRequired();
+  }
+  async function hubFetch(url, options) {
+    var requestHub = base(), path = String(url).slice((requestHub + '/api/v1').length).split('?')[0];
+    if (publicRequest(path)) return fetch(url, options);
+    var epoch = _registrationEpoch;
+    var admission = admitRequest(path); if (admission) await admission;
+    if (epoch !== _registrationEpoch || requestHub !== base()) throw staleTaskScope();
+    var lifetime = _requestLifetime?.signal;
+    var signal = options?.signal && lifetime?.constructor?.any
+      ? lifetime.constructor.any([options.signal, lifetime]) : options?.signal || lifetime;
+    var headers = Object.assign({}, options?.headers);
+    // Admission can restore/renew a session after the caller built its headers.
+    for (var key of Object.keys(headers)) if (/^(authorization|x-soduwork-secret|x-soduwork-device)$/i.test(key)) delete headers[key];
+    Object.assign(headers, authHeaders(false));
+    try {
+      var response = await fetch(url, Object.assign({}, options, { headers: headers, signal: signal }));
+      if (lifetime?.aborted) {
+        await response.body?.cancel?.().catch(function () {});
+        throw staleTaskScope();
+      }
+      return response;
+    } catch (error) {
+      if (lifetime?.aborted) throw staleTaskScope();
+      throw error;
+    }
+  }
   function hasValidDeviceSession() {
     if (_deviceSession && _deviceSessionHub === base() && Date.now() < _deviceSessionUntil) return true;
     if (_deviceSession) { _deviceSession = ''; _deviceSessionUntil = 0; }
     return false;
   }
-  function rememberSession(row) {
+  function rememberSession(row, options) {
     var previousScope = _deviceId && _clientUser ? taskStorageKey('ops') : '';
     if (row && row.clientId) _deviceId = String(row.clientId);
     if (row?.user?.id && row.user.id !== _clientUser?.id) _clientQuota = null;
@@ -396,22 +477,37 @@
       _deviceSession = ''; _deviceSessionUntil = 0; _deviceAuthState = 'pending';
     }
     if (previousScope && previousScope !== taskStorageKey('ops')) {
+      _requestLifetime?.abort();
+      _requestLifetime = typeof AbortController !== 'undefined' ? new AbortController() : null;
       try { window.dispatchEvent(new CustomEvent('soduwork-data-scope-changed')); } catch (_) {}
     }
     try { window.dispatchEvent(new CustomEvent('soduwork-device-auth', { detail: {
       state: _deviceAuthState, activationRequired: _deviceAuthState === 'pending',
       user: _clientUser, quota: _clientQuota,
-      code: String(row && row.code || ''), error: String(row && row.error || '')
+      code: String(row && row.code || ''), error: String(row && row.error || ''),
+      ...(options?.interactiveLogin === true && row?.ok && row.user?.id ? { interactiveLogin: true } : {})
     } })); } catch (e) {}
   }
-  function requireClientAuth(reason, payload) {
+  function requestAuth() {
+    hasValidDeviceSession();
+    return { epoch: _registrationEpoch, hub: base(), clientId: device(),
+      scope: taskStorageKey('ops'), session: _deviceSession };
+  }
+  function assertRequestAuth(request, session = true) {
+    if (request.epoch !== _registrationEpoch || request.hub !== base() ||
+        request.clientId !== device() || request.scope !== taskStorageKey('ops') ||
+        session && request.session !== _deviceSession) throw staleTaskScope();
+  }
+  function requireClientAuth(reason, payload, request) {
+    request = request || requestAuth();
+    assertRequestAuth(request);
     var data = payload || {};
     if (data.code === 'TOKEN_QUOTA_EXCEEDED' && _clientUser && hasValidDeviceSession()) {
-      if (data.quota) _clientQuota = data.quota;
-      window.dispatchEvent(new CustomEvent('soduwork-client-auth-required', { detail: {
-        state: 'quota', authenticated: true, code: data.code, error: String(data.message || data.error || ''),
-        user: _clientUser, quota: _clientQuota
-      } }));
+      // A delayed request error may describe quota that an administrator has
+      // already restored. Keep the authenticated snapshot until a fresh read.
+      if (window.SoduWorkQuotaNotice?.show?.(data) !== true) {
+        void refreshNativeQuota({ hub: base(), clientId: device() });
+      }
       return;
     }
     invalidateRegistrations();
@@ -420,7 +516,9 @@
     if (data.quota) _clientQuota = data.quota;
     try {
       if (window.soduWorkAPI && window.soduWorkAPI.deviceAuthClearSession) {
-        window.soduWorkAPI.deviceAuthClearSession({ hub: base(), clientId: device() });
+        // Clearing an older rejected token must not invalidate a newer login in another window.
+        Promise.resolve(window.soduWorkAPI.deviceAuthClearSession({ hub: request.hub,
+          clientId: request.clientId, expectedSession: request.session })).catch(function () {});
       }
       window.dispatchEvent(new CustomEvent('soduwork-client-auth-required', { detail: {
         state: _deviceAuthState, reason: String(reason || ''), code: String(data.code || ''),
@@ -428,42 +526,29 @@
       } }));
     } catch (e) {}
   }
-  function handleAuthError(error) {
+  function handleAuthError(error, request) {
     if (!error) return;
+    assertRequestAuth(request, error.code === 'TOKEN_QUOTA_EXCEEDED' || error.status === 401);
     if (error.code === 'LEGAL_ACCEPTANCE_REQUIRED') {
       window.dispatchEvent(new CustomEvent('soduwork-legal-required'));
       return;
     }
     if (error.code === 'TOKEN_QUOTA_EXCEEDED' || error.status === 401) {
-      requireClientAuth(error.code || 'SESSION_INVALID', error.payload || error);
+      requireClientAuth(error.code || 'SESSION_INVALID', error.payload || error, request);
     }
   }
 
-  var _quotaRefreshFlight = null;
+  var _clientAuthMeFlight = null;
   function refreshNativeQuota(detail) {
     if (detail?.hub && detail.hub !== base() || detail?.clientId && detail.clientId !== device()) return;
     if (!_clientUser || !hasValidDeviceSession()) return;
     // Usage acknowledgements and admission failures may arrive after an admin
     // restores quota. They are refresh hints, never newer account truth.
-    var epoch = _registrationEpoch, hub = base();
-    if (_quotaRefreshFlight?.epoch === epoch && _quotaRefreshFlight.hub === hub) {
-      _quotaRefreshFlight.pending = true;
-      return _quotaRefreshFlight.promise;
-    }
-    var flight = { epoch: epoch, hub: hub, pending: false, promise: null };
-    _quotaRefreshFlight = flight;
-    flight.promise = (async function () {
-      do {
-        flight.pending = false;
-        await SoduWorkAPI.clientAuthMe();
-      } while (flight.pending && epoch === _registrationEpoch && hub === base());
-    })().catch(function () { /* Keep the last confirmed quota when offline. */ })
-      .finally(function () { if (_quotaRefreshFlight === flight) _quotaRefreshFlight = null; });
-    return flight.promise;
+    return SoduWorkAPI.clientAuthMe().catch(function () { /* Keep the last confirmed quota when offline. */ });
   }
   window.soduWorkAPI?.onDeviceAuthQuotaExceeded?.(refreshNativeQuota);
   window.soduWorkAPI?.onDeviceAuthQuotaChanged?.(function (detail) {
-    if (_clientQuota?.exceeded) return refreshNativeQuota(detail);
+    if (_clientQuota?.exceeded || window.SoduWorkQuotaNotice?.isBlocked?.()) return refreshNativeQuota(detail);
   });
 
   async function syncRunnerConfig(workRootNow, registration) {
@@ -495,20 +580,38 @@
     return h;
   }
 
+  function hubInputMessage(key, fallback, params) {
+    const i18n = global.SoduWorkI18n;
+    if (!i18n || !Object.hasOwn(global.SoduWorkLocaleMessages?.[i18n.getLocale()] || {}, key)) return fallback;
+    return i18n.t(key, fallback, params);
+  }
+
+  function validationMessage(item) {
+    const fallback = item?.msg || item?.message || String(item || '');
+    if (item?.type === 'hub.input.due') return hubInputMessage('hub.input.due', fallback);
+    const [source, field] = Array.isArray(item?.loc) ? item.loc : [];
+    if (source !== 'query' || !['limit', 'offset', 'page', 'pageSize', 'days'].includes(field)) return fallback;
+    const lower = item.type === 'greater_than_equal';
+    const bound = lower ? item.ctx?.ge : item.ctx?.le;
+    if ((!lower && item.type !== 'less_than_equal') || !Number.isFinite(bound)) return fallback;
+    return hubInputMessage(lower ? 'hub.input.minimum' : 'hub.input.maximum', fallback, { field, bound });
+  }
+
   function httpError(res, text) {
     var data = null;
     try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
     var detail = data && data.detail;
     var meta = detail && !Array.isArray(detail) && typeof detail === 'object' ? detail : null;
-    if (Array.isArray(detail)) detail = detail.map(function (item) {
-      return item && (item.msg || item.message) || String(item || '');
-    }).filter(Boolean).join('；');
+    if (Array.isArray(detail)) detail = detail.map(validationMessage).filter(Boolean).join('；');
     else if (detail && typeof detail === 'object') detail = detail.message || detail.msg || '';
     detail = String(detail || '').trim().slice(0, 500);
-    var error = new Error(detail || ('HTTP ' + res.status));
+    var inputCode = res.headers?.get?.('X-Error-Code') || '';
+    if (!inputCode.startsWith('hub.input.')) inputCode = '';
+    var message = inputCode ? hubInputMessage(inputCode, detail) : detail;
+    var error = new Error(message || ('HTTP ' + res.status));
     error.status = Number(res.status) || 0;
     error.detail = detail;
-    error.code = String(meta && meta.code || '');
+    error.code = String(meta && meta.code || inputCode);
     error.phase = String(meta && meta.phase || '');
     error.phaseName = String(meta && meta.phaseName || '');
     error.retryable = meta && typeof meta.retryable === 'boolean' ? meta.retryable : null;
@@ -525,6 +628,8 @@
   }
   function invalidateRegistrations() {
     _registrationEpoch += 1;
+    _requestLifetime?.abort();
+    _requestLifetime = typeof AbortController !== 'undefined' ? new AbortController() : null;
     _sessionRefresh = null;
     _registrations.forEach(function (job) { job.cancel(); });
   }
@@ -568,6 +673,7 @@
     return job;
   }
   async function refreshDeviceSession(staleSession, startedAt) {
+    if (['pending', 'quota'].includes(_deviceAuthState)) throw authRequired();
     if (!SoduWorkAPI || typeof SoduWorkAPI.registerClient !== 'function') return false;
     if (startedAt == null) startedAt = Date.now();
     var restoration = restoreSavedHub(); if (restoration) await restoration;
@@ -582,6 +688,12 @@
     }
     var row = await _sessionRefresh;
     checkRefresh();
+    if (!row || row.ok === false) {
+      var failure = new Error(row?.error || '登录状态暂时无法恢复，请重试');
+      failure.code = row?.code || 'DEVICE_AUTH_UNAVAILABLE'; failure.status = row?.status || 0;
+      if (row?.activationRequired) failure.connectivityHandled = true;
+      throw failure;
+    }
     return !!(row && row.ok && row.session);
   }
 
@@ -609,30 +721,23 @@
   async function jfetchCurrent(path, opts, retried, trace) {
     var startedAt = Date.now();
     var restoration = restoreSavedHub(); if (restoration) await restoration;
-    /*
-     * Each Electron window has separate renderer memory. Before its first request, obtain a
-     * short-lived session through main-process secure storage; cached task data does not imply
-     * initData ran here. Share _sessionRefresh across concurrent requests to avoid duplicate
-     * issuance and transient 401 flashes. Pending activation still fails with the actual
-     * authorization error.
-     */
-    if (!retried && path !== '/clients/register' && !hasValidDeviceSession() &&
-        _deviceAuthState !== 'pending' && window.soduWorkAPI && window.soduWorkAPI.deviceAuthBootstrap) {
-      try { await refreshDeviceSession('', startedAt); } catch (e) {
-        if (registrationBoundaryError(e)) throw e;
-        /* Subsequent requests report the actual connectivity or authorization error. */
-      }
-    }
+    var admission = admitRequest(path.split('?')[0], startedAt); if (admission) await admission;
     var requestScope = taskStorageKey('ops');
     if (opts && opts.taskScope && opts.taskScope !== requestScope) throw staleTaskScope();
     var o = Object.assign({ headers: {} }, opts || {});
     delete o.taskScope;
+    delete o.sessionRead;
     o.headers = Object.assign(authHeaders(true), o.headers);
+    var auth = requestAuth();
     if (trace?.requestId && !Object.keys(o.headers).some(key => key.toLowerCase() === 'x-request-id')) o.headers['X-Request-ID'] = trace.requestId;
     if (!o.signal) o.signal = _abortSignal(DEFAULT_TIMEOUT);
     var res;
-    try { res = await fetch(apiUrl(path), o); }
-    catch (error) { if (!opts?.signal?.aborted || error?.name !== 'AbortError') mark(false); throw error; }
+    try { res = await hubFetch(apiUrl(path), o); }
+    catch (error) {
+      if (error?.connectivityHandled || error?.code === 'STALE_TASK_SCOPE') throw error;
+      global.RequirementDiagnostics?.http(global.RequirementDiagnostics.emit,path,o.body,{},0);
+      if (!opts?.sessionRead && (!opts?.signal?.aborted || error?.name !== 'AbortError')) mark(false); throw error;
+    }
     try { trace?.response?.(res); } catch (_) {}
     /*
      * Any HTTP response proves reachability; 4xx/5xx are request failures, not offline status.
@@ -640,15 +745,17 @@
      */
     mark(true);
     var txt = await res.text();
+    try { global.RequirementDiagnostics?.http(global.RequirementDiagnostics.emit,path,o.body,JSON.parse(txt),res.status); } catch (_) {}
     if (requestScope !== taskStorageKey('ops')) throw staleTaskScope();
+    assertRequestAuth(auth, false);
     /*
      * The first request may precede initialization or encounter an expired 30-minute session.
      * Refresh through secure storage and replay once; pending or disabled devices must still
      * report their actual errors.
      */
-    if (res.status === 401 && !retried && path !== '/clients/register') {
+    if (res.status === 401 && !retried && auth.session && requestsAllowed() && path !== '/clients/register') {
       try {
-        if (await refreshDeviceSession(_deviceSession)) return jfetch(path, Object.assign({}, opts, { taskScope: requestScope }), true, trace);
+        if (await refreshDeviceSession(auth.session)) return jfetch(path, Object.assign({}, opts, { taskScope: requestScope }), true, trace);
       } catch (e) { if (registrationBoundaryError(e)) throw e; /* Preserve the original 401 error details. */ }
       /*
        * A failed refresh can reflect a transient network error. Preserve the original 401 and
@@ -658,7 +765,7 @@
       throw httpError(res, txt);
     }
     if (!res.ok) {
-      var requestError = httpError(res, txt); handleAuthError(requestError); throw requestError;
+      var requestError = httpError(res, txt); handleAuthError(requestError, auth); throw requestError;
     }
     return parseJSON(txt);
   }
@@ -680,10 +787,7 @@
   async function uploadFile(path, file, retried, metadata, requestScope) {
     var startedAt = Date.now();
     var restoration = restoreSavedHub(); if (restoration) await restoration;
-    if (!retried && !hasValidDeviceSession() && _deviceAuthState !== 'pending' &&
-        window.soduWorkAPI && window.soduWorkAPI.deviceAuthBootstrap) {
-      try { await refreshDeviceSession('', startedAt); } catch (e) { if (registrationBoundaryError(e)) throw e; }
-    }
+    var admission = admitRequest(path, startedAt); if (admission) await admission;
     if (requestScope && requestScope !== taskStorageKey('ops')) throw staleTaskScope();
     var form = new FormData();
     form.append('file', file);
@@ -693,25 +797,26 @@
       form.append('sequence', String(Math.max(0, Number(metadata.sequence) || 0)));
       form.append('criterionText', String(metadata.criterionText || '').slice(0, 500));
     }
-    var res;
+    var res, auth = requestAuth();
     try {
-      res = await fetch(apiUrl(path), {
+      res = await hubFetch(apiUrl(path), {
         method: 'POST', headers: authHeaders(false), body: form,
         signal: _abortSignal(60000)
       });
-    } catch (error) { mark(false); throw error; }
+    } catch (error) { markFromError(error); throw error; }
     mark(true);
     var txt = await res.text();
     if (requestScope && requestScope !== taskStorageKey('ops')) throw staleTaskScope();
+    assertRequestAuth(auth, false);
     if (res.status === 401 && !retried) {
       try {
-        if (await refreshDeviceSession(_deviceSession)) return uploadFile(path, file, true, metadata, requestScope);
+        if (await refreshDeviceSession(auth.session)) return uploadFile(path, file, true, metadata, requestScope);
       } catch (e) { if (registrationBoundaryError(e)) throw e; }
       /* As in jfetch, preserve the original 401 after refresh failure without forcing reauthentication. */
       throw httpError(res, txt);
     }
     if (!res.ok) {
-      var requestError = httpError(res, txt); handleAuthError(requestError); throw requestError;
+      var requestError = httpError(res, txt); handleAuthError(requestError, auth); throw requestError;
     }
     return parseJSON(txt);
   }
@@ -721,7 +826,7 @@
     var restoration = restoreSavedHub(); if (restoration) await restoration;
     var o = Object.assign({ headers: authHeaders(true) }, opts || {});
     if (!o.signal) o.signal = _abortSignal(timeout || DEFAULT_TIMEOUT);
-    return fetch(apiUrl(path), o);
+    return hubFetch(apiUrl(path), o);
   }
 
   function lsCfg() { try { return JSON.parse(localStorage.getItem(LS_CFG) || '{}'); } catch (e) { return {}; } }
@@ -801,6 +906,29 @@
     return path;
   }
 
+  // Keep the revision tied to the authenticated scope and the snapshot the editor actually saw.
+  var configSnapshot = null, configWriteGeneration = 0;
+  function activeConfigSnapshot(scope) {
+    if (configSnapshot && sameDomainScope(configSnapshot.scope)) return configSnapshot;
+    try {
+      var saved = JSON.parse(localStorage.getItem(taskStorageKey('config-edit-base')) || 'null');
+      return saved && sameDomainScope(saved.scope) ? saved : null;
+    } catch (_) { return null; }
+  }
+  function rememberConfig(scope, value, local, persist = true) {
+    if (!value || !sameDomainScope(scope)) return {};
+    var cfg = Object.assign({}, value), revision = cfg._configRevision;
+    var keys = cfg._configKeys;
+    delete cfg._configRevision;
+    delete cfg._configKeys;
+    if (revision && persist) {
+      var base = local && Array.isArray(keys)
+        ? Object.fromEntries(Object.entries(local).filter(([key]) => keys.includes(key))) : local;
+      configSnapshot = { scope, revision, cfg: base || cfg, remote: cfg, keys };
+      try { localStorage.setItem(taskStorageKey('config-edit-base'), JSON.stringify(configSnapshot)); } catch (_) {}
+    }
+    return cfg;
+  }
   function domainScope() {
     return { hub: base().replace(/\/+$/, ''), clientId: device(), userId: String(_clientUser?.id || '') };
   }
@@ -808,10 +936,11 @@
     var current = domainScope();
     return value && value.hub === current.hub && value.clientId === current.clientId && value.userId === current.userId;
   }
-  async function domainRead(domain, path) {
+  async function domainRead(domain, path, fresh = false) {
     var bridge = global.soduWorkAPI, scope = domainScope();
     if (!bridge?.clientDomainRead || !scope.userId) return jfetch(path);
-    var result = await bridge.clientDomainRead(domain, scope);
+    var auth = requestAuth();
+    var result = await bridge.clientDomainRead(domain, scope, fresh);
     if (!sameDomainScope(scope)) throw staleTaskScope();
     if (result?.code === 'DOMAIN_POLL_FALLBACK') return jfetch(path);
     // A local snapshot or replayed backoff error does not prove current reachability.
@@ -820,7 +949,7 @@
       if (result?.status) {
         var error = httpError({status: result.status}, JSON.stringify(result.body || {detail: result.reason}));
         error.connectivityHandled = true;
-        if (result.status !== 401) handleAuthError(error);
+        if (result.status !== 401) handleAuthError(error, auth);
         throw error;
       }
       throw Object.assign(new Error(result?.reason || '同步暂时不可用'), {status: result?.status, code: result?.code, connectivityHandled: true});
@@ -834,11 +963,271 @@
     if (!sameDomainScope(scope)) throw staleTaskScope();
   }
   function isLocalModelChoice(value) {
+    return Boolean(localModelReference(value));
+  }
+  function localModelReference(value) {
     var name = String(value || '').trim();
-    return name.startsWith('local:') || /^image::[^:]+::local:/.test(name);
+    if (name.startsWith('local:')) return name;
+    if (!name.startsWith('image::')) return '';
+    var split = name.indexOf('::', 7), reference = split > 7 && name.slice(7, split).trim() ? name.slice(split + 2).trim() : '';
+    return reference.startsWith('local:') ? reference : '';
   }
   function requireRemoteModel(value) {
-    if (isLocalModelChoice(value)) throw new Error('本地模型仅支持本机对话，请为后台任务选择托管模型');
+    if (isLocalModelChoice(value)) throw new Error('本地模型暂不支持云端或远程执行，请选择 Hub 模型');
+  }
+  async function localAgentDefaults(scope) {
+    var bridge = global.soduWorkAPI?.localAgentModels;
+    if (!bridge?.get) return null;
+    var result = await bridge.get();
+    if (!sameDomainScope(scope)) throw staleTaskScope();
+    if (!result?.ok || !result.scopeKey) throw new Error('本机 Agent 默认模型无法读取');
+    return result;
+  }
+  function localAutomationModel(value) {
+    var reference = localModelReference(value);
+    if (!reference) return '';
+    if (String(value || '').trim() !== reference || !/^local:model-[a-f0-9]{32}$/.test(reference)) {
+      throw new Error('自动化只能选择当前设备可验证的本地模型');
+    }
+    return reference;
+  }
+  function localAutomationAgent(value, mode, clientId) {
+    var id = String(value || '').trim();
+    var runtime = id.replace(/^local:/, '').replace(/^runner:[^:]+:/, '');
+    var managed = runtime && !['codex'].includes(runtime);
+    var current = String(_deviceId || '').trim(), selected = String(clientId || '').trim();
+    return (id.startsWith('local:') && managed) || (String(mode || '').trim() === 'local' &&
+      /^runner:[^:]+:[a-z][a-z0-9-]{0,39}$/.test(id) && managed &&
+      current && selected && selected === current);
+  }
+  function automationOperationScope() {
+    return { hub: String(base() || '').replace(/\/+$/, ''), clientId: String(_deviceId || device() || ''),
+      owner: _clientUser?.id ? 'account:' + String(_clientUser.id) : '',
+      taskScope: taskStorageKey('ops'), epoch: _registrationEpoch };
+  }
+  function assertAutomationScope(scope) {
+    var current = automationOperationScope();
+    if (!scope || ['hub', 'clientId', 'owner', 'taskScope', 'epoch'].some(key => scope[key] !== current[key])) {
+      throw staleTaskScope();
+    }
+  }
+  var automationMutations = new Map();
+  function mutateAutomation(scope, scheduleId, action) {
+    var key = scope.taskScope + '\n' + String(scheduleId || '');
+    var previous = automationMutations.get(key);
+    var pending = Promise.resolve(previous).catch(() => {}).then(() => {
+      assertAutomationScope(scope);
+      return action();
+    });
+    automationMutations.set(key, pending);
+    return pending.finally(() => {
+      if (automationMutations.get(key) === pending) automationMutations.delete(key);
+    });
+  }
+  function automationModelScope(captured) {
+    var scope = captured || automationOperationScope();
+    assertAutomationScope(scope);
+    var bridge = window.soduWorkAPI?.automationModels;
+    if (!bridge || !scope.hub || !scope.clientId || !scope.owner) throw new Error('当前客户端无法保存自动化本地模型选择');
+    return { ...scope, bridge };
+  }
+  async function readAutomationModels(scheduleIds, captured) {
+    var operation = captured || automationOperationScope();
+    try {
+      var scope = automationModelScope(operation);
+      var result = await scope.bridge.get({ hub: scope.hub, clientId: scope.clientId, owner: scope.owner,
+        ...(scheduleIds ? { scheduleIds: scheduleIds } : {}) });
+      assertAutomationScope(operation);
+      var models = result?.ok === true && result.models && typeof result.models === 'object' ? { ...result.models } : {};
+      for (var id of result?.unavailableScheduleIds || []) if (!models[id]) models[id] = 'local:unavailable';
+      return models;
+    } catch (error) { assertAutomationScope(operation); if (error?.code === 'STALE_TASK_SCOPE') throw error; return {}; }
+  }
+  async function saveAutomationModel(scheduleId, modelName, captured) {
+    var operation = captured || automationOperationScope();
+    assertAutomationScope(operation);
+    if (!window.soduWorkAPI?.automationModels) {
+      if (modelName) throw new Error('当前客户端无法保存自动化本地模型选择');
+      return;
+    }
+    var scope = automationModelScope(operation);
+    var action = modelName ? 'set' : 'remove';
+    var result = await scope.bridge[action]({ hub: scope.hub, clientId: scope.clientId, owner: scope.owner,
+      scheduleId: String(scheduleId || ''), modelName: modelName || '' });
+    assertAutomationScope(operation);
+    if (!result || result.ok !== true) throw new Error('自动化本地模型选择保存失败，请检查系统安全存储后重试');
+  }
+  async function readAutomationModel(scheduleId, captured) {
+    var operation = captured || automationOperationScope();
+    assertAutomationScope(operation);
+    if (!window.soduWorkAPI?.automationModels || typeof window.soduWorkAPI.automationModels.get !== 'function') {
+      return { available: false, modelName: '', configured: false };
+    }
+    var scope = automationModelScope(operation);
+    var result = await scope.bridge.get({ hub: scope.hub, clientId: scope.clientId, owner: scope.owner, scheduleId: String(scheduleId || '') });
+    assertAutomationScope(operation);
+    if (!result || result.ok !== true) throw new Error('自动化本地模型选择无法读取，请检查系统安全存储后重试');
+    return { available: true, modelName: String(result?.modelName || ''), configured: result?.configured === true };
+  }
+  function scheduleRequest(body) {
+    var selectedModel = String(body?.modelName || '').trim();
+    if (selectedModel.startsWith('unavailable:') || selectedModel === 'local:unavailable') {
+      // UI placeholders describe a missing choice; they are never wire model identifiers.
+      var selectionError = new Error(selectedModel === 'local:unavailable'
+        ? '本机模型选择已失效，请重新选择可验证的本地模型'
+        : '所选模型已不可用，请选择可用模型后重试');
+      selectionError.code = 'MODEL_SELECTION_REQUIRED';
+      throw selectionError;
+    }
+    var value = { ...(body || {}) }, hasModelField = Object.hasOwn(value, 'modelName'),
+      localModel = localAutomationModel(value.modelName), assigneeMode = value.assigneeMode,
+      assigneeClientId = value.assigneeClientId;
+    delete value.assigneeMode;
+    delete value.assigneeClientId;
+    if (localModel && (!Object.hasOwn(value, 'assigneeId') ||
+        !localAutomationAgent(value.assigneeId, assigneeMode, assigneeClientId))) {
+      throw new Error('本地模型只能选择本机托管型执行底座');
+    }
+    if (localModel) {
+      value.modelName = '';
+      value.modelSource = 'device';
+    } else if (hasModelField || Object.hasOwn(value, 'modelSource')) {
+      var source = String(value.modelSource || 'managed').trim().toLowerCase() || 'managed';
+      if (source !== 'managed' && source !== 'device') throw new Error('自动化模型来源无效');
+      // An explicit managed selection clears a previous device-owned source.
+      value.modelSource = source;
+      if (source === 'device') value.modelName = '';
+    }
+    return { value: value, localModel: localModel };
+  }
+  function localParseInput(text, attachments) {
+    var parts = ['原始需求：', String(text || '').slice(0, 12000)];
+    var rows = Array.isArray(attachments) ? attachments.slice(0, 8) : [];
+    rows.forEach(function (item) {
+      if (!item || typeof item !== 'object') return;
+      var name = String(item.name || '未命名材料').slice(0, 160);
+      var mode = String(item.mode || '');
+      if (mode === 'text' && typeof item.text === 'string') {
+        parts.push('\n本地附件文本（' + name + '）：\n' + item.text.slice(0, 2000));
+      } else {
+        var type = String(item.type || item.kind || '附件').slice(0, 80);
+        var size = Number.isFinite(Number(item.size)) ? String(Math.max(0, Number(item.size))) : '';
+        parts.push('\n本地附件元数据：' + name + ' · ' + type + (size ? ' · ' + size + ' bytes' : '') +
+          '（未上传附件内容）');
+      }
+    });
+    return parts.join('\n').slice(0, 16000);
+  }
+  function localParseInstructions(options) {
+    var kind = options?.kind === 'automation' ? 'automation' : 'requirement';
+    var locale = global.SoduWorkI18n?.getLocale?.();
+    var languages = { 'zh-CN': 'Simplified Chinese', 'en-US': 'English', 'ja-JP': 'Japanese', 'ko-KR': 'Korean' };
+    var language = typeof locale === 'string' && Object.hasOwn(languages, locale) ? languages[locale] : languages['zh-CN'];
+    return [
+      '你是本机需求整理助手。只根据用户原文和附件材料整理内容，不访问网络，不补造事实。',
+      '仅返回一个 JSON 对象，不要 Markdown、代码围栏或解释文字。',
+      'JSON 字段必须是：title（不超过200字）、note（正文，不超过4000字）、checklist（字符串数组）、',
+      'kind（requirement、bug、ticket、improvement、other 之一）、priority（low、normal、high、urgent 之一）、',
+      'due（无法从原文确定时为空字符串）、tags（字符串数组）。',
+      '保留原文中的关键约束；无法确定的字段使用空字符串、空数组或 normal。当前表单类型：' + kind + '。',
+      options?.instruction ? '额外整理要求：' + String(options.instruction).slice(0, 1000) : '',
+      'Output language: ' + language + '. Write generated titles, descriptions, acceptance criteria, and tags in this language, even when the reference material uses another language. Keep JSON keys, enum values, dates, proper names, identifiers, and literal quotations unchanged.',
+    ].filter(Boolean).join('\n');
+  }
+  function localParseFields(raw) {
+    var value = String(raw || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+    var start = value.indexOf('{'), end = value.lastIndexOf('}');
+    if (start < 0 || end <= start) throw Error('invalid JSON');
+    var parsed = JSON.parse(value.slice(start, end + 1));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw Error('invalid object');
+    var text = function (field, max) { return typeof parsed[field] === 'string' ? parsed[field].trim().slice(0, max) : ''; };
+    var list = function (field, maxItems, maxLength) {
+      return Array.isArray(parsed[field]) ? parsed[field].filter(item => typeof item === 'string')
+        .map(item => item.trim().slice(0, maxLength)).filter(Boolean).slice(0, maxItems) : [];
+    };
+    var kinds = ['requirement', 'bug', 'ticket', 'improvement', 'other'];
+    var priorities = ['low', 'normal', 'high', 'urgent'];
+    var kind = text('kind', 32), priority = text('priority', 16);
+    if (!text('title', 200) && !text('note', 4000)) throw Error('missing requirement fields');
+    return { title: text('title', 200), note: text('note', 4000), checklist: list('checklist', 30, 300),
+      kind: kinds.includes(kind) ? kind : 'requirement', priority: priorities.includes(priority) ? priority : 'normal',
+      due: text('due', 64), tags: list('tags', 20, 40) };
+  }
+  function localParseFailure(result) {
+    var messages = {
+      APP_AI_UNAVAILABLE: '本地需求解析需要当前账号登录，请重新登录后重试',
+      APP_AI_CONTEXT_CHANGED: '账号已变化，请在当前账号重新解析',
+      APP_AI_MODEL_UNAVAILABLE: '本地文字模型已删除、未配置或不可用，请检查「我的模型」并重新选择',
+      APP_AI_OUTPUT_LIMIT: '本地模型输出达到长度上限，未生成完整需求，请精简输入或调整模型',
+      APP_AI_RATE_LIMITED: '本地模型服务请求过多，请稍后重试',
+      APP_AI_PROVIDER_ERROR: '本地模型服务返回错误，请检查本地服务和凭据',
+      APP_AI_EMPTY_RESULT: '本地模型未返回可用文字，请检查模型',
+      APP_AI_BUSY: '本地模型正在处理其他请求，请稍后重试',
+      APP_AI_CANCELLED: '本地需求解析已取消',
+      APP_AI_RESULT_UNKNOWN: '本地模型调用中断或超时，未能确认结果，请确认后再重试',
+    };
+    var message = messages[result?.code] || '本地模型需求解析失败，请检查本地模型后重试';
+    // The host supplies a numeric status, never upstream response text, URLs or
+    // credentials. Keep provider authentication distinct from SoduWork login.
+    var status = result?.httpStatus;
+    if (['APP_AI_PROVIDER_ERROR', 'APP_AI_RATE_LIMITED'].includes(result?.code) &&
+        Number.isInteger(status) && status >= 400 && status <= 599) {
+      var advice = status === 401 ? '模型服务拒绝了凭据，请在「我的模型」检查该服务的密钥' :
+        status === 403 ? '模型服务拒绝访问，请检查该模型的调用权限' :
+        [404,405].includes(status) ? '请检查服务地址、接口路径和模型名称是否正确' :
+        [400,422].includes(status) ? '模型服务不接受当前请求参数，请检查该模型的接口兼容配置' :
+        status === 429 ? '模型服务请求过多或配额受限，请检查该服务后稍后重试' :
+        [408,504].includes(status) ? '模型服务响应超时，请稍后重试' :
+        status >= 500 ? '模型服务暂时不可用，请检查服务状态或稍后重试' : '请检查模型服务配置后重试';
+      message = '本地模型服务返回错误（HTTP ' + status + '），' + advice;
+    }
+    return { _parseError: message + '；原文已保留，也可手动填写' };
+  }
+  async function parseLocalTaskText(text, model, attachments, options) {
+    var reference = localModelReference(model), bridge = global.soduWorkAPI?.conversationSession;
+    if (!reference || typeof bridge?.localRequirementParse !== 'function') {
+      return { _parseError: '本地模型需求解析暂不可用；原文已保留，请稍后重试或手动填写' };
+    }
+    var requestId = 'task-parse-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+    var result;
+    try {
+      result = await bridge.localRequirementParse({ model: reference, input: localParseInput(text, attachments),
+        instructions: localParseInstructions(options), timeoutMs: 60000, requestId });
+    } catch (_) {
+      return { _parseError: '本地需求解析未能完成；原文已保留，请检查本地模型后重试或手动填写' };
+    }
+    if (!result?.ok) return localParseFailure(result);
+    if (result.finishReason === 'length') return localParseFailure({ code: 'APP_AI_OUTPUT_LIMIT' });
+    try {
+      return localParseFields(result.text);
+    } catch (_) {
+      return { _parseError: '本地模型返回的需求格式无效；原文已保留，请重试或手动填写' };
+    }
+  }
+  function deviceProviderId(value) {
+    var id = String(value || '');
+    return id.startsWith('device:') ? id.slice(7) : id;
+  }
+  function deviceProvider(value) { return String(value || '').startsWith('device:'); }
+  function projectLocalModelCatalog(catalog) {
+    if (!catalog || !Array.isArray(catalog.providers)) return catalog;
+    var model = row => ({ ...row, providerId: 'device:' + deviceProviderId(row.providerId),
+      localProviderId: deviceProviderId(row.providerId), localOnly: true });
+    return { ...catalog,
+      providers: catalog.providers.map(row => ({ ...row, id: 'device:' + deviceProviderId(row.id),
+        localProviderId: deviceProviderId(row.id), localOnly: true,
+        ...(Array.isArray(row.modelDefs) ? { modelDefs: row.modelDefs.map(model) } : {}) })),
+      myModels: (catalog.myModels || []).map(model), usable: (catalog.usable || []).map(model),
+      mediaUsable: Object.fromEntries(['image', 'video'].map(kind => [kind, (catalog.mediaUsable?.[kind] || []).map(model)])),
+    };
+  }
+  function nativeLocalProvider(row) {
+    var { localProviderId: _localProviderId, ...value } = row;
+    return { ...value, id: deviceProviderId(value.id) };
+  }
+  function nativeLocalModel(row) {
+    var { localProviderId: _localProviderId, ...value } = row;
+    return { ...value, providerId: deviceProviderId(value.providerId) };
   }
   async function localModelCatalog() {
     var bridge = global.soduWorkAPI?.localModels;
@@ -850,6 +1239,38 @@
       throw new Error('本地模型配置无法读取，请检查系统安全存储后重试');
     }
     return catalog;
+  }
+  async function managedModelOwners(scope, signal) {
+    // Edit permissions must come from a current Hub response, not a cached
+    // renderer row or personal/localOnly flags supplied by the caller.
+    var catalog = await jfetch('/my-models', { cache: 'no-store',
+      ...(signal ? { signal: AbortSignal.any([signal, _abortSignal(DEFAULT_TIMEOUT)]) } : {}) });
+    if (!sameDomainScope(scope)) throw staleTaskScope();
+    if (catalog?.ok === false || !Array.isArray(catalog?.providers)) {
+      throw new Error('模型服务来源暂时无法确认，请刷新目录后重试');
+    }
+    return new Map(catalog.providers.filter(row => row && !deviceProvider(row.id) && row.localOnly !== true)
+      .map(row => [String(row.id || '').trim().toLowerCase(), row.personal === true]));
+  }
+  function requirePersonalProvider(id, owners, created = new Set()) {
+    var key = String(id || '').trim().toLowerCase();
+    if (owners.get(key) === true || !owners.has(key) && created.has(key)) return;
+    throw Object.assign(new Error(owners.has(key)
+      ? '服务端同步的模型服务为只读，请添加自己的服务'
+      : '模型服务不存在或来源无法确认，请刷新目录后重试'),
+    { code: owners.has(key) ? 'MODEL_PROVIDER_READ_ONLY' : 'MODEL_PROVIDER_UNAVAILABLE' });
+  }
+  async function validateManagedModelWrite(body, scope) {
+    var providers = Array.isArray(body.providers) ? body.providers : [];
+    var models = Array.isArray(body.models) ? body.models : [];
+    var keys = Object.keys(body.keys || {});
+    if (!providers.length && !models.length && !keys.length) return;
+    var owners = await managedModelOwners(scope);
+    var created = new Set(providers.map(row => String(row?.id || '').trim().toLowerCase())
+      .filter(id => /^custom-[a-z0-9_-]+$/.test(id) && !owners.has(id)));
+    for (var provider of providers) requirePersonalProvider(provider?.id, owners, created);
+    for (var model of models) requirePersonalProvider(model?.providerId, owners, created);
+    for (var id of keys) requirePersonalProvider(id, owners, created);
   }
   global.soduWorkAPI?.onClientDomainChanged?.(value => {
     if (!sameDomainScope(value?.scope)) return;
@@ -878,6 +1299,12 @@
     connectHub: connectHub,
     normalizeHub: normalizeHub,
     taskStorageKey: taskStorageKey,
+    async reportFirstChatReadiness(scope, runtimeReady, modelReady) {
+      if (!hasValidDeviceSession() || !_clientUser || scope !== taskStorageKey('ops')) return false;
+      await jfetch('/first-chat-readiness', { method: 'PUT', taskScope: scope, sessionRead: true,
+        body: JSON.stringify({ runtimeReady, modelReady }) });
+      return true;
+    },
     adoptVerifiedTaskOperations: adoptVerifiedTaskOperations,
 
     /*
@@ -943,8 +1370,13 @@
       }
       return task;
     },
-    async getConfig() {
-      try { var c = await domainRead('config', '/config'); return c || {}; }
+    async getConfig(acceptBase) {
+      var scope = domainScope(), generation = configWriteGeneration;
+      try {
+        var result = await domainRead('config', '/config?withRevision=true');
+        return rememberConfig(scope, result, null,
+          generation === configWriteGeneration && (!acceptBase || acceptBase()));
+      }
       catch (e) { markFromError(e); return lsCfg(); }
     },
 
@@ -982,7 +1414,7 @@
     },
     /* Let a team manager update a member's task status, including acceptance; propagate backend rejection details. */
     async setTeamTaskStatus(tid, status) {
-      var res = await fetch(apiUrl('/team/tasks/' + encodeURIComponent(tid) + '/status'),
+      var res = await hubFetch(apiUrl('/team/tasks/' + encodeURIComponent(tid) + '/status'),
         { method: 'POST', headers: authHeaders(true), body: JSON.stringify({ status: status }) });
       var txt = await res.text();
       var data = parseJSON(txt);
@@ -991,7 +1423,7 @@
     },
     /* Reassign a task to another team member's SoduWork; propagate backend rejection details. */
     async reassignTeamTask(tid, assigneeUserId) {
-      var res = await fetch(apiUrl('/team/tasks/' + encodeURIComponent(tid) + '/reassign'),
+      var res = await hubFetch(apiUrl('/team/tasks/' + encodeURIComponent(tid) + '/reassign'),
         { method: 'POST', headers: authHeaders(true), body: JSON.stringify({ assigneeUserId: assigneeUserId }), signal: _abortSignal(DEFAULT_TIMEOUT) });
       var txt = await res.text();
       var data = parseJSON(txt);
@@ -1000,7 +1432,7 @@
     },
     /* Send a manager's reminder from the desktop pet; the recipient sees a bubble and attention animation. */
     async nudgeTeamTask(tid, note) {
-      var res = await fetch(apiUrl('/team/tasks/' + encodeURIComponent(tid) + '/nudge'),
+      var res = await hubFetch(apiUrl('/team/tasks/' + encodeURIComponent(tid) + '/nudge'),
         { method: 'POST', headers: authHeaders(true), body: JSON.stringify({ note: note || '' }), signal: _abortSignal(DEFAULT_TIMEOUT) });
       var txt = await res.text(); var data = parseJSON(txt);
       if (!res.ok) { markFromError(new Error('HTTP ' + res.status)); throw new Error((data && data.detail) || ('HTTP ' + res.status)); }
@@ -1008,12 +1440,11 @@
     },
     /* Assign tasks using title, assigneeUserIds/assigneeUserId, priority, due, tags, and note; propagate backend error details. */
     async createTeamTask(body) {
-      var res = await fetch(apiUrl('/team/tasks'),
+      var res = await hubFetch(apiUrl('/team/tasks'),
         { method: 'POST', headers: authHeaders(true), body: JSON.stringify(body || {}), signal: _abortSignal(DEFAULT_TIMEOUT) });
       var txt = await res.text();
-      var data = parseJSON(txt);
-      if (!res.ok) { markFromError(new Error('HTTP ' + res.status)); throw new Error((data && data.detail) || ('HTTP ' + res.status)); }
-      mark(true); return data;
+      if (!res.ok) { markFromError(new Error('HTTP ' + res.status)); throw httpError(res, txt); }
+      mark(true); return parseJSON(txt);
     },
 
     /* Atomic coworker assignment: create on the recipient device, never create locally then hand off. */
@@ -1071,21 +1502,21 @@
       return await jfetch('/tasks/' + encodeURIComponent(tid) + '/comments');
     },
     async addTaskComment(tid, body, mentions) {
-      var res = await fetch(apiUrl('/tasks/' + encodeURIComponent(tid) + '/comments'),
+      var res = await hubFetch(apiUrl('/tasks/' + encodeURIComponent(tid) + '/comments'),
         { method: 'POST', headers: authHeaders(true), body: JSON.stringify({ body: body, mentions: mentions || [] }), signal: _abortSignal(DEFAULT_TIMEOUT) });
-      var txt = await res.text(); var data = parseJSON(txt);
-      if (!res.ok) { markFromError(new Error('HTTP ' + res.status)); throw new Error((data && data.detail) || ('HTTP ' + res.status)); }
-      mark(true); return data;
+      var txt = await res.text();
+      if (!res.ok) { markFromError(new Error('HTTP ' + res.status)); throw httpError(res, txt); }
+      mark(true); return parseJSON(txt);
     },
 
     /* Derive task fields from instructions and materials. Preserve input for manual editing when the API rejects or fails. */
     async parseTaskText(text, model, attachments, options) {
-      if (isLocalModelChoice(model)) return { _parseError: '本地模型不能用于后台解析；原文已保留，请选择托管模型或手动填写' };
+      if (isLocalModelChoice(model)) return parseLocalTaskText(text, model, attachments, options);
       var signal;
       var timeoutMs = options?.kind === 'automation' ? 90000 : 130000;
       try {
         signal = _abortSignal(timeoutMs);
-        var res = await fetch(apiUrl('/tasks/parse'),
+        var res = await hubFetch(apiUrl('/tasks/parse'),
           { method: 'POST', headers: { ...authHeaders(true), Accept: 'application/json; keepalive=1' },
             /* Use the model selected for this request, or the personal default when empty. */
             body: JSON.stringify({ text: text || '', model: model || '', keepalive: true,
@@ -1129,7 +1560,7 @@
     },
     /* Claim a task for this SoduWork instance; HTTP 409 means another member already claimed it. */
     async claimInboxTask(tid) {
-      var res = await fetch(apiUrl('/team/inbox/' + encodeURIComponent(tid) + '/claim'),
+      var res = await hubFetch(apiUrl('/team/inbox/' + encodeURIComponent(tid) + '/claim'),
         { method: 'POST', headers: authHeaders(true), body: '{}', signal: _abortSignal(DEFAULT_TIMEOUT) });
       var txt = await res.text();
       var data = parseJSON(txt);
@@ -1142,7 +1573,7 @@
     },
     /* Let a manager assign an inbox task directly; 403 means unauthorized and 409 means already claimed. */
     async assignInboxTask(tid, userId) {
-      var res = await fetch(apiUrl('/team/inbox/' + encodeURIComponent(tid) + '/assign'),
+      var res = await hubFetch(apiUrl('/team/inbox/' + encodeURIComponent(tid) + '/assign'),
         { method: 'POST', headers: authHeaders(true), body: JSON.stringify({ userId: userId }), signal: _abortSignal(DEFAULT_TIMEOUT) });
       var txt = await res.text();
       var data = parseJSON(txt);
@@ -1151,7 +1582,7 @@
     },
     /* Return an owned task to the team inbox; the backend rejects workflow tasks and non-owners. */
     async releaseTask(tid, note) {
-      var res = await fetch(apiUrl('/tasks/' + encodeURIComponent(tid) + '/release'),
+      var res = await hubFetch(apiUrl('/tasks/' + encodeURIComponent(tid) + '/release'),
         { method: 'POST', headers: authHeaders(true), body: JSON.stringify({ note: note || '' }), signal: _abortSignal(DEFAULT_TIMEOUT) });
       var txt = await res.text();
       var data = parseJSON(txt);
@@ -1204,6 +1635,7 @@
         }
         return acceptTaskResult(result);
       }
+      requireRemoteModel(model);
       var b = who && who.id ? { assigneeId: who.id, assigneeType: who.type || 'agent' } : {};
       if (brief) b.brief = String(brief).slice(0, 2000);
       if (repo && (repo.id || repo.path)) b.repo = repo; /* Resolve the repository ID beneath the Runner's own workspace root. */
@@ -1245,24 +1677,43 @@
      * enabled selections, and revoked selections.
      */
     /* Personal model configuration returns availability and secret metadata, never plaintext keys. */
-    async myModels() {
+    async myModels(options) {
       var scope = domainScope();
       var localCatalog = await localModelCatalog();
       if (!sameDomainScope(scope)) throw staleTaskScope();
+      var localDefaults = options?.localDefaults === false ? null : await localAgentDefaults(scope);
       localCatalog = localCatalog || { providers: [], usable: [], myModels: [], mediaUsable: {} };
-      var r;
-      try { r = await domainRead('models', '/my-models'); }
+      var r, managedCatalogUnavailable = false;
+      try {
+        if (!sameDomainScope(scope)) throw staleTaskScope();
+        r = await domainRead('models', '/my-models', options?.fresh === true);
+        if (r?.ok === false) throw new Error('Hub 模型目录暂时无法读取');
+        managedCatalogUnavailable = !Array.isArray(r?.usable);
+      }
       catch (error) {
         if (error?.code === 'STALE_TASK_SCOPE') throw error;
         if (!(localCatalog.providers || []).length) throw error;
+        managedCatalogUnavailable = true;
         r = { providers: [], usable: [], myModels: [], mediaUsable: {}, defaultModels: {} };
       }
       r = r || { providers: [], usable: [], myModels: [], mediaUsable: {} };
-      var localProviderIds = new Set((localCatalog.providers || []).map(row => String(row?.id || '')));
-      var managedProviders = (r.providers || []).filter(row => !localProviderIds.has(String(row?.id || '')));
-      var managedModels = row => (row || []).filter(item => !localProviderIds.has(String(item?.providerId || '')));
+      localCatalog = projectLocalModelCatalog(localCatalog);
+      var managedProviders = (r.providers || []).filter(row => row?.localOnly !== true && !deviceProvider(row?.id))
+        .map(row => ({ ...row, localOnly: false }));
+      var managedModels = rows => (rows || []).filter(row => row?.localOnly !== true && !deviceProvider(row?.providerId) &&
+        !isLocalModelChoice(row?.name)).map(row => ({ ...row, localOnly: false }));
+      var defaultModels = { ...(r.defaultModels || {}) }, defaultModelErrors = { ...(r.defaultModelErrors || {}) };
+      for (var [agent, selected] of Object.entries(localDefaults?.selections || {})) {
+        defaultModels[agent] = selected.modelName;
+        if (selected.unavailable) defaultModelErrors[agent] = '原本地默认模型已删除或不可用，请重新选择';
+        else delete defaultModelErrors[agent];
+      }
       return {
         ...r,
+        // Keep offline local access without representing an unreadable Hub
+        // catalog as proof that a saved Hub model was deleted.
+        managedCatalogUnavailable,
+        defaultModels, defaultModelErrors,
         providers: (localCatalog.providers || []).concat(managedProviders),
         usable: (localCatalog.usable || []).concat(managedModels(r.usable)),
         myModels: (localCatalog.myModels || []).concat(managedModels(r.myModels)),
@@ -1274,8 +1725,8 @@
       };
     },
     /*
-     * Accept provider overrides, keys, and models. Omitted keys remain unchanged; null removes
-     * the personal key and restores the company fallback.
+     * Accept personal providers, keys, and models. Organization services are read-only.
+     * Omitted keys remain unchanged; null removes the personal service's key.
      */
     async saveMyModels(body) {
       body = body || {};
@@ -1283,20 +1734,33 @@
       var local = global.soduWorkAPI?.localModels;
       var providers = Array.isArray(body.providers) ? body.providers : [];
       var isLocalId = id => { id = String(id || '').trim().toLowerCase(); return id === 'local' || id.startsWith('local-'); };
-      var isLocalProvider = row => row && (row.localOnly === true || isLocalId(row.id));
-      var isLocalModel = row => row && (row.localOnly === true || localIds.has(String(row.providerId || '')) || isLocalId(row.providerId));
+      var isLocalProvider = row => row && (row.localOnly === true || deviceProvider(row.id) || row.localOnly !== false && isLocalId(row.id));
       var localCatalog = await localModelCatalog();
       if (!sameDomainScope(scope)) throw staleTaskScope();
       var explicitLocal = Array.isArray(body.localProviders);
       var localProviderInput = explicitLocal ? body.localProviders.filter(row => row && row.localOnly !== false) : providers.filter(isLocalProvider);
-      var localIds = new Set((localCatalog?.providers || []).filter(isLocalProvider).map(row => String(row.id || '')));
-      localProviderInput.forEach(row => localIds.add(String(row.id || '')));
+      var localIds = new Set((localCatalog?.providers || []).map(row => String(row.id || '')));
+      var explicitLocalIds = new Set(localProviderInput.map(row => String(row.id || '')));
+      var managedIds = new Set(providers.filter(row => row && row.localOnly === false && !deviceProvider(row.id)).map(row => String(row.id || '')));
+      localProviderInput.forEach(row => localIds.add(deviceProviderId(row.id)));
       (Array.isArray(body.localModels) ? body.localModels : []).forEach(row => {
-        if (row && row.providerId) localIds.add(String(row.providerId));
+        if (row && row.providerId) localIds.add(deviceProviderId(row.providerId));
       });
-      Object.keys(body.localKeys || {}).forEach(id => localIds.add(String(id)));
+      Object.keys(body.localKeys || {}).forEach(id => localIds.add(deviceProviderId(id)));
+      function ambiguous(id) { throw new Error('模型服务来源不明确，请刷新模型目录后重试：' + String(id || '')); }
+      for (var row of providers) {
+        if (row && !isLocalProvider(row) && row.localOnly !== false && localIds.has(String(row.id || ''))) ambiguous(row.id);
+      }
+      var isLocalModel = row => {
+        if (!row) return false;
+        if (row.localOnly === true || deviceProvider(row.providerId) || isLocalModelChoice(row.id) || isLocalModelChoice(row.name)) return true;
+        if (row.localOnly === false || managedIds.has(String(row.providerId || ''))) return false;
+        if (explicitLocalIds.has(String(row.providerId || '')) || isLocalId(row.providerId)) return true;
+        if (localIds.has(String(row.providerId || ''))) ambiguous(row.providerId);
+        return false;
+      };
       var localProviders = explicitLocal || localProviderInput.length ? localProviderInput :
-        (localCatalog?.providers || []).filter(isLocalProvider);
+        (localCatalog?.providers || []);
       var localModelInput = Array.isArray(body.localModels) ? body.localModels :
         (Array.isArray(body.models) ? body.models.filter(isLocalModel) : []);
       var localModels = Array.isArray(body.localModels) || localModelInput.length ? localModelInput :
@@ -1306,21 +1770,27 @@
       // carries local provider or model rows.
       var keySource = Object.hasOwn(body, 'localKeys') ? body.localKeys :
         (localProviderInput.length || localModelInput.length ? body.keys : {});
-      var localKeys = Object.fromEntries(Object.entries(keySource || {}).filter(([id]) => localIds.has(id) || isLocalId(id)));
+      var localKeys = Object.fromEntries(Object.entries(keySource || {}).filter(([id]) =>
+        deviceProvider(id) || (Object.hasOwn(body, 'localKeys') || !managedIds.has(id)) && (localIds.has(deviceProviderId(id)) || isLocalId(id)))
+        .map(([id, value]) => [deviceProviderId(id), value]));
       var localResult = null;
       var hasLocal = explicitLocal || localProviderInput.length || localModelInput.length || Object.keys(localKeys).length ||
         (Array.isArray(body.localModels) && body.localRevision != null);
-      if (hasLocal) {
-        if (!local || typeof local.save !== 'function') throw new Error('本地模型存储不可用');
-        localResult = await local.save({ providers: localProviders, models: localModels, keys: localKeys, expectedRevision: body.localRevision });
-      }
       var { localProviders: _localProviders, localModels: _localModels, localKeys: _localKeys,
         localRevision: _localRevision, ...managedInput } = body;
       var managedBody = {
         ...managedInput,
-        providers: Array.isArray(body.providers) ? providers.filter(row => !isLocalProvider(row) && !localIds.has(String(row.id || ''))) : body.providers,
-        models: Array.isArray(body.models) ? body.models.filter(row => !isLocalModel(row) && !localIds.has(String(row.providerId || ''))) : body.models,
-        keys: Object.fromEntries(Object.entries(body.keys || {}).filter(([id]) => !localIds.has(id) && !isLocalId(id))),
+        providers: Array.isArray(body.providers) ? providers.filter(row => !isLocalProvider(row)) : body.providers,
+        models: Array.isArray(body.models) ? body.models.filter(row => !isLocalModel(row)) : body.models,
+        keys: Object.fromEntries(Object.entries(body.keys || {}).filter(([id]) => {
+          if (deviceProvider(id)) return false;
+          if (managedIds.has(id)) return true;
+          if (localIds.has(id) || isLocalId(id)) {
+            if (!Object.hasOwn(body.localKeys || {}, id) && !explicitLocalIds.has(id)) ambiguous(id);
+            return false;
+          }
+          return true;
+        })),
       };
       // Local-only fields are never part of the Hub request, even when the
       // desktop catalog is temporarily unavailable or an older caller sends
@@ -1337,6 +1807,13 @@
         (explicitLocal || (!localProviderInput.length && !localModelInput.length));
       var hasManaged = managedBody.providers?.length || managedBody.models?.length || Object.keys(managedBody.keys || {}).length ||
         managedReplacement;
+      if (hasManaged) await validateManagedModelWrite(managedBody, scope);
+      if (!sameDomainScope(scope)) throw staleTaskScope();
+      if (hasLocal) {
+        if (!local || typeof local.save !== 'function') throw new Error('本地模型存储不可用');
+        localResult = projectLocalModelCatalog(await local.save({ providers: localProviders.map(nativeLocalProvider),
+          models: localModels.map(nativeLocalModel), keys: localKeys, expectedRevision: body.localRevision }));
+      }
       if (!hasManaged && hasLocal) return localResult || { ok: true };
       if (!sameDomainScope(scope)) throw staleTaskScope();
       var r = await jfetch('/my-models', { method: 'PUT', body: JSON.stringify(managedBody) });
@@ -1345,61 +1822,77 @@
     },
     async localModels() {
       var local = global.soduWorkAPI?.localModels;
-      return local && typeof local.get === 'function' ? local.get() : { providers: [], usable: [], myModels: [], mediaUsable: {} };
+      return local && typeof local.get === 'function' ? projectLocalModelCatalog(await local.get()) : { providers: [], usable: [], myModels: [], mediaUsable: {} };
     },
     async saveLocalModels(body) {
       var local = global.soduWorkAPI?.localModels;
       if (!local || typeof local.save !== 'function') throw new Error('本地模型存储不可用');
-      return local.save(body || {});
+      var value = body || {};
+      return projectLocalModelCatalog(await local.save({ ...value,
+        ...(Array.isArray(value.providers) ? { providers: value.providers.map(nativeLocalProvider) } : {}),
+        ...(Array.isArray(value.models) ? { models: value.models.map(nativeLocalModel) } : {}),
+        ...(value.keys ? { keys: Object.fromEntries(Object.entries(value.keys).map(([id, key]) => [deviceProviderId(id), key])) } : {}),
+      }));
     },
     async testLocalModel(providerId, modelName) {
       var local = global.soduWorkAPI?.localModels;
       if (!local || typeof local.test !== 'function') throw new Error('本地模型存储不可用');
-      return local.test(providerId || '', modelName || '');
+      return local.test(deviceProviderId(providerId), modelName || '');
     },
     /*
-     * Test the effective key immediately: use a personal override when configured, otherwise
-     * the company key.
+     * Test only a saved personal service; synchronized organization services are read-only.
      */
-    async testMyModel(providerId) {
+    async testMyModel(providerId, options) {
       var scope = domainScope();
       var local = global.soduWorkAPI?.localModels;
       var catalog = await localModelCatalog();
-      if (catalog && (catalog.providers || []).some(row => row.id === providerId && row.localOnly)) {
-        var model = (catalog.myModels || []).find(row => row.providerId === providerId);
-        return local.test(providerId, model?.name || '');
-      }
       if (!sameDomainScope(scope)) throw staleTaskScope();
+      var nativeId = deviceProviderId(providerId), localProvider = (catalog?.providers || []).find(row => row.id === nativeId);
+      if (deviceProvider(providerId) || options?.localOnly === true) {
+        if (!localProvider || !local?.test) throw new Error('本地模型服务已不可用，请刷新目录后重试');
+        var model = (catalog.myModels || []).find(row => row.providerId === nativeId);
+        return local.test(nativeId, model?.name || '');
+      }
+      if (localProvider && options?.localOnly !== false) throw new Error('模型服务来源不明确，请刷新模型目录后重试');
+      if (!sameDomainScope(scope)) throw staleTaskScope();
+      requirePersonalProvider(providerId, await managedModelOwners(scope));
       var r = await jfetch('/my-models/test', { method: 'POST',
         body: JSON.stringify({ providerId: providerId }) });
       mark(true); return r;
     },
-    async checkMyModelCapabilities(body) {
+    async checkMyModelCapabilities(body, options) {
       body = body || {};
+      options?.signal?.throwIfAborted();
       var scope = domainScope();
       var local = global.soduWorkAPI?.localModels;
       var localCatalog = await localModelCatalog();
-      var localProvider = (localCatalog?.providers || []).find(row => row?.id === body.providerId && row.localOnly);
-      if (localProvider) {
-        if (!local || typeof local.test !== 'function') throw new Error('本地模型存储不可用');
-        var localModel = String(body.model || '').trim() ||
-          (localCatalog?.myModels || []).find(row => row.providerId === body.providerId)?.name || '';
-        var probe = await local.test(body.providerId, localModel);
-        var checks = {};
-        for (var key of (Array.isArray(body.checks) ? body.checks : ['connection'])) {
-          checks[key] = key === 'connection'
-            ? { status: probe?.ok ? 'passed' : 'failed', code: probe?.ok ? 'verified' : 'request_not_accepted' }
-            : { status: 'inconclusive', code: 'protocol_not_tested' };
-        }
-        return { ok: Boolean(probe?.ok), providerId: body.providerId, model: localModel,
-          checks, capabilityProfile: { imageInput: { state: 'unknown', source: 'unknown' },
-            toolCalling: { state: 'unknown', source: 'unknown' }, streaming: { state: 'unknown', source: 'unknown' } },
-          checkedAt: new Date().toISOString(), localOnly: true,
-          detail: probe?.detail || '' };
-      }
+      options?.signal?.throwIfAborted();
       if (!sameDomainScope(scope)) throw staleTaskScope();
+      var nativeId = deviceProviderId(body.providerId);
+      var localProvider = (localCatalog?.providers || []).find(row => row?.id === nativeId);
+      if (deviceProvider(body.providerId) || body.localOnly === true) {
+        if (!localProvider) throw new Error('本地模型服务已不可用，请刷新目录后重试');
+        var localModel = (localCatalog?.myModels || []).find(row => row.providerId === nativeId && row.name === String(body.model || '').trim());
+        if (!localModel) throw new Error('本地模型不存在或已不可用，请刷新目录后重试');
+        if (body.expectedConfigRevision && body.expectedConfigRevision !== localModel.configRevision)
+          throw new Error('模型配置在检测期间已变更，请重新检测');
+        if (typeof local?.checkCapabilities !== 'function') throw new Error('当前客户端尚未提供本机能力检测，请更新客户端');
+        var report = await local.checkCapabilities({ modelRef: localModel.id,
+          checks: Array.isArray(body.checks) ? body.checks : ['connection'],
+          ...(localModel.configRevision ? { expectedTargetRevision: localModel.configRevision } : {}),
+          ...(body.requestId ? { requestId: body.requestId } : {}) });
+        if (!sameDomainScope(scope)) throw staleTaskScope();
+        return { ...report, providerId: body.providerId, model: localModel.name };
+      }
+      if (localProvider && body.localOnly !== false) throw new Error('模型服务来源不明确，请刷新模型目录后重试');
+      if (!sameDomainScope(scope)) throw staleTaskScope();
+      requirePersonalProvider(body.providerId, await managedModelOwners(scope, options?.signal));
+      options?.signal?.throwIfAborted();
       var result = await jfetch('/my-models/capabilities/check', { method: 'POST',
-        body: JSON.stringify(body), signal: _abortSignal(140000) });
+        body: JSON.stringify({ providerId: body.providerId, model: body.model,
+          ...(body.expectedConfigRevision ? { expectedConfigRevision: body.expectedConfigRevision } : {}),
+          ...(Array.isArray(body.checks) ? { checks: body.checks } : {}) }),
+        signal: options?.signal ? AbortSignal.any([options.signal, _abortSignal(140000)]) : _abortSignal(140000) });
       await invalidateDomain('models', scope); return result;
     },
     /*
@@ -1419,6 +1912,7 @@
     },
     async localAgentSetup() {
       var requestScope = taskStorageKey('ops'), requestHub = base(), epoch = _registrationEpoch;
+      var modelScope = domainScope();
       function currentRequest() {
         if (requestScope !== taskStorageKey('ops') || requestHub !== base() || epoch !== _registrationEpoch) {
           throw staleTaskScope();
@@ -1431,12 +1925,32 @@
         if (!row || row.execution === 'backend') return false;
         return row.scope != null && row.scope !== '' ? row.scope === 'current-instance' : row.isCurrentDevice === true;
       }
+      // The Hub catalog never contains device-owned models. Read only the
+      // local metadata so Agent management can advertise the current Runner's
+      // real capability without sending credentials, endpoints, or references
+      // to the Hub.
+      // An unreadable secure store does not prove that a model was deleted.
+      var localCatalog = await localModelCatalog();
+      currentRequest();
+      var localDefaults = await localAgentDefaults(modelScope);
+      currentRequest();
+      var localRows = (Array.isArray(localCatalog?.usable) ? localCatalog.usable : [])
+        .filter(function (row) {
+          return row && row.localOnly === true && String(row.modality || 'chat') === 'chat';
+        })
+        .map(function (row) {
+          return { name: String(row.name || row.id || ''), label: String(row.label || row.name || row.id || ''),
+            provider: String(row.providerName || row.providerId || '本机'), providerKind: 'local',
+            keyFrom: 'local', localOnly: true };
+        })
+        .filter(function (row) { return /^local:model-[a-f0-9]{32}$/.test(row.name); });
+      var hasLocalModel = localRows.length > 0;
       var inventory = await jfetch('/runners', { taskScope: requestScope }) || {};
       currentRequest();
       async function unavailable() {
         var reason = inventory.localRunnerReason || await localRunnerReason();
         currentRequest();
-        return { machines: [], agents: [], models: [], modelCount: null, execution: 'runner',
+        return { machines: [], agents: [], models: [], modelCount: null, localModelCount: 0, execution: 'runner',
           env: { ok: false, why: reason || '当前客户端的 Runner 尚未连接，连接后会显示本机底座。' } };
       }
       var runners = (Array.isArray(inventory.runners) ? inventory.runners : []).filter(function (row) {
@@ -1446,7 +1960,8 @@
       if (!selected) return unavailable();
       var selectedId = runnerId(selected);
       // Keep the captured identity through both requests; an older Hub may ignore runnerId.
-      var data = await jfetch('/agent-setup?runnerId=' + encodeURIComponent(selectedId), { taskScope: requestScope }) || {};
+      var setupQuery = '?runnerId=' + encodeURIComponent(selectedId) + (hasLocalModel ? '&hasLocalModel=1' : '');
+      var data = await jfetch('/agent-setup' + setupQuery, { taskScope: requestScope }) || {};
       currentRequest();
       var machine = (Array.isArray(data.machines) ? data.machines : []).find(function (row) {
         if (runnerId(row) !== selectedId || row.execution === 'backend' || row.online === false) return false;
@@ -1456,11 +1971,51 @@
       });
       if (!machine) return unavailable();
       machine = Object.assign({}, machine, { runnerId: selectedId, scope: 'current-instance', isCurrentDevice: true });
-      var agents = Array.isArray(machine.agents) ? machine.agents : [];
+      var agents = (Array.isArray(machine.agents) ? machine.agents : [])
+        .filter(function (agent) { return !['claude', 'harness2'].includes(agent.key); });
+      var hubModels = Array.isArray(data.models) ? data.models : [];
+      var models = localRows.concat(hubModels);
+      var firstModel = models[0];
+      agents = agents.map(function (agent) {
+        var selected = localDefaults?.selections?.[agent.key];
+        if (agent.modelPick === false || ['codex'].includes(agent.key)) return agent;
+        var savedModel = selected?.configured ? selected.modelName : agent.model || '';
+        var missing = selected?.configured ? selected.unavailable : agent.modelGone ||
+          (savedModel && !models.some(row => row.name === savedModel));
+        // Use the first available model only when no valid preference remains.
+        // Resolve from the displayed local-first catalog without rewriting it.
+        var pinnedHubModel = !selected?.configured && Boolean(agent.modelProviderId);
+        var automatic = !pinnedHubModel && agent.modelPick === true && firstModel && (!savedModel || missing);
+        if (automatic && (firstModel.localOnly !== true ||
+            localDefaults && global.soduWorkAPI?.localAgentModels?.probe)) {
+          selected = { configured: true, modelName: firstModel.name, unavailable: false,
+            automatic: true, localOnly: firstModel.localOnly === true };
+        }
+        if (!selected?.configured) return agent;
+        var modelStates = ['ready', 'ok', 'nollm', 'needmodel'];
+        var states = [agent.setupState, agent.displayState, agent.state].filter(Boolean);
+        var modelOnly = agent.installed !== false && agent.present !== false &&
+          states.every(function (state) { return modelStates.includes(state); });
+        var modelMissing = states.some(function (state) { return ['nollm', 'needmodel'].includes(state); });
+        var state = selected.unavailable ? 'nollm' : modelMissing ? 'ready' : states[0] || 'ready';
+        // Keep every readiness field consistent with the device-owned selection.
+        // Installation, account and runtime failures remain authoritative.
+        var readiness = modelOnly ? { state: state, setupState: state, displayState: state,
+          ...(selected.unavailable ? { why: '原本地默认模型已删除或不可用，请重新选择' }
+            : modelMissing ? { why: '' } : {}) } : {};
+        return { ...agent, model: savedModel, modelEffective: selected.modelName, modelProviderId: '',
+          ...(selected.automatic ? { modelAutomatic: true } : {}),
+          modelGone: selected.unavailable, localModelDefault: selected.localOnly !== false,
+          ...(selected.localOnly !== false ? { configRevision: 'local:' + String(localCatalog?.revision ?? 'unavailable') } : {}),
+          ...readiness };
+      });
+      machine = { ...machine, agents };
       // Never reuse first-machine compatibility fields returned by an older Hub.
+      var hubModelCount = typeof data.modelCount === 'number' ? data.modelCount : null;
       return { machines: [machine], agents: agents, env: machine.env || {}, execution: 'runner',
-        models: Array.isArray(data.models) ? data.models : [],
-        modelCount: typeof data.modelCount === 'number' ? data.modelCount : null };
+        models: models,
+        modelCount: hubModelCount == null ? (localRows.length ? localRows.length : null) : hubModelCount + localRows.length,
+        localModelCount: localRows.length };
     },
     async myUsage(days) {
       var span = Math.max(1, Math.min(365, Number(days || 30)));
@@ -1481,22 +2036,68 @@
     },
     /* Run a minimal real task using the same effective-key resolution as normal dispatch. */
     async agentProbe(key, model, runnerId) {
-      if (isLocalModelChoice(model)) throw new Error('本地模型请在「我的模型」中测试');
+      var scope = domainScope(), defaults = !model || isLocalModelChoice(model) ? await localAgentDefaults(scope) : null;
+      var probeAgent = null;
+      var preferred = !model && defaults?.selections?.[key];
+      var inherited = !model && defaults && !['codex'].includes(key);
+      if (isLocalModelChoice(model) || preferred?.configured || inherited) {
+        if (!defaults) throw new Error('本地模型测试不可用，请更新客户端');
+        var setup = await this.localAgentSetup();
+        if (!sameDomainScope(scope)) throw staleTaskScope();
+        var isCurrentRunner = runnerId && (setup.machines || []).some(row => row.runnerId === runnerId && row.isCurrentDevice === true);
+        var agent = isCurrentRunner && (setup.agents || []).find(agent => agent.key === key);
+        if (isLocalModelChoice(model) && !isCurrentRunner) throw new Error('本地模型只能在当前设备测试');
+        var inheritedModel = !model;
+        if (isCurrentRunner && inheritedModel) {
+          if (agent?.modelGone || preferred?.unavailable && !agent?.modelAutomatic) {
+            throw new Error(agent?.modelProviderId ? '请主动选择可用模型后再执行，不会自动切换模型'
+              : '原本地默认模型已删除或不可用，请重新选择');
+          }
+          model = agent?.modelEffective || preferred?.modelName || '';
+          if (agent) {
+            // Bind test evidence to the freshly resolved model and runtime.
+            probeAgent = Object.fromEntries(['key', 'version', 'bin', 'model', 'modelEffective', 'modelProviderId',
+              'modelGone', 'configRevision', 'runtimeRevision'].map(field => [field, agent[field]]));
+          }
+        }
+        if (isCurrentRunner && isLocalModelChoice(model)) {
+          var tested = await global.soduWorkAPI.localAgentModels.probe({ agentId: key,
+            modelName: model, scopeKey: defaults.scopeKey,
+            ...(inheritedModel ? { expectedRevision: defaults.revision } : {}) });
+          if (!sameDomainScope(scope)) throw staleTaskScope();
+          return { ...tested, ...(probeAgent && tested.modelName === model ? { probeAgent } : {}) };
+        }
+      }
       var r = await jfetch('/agent-setup/probe', { method: 'POST', taskScope: taskStorageKey('ops'),
         body: JSON.stringify({ key: key, model: model || '', runnerId: runnerId || '' }) });
-      mark(true); return r;
+      mark(true); return { ...r, ...(probeAgent && !r?.fellBackFrom ? { probeAgent } : {}) };
     },
     async agentJob(jid) {
       var r = await jfetch('/agent-setup/job/' + encodeURIComponent(jid), { taskScope: taskStorageKey('ops') });
       mark(true); return r;
     },
 
-    async setAgentModel(key, model) {
-      if (isLocalModelChoice(model)) throw new Error('本地模型仅能在本机对话中选择，不能设为后台默认模型');
-      var scope = domainScope();
+    async setAgentModel(key, model, providerId) {
+      var scope = domainScope(), requestScope = taskStorageKey('ops');
+      var defaults = await localAgentDefaults(scope);
+      if (isLocalModelChoice(model)) {
+        if (!defaults) throw new Error('本地模型默认设置存储不可用，请更新客户端');
+        var localResult = await global.soduWorkAPI.localAgentModels.set({ agentId: key, modelName: model,
+          scopeKey: defaults.scopeKey, expectedRevision: defaults.revision });
+        if (!sameDomainScope(scope)) throw staleTaskScope();
+        await invalidateDomain('models', scope);
+        return localResult;
+      }
       var r = await jfetch('/agent-setup/model', {
-        method: 'PUT', taskScope: taskStorageKey('ops'), body: JSON.stringify({ key: key, model: model || '' })
+        method: 'PUT', taskScope: requestScope, body: JSON.stringify({ key: key, model: model || '',
+          ...(providerId ? { providerId } : {}) })
       });
+      if (!sameDomainScope(scope)) throw staleTaskScope();
+      if (defaults?.selections?.[key]?.configured) {
+        await global.soduWorkAPI.localAgentModels.remove({ agentId: key, scopeKey: defaults.scopeKey,
+          expectedRevision: defaults.revision });
+        if (!sameDomainScope(scope)) throw staleTaskScope();
+      }
       await invalidateDomain('models', scope);
       mark(true); return r;
     },
@@ -1582,7 +2183,7 @@
     async uploadApprovalEvidence(requestId, file) {
       var fd = new FormData();
       fd.append('file', file);
-      var res = await fetch(apiUrl('/approvals/' + encodeURIComponent(requestId) + '/evidence'),
+      var res = await hubFetch(apiUrl('/approvals/' + encodeURIComponent(requestId) + '/evidence'),
         { method: 'POST', headers: authHeaders(false), body: fd, signal: _abortSignal(30000) });
       if (!res.ok) {
         var detail = '';
@@ -1663,9 +2264,14 @@
       });
       mark(true); return acceptTaskResult(r);
     },
-    async mySkills() {
-      try { var v = await jfetch('/skills'); mark(true); return v || { skills: [] }; }
-      catch (e) { markFromError(e); return { skills: [] }; }
+    async mySkills(options) {
+      var strict = options?.strict === true, scope = skillMutationScope();
+      try {
+        var v = await jfetch('/skills', strict ? { taskScope: scope.key } : undefined);
+        if (strict && (scope.key !== taskStorageKey('ops') || scope.epoch !== _skillScopeEpoch)) throw staleTaskScope();
+        if (strict && (!v || !Array.isArray(v.skills))) throw new Error('技能目录响应无效，请刷新后重试');
+        mark(true); return v || { skills: [] };
+      } catch (e) { markFromError(e); if (strict) throw e; return { skills: [] }; }
     },
     async setMySkills(names) {
       var scope = skillMutationScope();
@@ -1698,7 +2304,8 @@
       mark(true); return r;
     },
     async preflightMySkill(file) {
-      var r = await uploadFile('/skills/preflight', file);
+      var scope = skillMutationScope();
+      var r = await uploadFile('/skills/preflight', file, false, null, scope.key);
       mark(true); return r;
     },
     skillDetails(name) { return jfetch('/skills/' + encodeURIComponent(name) + '/details'); },
@@ -1707,8 +2314,9 @@
         new URLSearchParams({ checksum, path, offset: offset || 0 }));
     },
     previewSkillContent(file, path, offset) {
+      var scope = skillMutationScope();
       return uploadFile('/skills/preflight/content?' +
-        new URLSearchParams({ path, offset: offset || 0 }), file);
+        new URLSearchParams({ path, offset: offset || 0 }), file, false, null, scope.key);
     },
     shareSkill(name, body) {
       return jfetch('/skills/' + encodeURIComponent(name) + '/share', {
@@ -1795,38 +2403,105 @@
        * Propagate schedule-list failures to the retry UI; returning [] would misrepresent an
        * outage as an empty list.
        */
-      var v = await jfetch('/schedules'); mark(true); return v || [];
+      var operation = automationOperationScope();
+      var v = await jfetch('/schedules', { taskScope: operation.taskScope });
+      assertAutomationScope(operation);
+      var rows = Array.isArray(v) ? v : [];
+      var local = await readAutomationModels(rows.map(function (row) { return String(row?.id || ''); }).filter(Boolean), operation);
+      assertAutomationScope(operation);
+      rows = rows.map(function (row) {
+        var source = String(row?.modelSource || '').trim().toLowerCase();
+        var rawModel = String(row?.modelName || '');
+        if (source === 'device' && !local[String(row?.id || '')]) {
+          return { ...row, modelName: 'local:unavailable', localModelUnavailable: true };
+        }
+        var legacyLocal = !rawModel || isLocalModelChoice(rawModel);
+        var modelName = ((source === 'device' || (!source && legacyLocal)) &&
+          local[String(row?.id || '')]) || rawModel;
+        return modelName ? { ...row, modelName: modelName } : row;
+      });
+      mark(true); return rows;
     },
     async listScheduleTemplates() {
       var v = await jfetch('/schedules/templates'); mark(true); return Array.isArray(v) ? v : [];
     },
     async preflightSchedule(b, options) {
-      requireRemoteModel(b?.modelName);
+      var request = scheduleRequest(b), localModel = request.localModel;
       var epoch = _registrationEpoch, hub = base(), owner = taskStorageKey('ops');
-      var r = await jfetch('/schedules/preflight',
-        { method: 'POST', body: JSON.stringify(b || {}) });
-      if (epoch !== _registrationEpoch || hub !== base() || owner !== taskStorageKey('ops')) throw staleTaskScope();
       var bridge = global.soduWorkAPI;
-      if (r && r.deviceDependencies && bridge && bridge.automationPreflight) {
-        r = await bridge.automationPreflight({ server: r, hub: hub, force: !!(options && options.force) });
+      if (localModel && (!bridge || typeof bridge.automationPreflight !== 'function')) {
+        throw new Error('当前客户端无法验证本地模型，请更新客户端后重试');
+      }
+      var r = await jfetch('/schedules/preflight',
+        { method: 'POST', taskScope: owner, body: JSON.stringify(request.value) });
+      if (epoch !== _registrationEpoch || hub !== base() || owner !== taskStorageKey('ops')) throw staleTaskScope();
+      if (r && bridge && bridge.automationPreflight && (r.deviceDependencies || localModel)) {
+        r = await bridge.automationPreflight({ server: r, hub: hub, force: !!(options && options.force),
+          localModelName: localModel, assigneeId: String(b?.assigneeId || ''),
+          assigneeMode: String(b?.assigneeMode || ''), assigneeClientId: String(b?.assigneeClientId || '') });
         if (epoch !== _registrationEpoch || hub !== base() || owner !== taskStorageKey('ops')) throw staleTaskScope();
       }
       mark(true); return r || {};
     },
     async createSchedule(b) {
-      requireRemoteModel(b?.modelName);
-      var r = await jfetch('/schedules', { method: 'POST', taskScope: taskStorageKey('ops'), body: JSON.stringify(b || {}) });
+      var operation = automationOperationScope(), request = scheduleRequest(b);
+      var r = await jfetch('/schedules', { method: 'POST', taskScope: operation.taskScope, body: JSON.stringify(request.value) });
+      assertAutomationScope(operation);
+      if (request.localModel) {
+        if (String(r?.modelSource || '').trim().toLowerCase() !== 'device') {
+          if (r?.id) { try { assertAutomationScope(operation); await jfetch('/schedules/' + encodeURIComponent(r.id), { method: 'DELETE', taskScope: operation.taskScope }); } catch (_) {} }
+          throw new Error('当前 Hub 不支持本地模型自动化，请升级 Hub 后重试');
+        }
+        try { await saveAutomationModel(r?.id, request.localModel, operation); }
+        catch (error) {
+          if (r?.id) { try { assertAutomationScope(operation); await jfetch('/schedules/' + encodeURIComponent(r.id), { method: 'DELETE', taskScope: operation.taskScope }); } catch (_) {} }
+          throw error;
+        }
+        r = { ...r, modelName: request.localModel };
+      }
       mark(true); return r;
     },
     async updateSchedule(sid, b) {
-      requireRemoteModel(b?.modelName);
-      var r = await jfetch('/schedules/' + encodeURIComponent(sid),
-        { method: 'PUT', body: JSON.stringify(b || {}) });
-      mark(true); return r;
+      var operation = automationOperationScope(), request = scheduleRequest(b);
+      return mutateAutomation(operation, sid, async function () {
+        var hasModelField = Object.hasOwn(request.value, 'modelName') || Object.hasOwn(request.value, 'modelSource'), previous = null;
+        if (request.localModel && (!window.soduWorkAPI?.automationModels ||
+            typeof window.soduWorkAPI.automationModels.set !== 'function')) {
+          throw new Error('当前客户端无法保存自动化本地模型选择');
+        }
+        if (hasModelField && window.soduWorkAPI?.automationModels) previous = await readAutomationModel(sid, operation);
+        if (hasModelField && window.soduWorkAPI?.automationModels) await saveAutomationModel(sid, request.localModel, operation);
+        assertAutomationScope(operation);
+        var r;
+        try {
+          r = await jfetch('/schedules/' + encodeURIComponent(sid),
+            { method: 'PUT', taskScope: operation.taskScope, body: JSON.stringify(request.value) });
+          assertAutomationScope(operation);
+        } catch (error) {
+          if (hasModelField && previous?.available) {
+            try { await saveAutomationModel(sid, previous.configured ? previous.modelName : '', operation); } catch (_) {}
+          }
+          throw error;
+        }
+        if (request.localModel && String(r?.modelSource || '').trim().toLowerCase() !== 'device') {
+          // The Hub has accepted a managed source. Do not retain a stale local
+          // mapping that would make a later legacy response look device-owned.
+          if (hasModelField) { try { await saveAutomationModel(sid, '', operation); } catch (_) {} }
+          throw new Error('当前 Hub 不支持本地模型自动化，请升级 Hub 后重试');
+        }
+        if (request.localModel) r = { ...r, modelName: request.localModel };
+        mark(true); return r;
+      });
     },
     async deleteSchedule(sid) {
-      var r = await jfetch('/schedules/' + encodeURIComponent(sid), { method: 'DELETE' });
-      mark(true); return r;
+      var operation = automationOperationScope();
+      return mutateAutomation(operation, sid, async function () {
+        var r = await jfetch('/schedules/' + encodeURIComponent(sid), { method: 'DELETE', taskScope: operation.taskScope });
+        assertAutomationScope(operation);
+        try { await saveAutomationModel(sid, '', operation); } catch (error) { if (error?.code === 'STALE_TASK_SCOPE') throw error; }
+        assertAutomationScope(operation);
+        mark(true); return r;
+      });
     },
     async listScheduleRuns(sid, limit) {
       var q = '?limit=' + encodeURIComponent(limit || 20);
@@ -1834,11 +2509,46 @@
       mark(true); return (r && r.items) || [];
     },
     async runSchedule(sid, options) {
+      var operation = automationOperationScope();
       var epoch = _registrationEpoch, hub = base(), owner = taskStorageKey('ops');
       var body = options && options.instanceId ? { instanceId: String(options.instanceId) } : {};
       var r = await jfetch('/schedules/' + encodeURIComponent(sid) + '/run', {
-        method: 'POST', body: JSON.stringify(body)
+        method: 'POST', taskScope: operation.taskScope, body: JSON.stringify(body)
       });
+      assertAutomationScope(operation);
+      if (r && (r.conversationInput || String(r.modelSource || '').trim().toLowerCase() === 'device')) {
+        try {
+          var source = String(r.conversationInput?.modelSource || r.modelSource || '').trim().toLowerCase();
+          if (source === 'device') {
+            if (!window.soduWorkAPI?.automationModels) {
+              r = { ...r, conversationInput: null, localModelUnavailable: true };
+            } else {
+              var selected = await readAutomationModel(sid, operation);
+              if (selected.available && selected.configured && selected.modelName && r.conversationInput) {
+                r = { ...r, conversationInput: { ...r.conversationInput, modelName: selected.modelName } };
+              } else {
+                r = { ...r, conversationInput: null, localModelUnavailable: true };
+              }
+            }
+          } else if (!source && r.conversationInput && window.soduWorkAPI?.automationModels) {
+            // Legacy Hub responses predate modelSource. A known local mapping
+            // may be overlaid only for this exact schedule; managed responses
+            // with an explicit source never take this compatibility path.
+            var legacySelected = await readAutomationModel(sid, operation);
+            if (!String(r.conversationInput.modelName || '').trim() &&
+                legacySelected.available && legacySelected.configured && legacySelected.modelName) {
+              r = { ...r, conversationInput: { ...r.conversationInput, modelName: legacySelected.modelName } };
+            }
+          }
+        } catch (error) {
+          assertAutomationScope(operation);
+          if (error?.code === 'STALE_TASK_SCOPE') throw error;
+          // The native automation worker will report a local storage failure without
+          // opening the conversation with a managed fallback model.
+          r = { ...r, conversationInput: null, localModelUnavailable: true };
+        }
+      }
+      assertAutomationScope(operation);
       // Wake only after the Hub accepts the run. The native worker coalesces wakes;
       // an older/unavailable bridge must not turn an accepted run into a UI error.
       if (epoch === _registrationEpoch && hub === base() && owner === taskStorageKey('ops') && r && r.ok !== false) {
@@ -1968,9 +2678,10 @@
         if (since) params.set('since', String(since));
         if (ref) params.set('ref', String(ref));
         var q = params.size ? '?' + params.toString() : '';
-        var r = await jfetch('/tasks/' + encodeURIComponent(tid) + '/ai-session' + q);
+        var r = await jfetch('/tasks/' + encodeURIComponent(tid) + '/ai-session' + q, { sessionRead: true });
         mark(true); return r || { ok: false, items: [] };
-      } catch (e) { markFromError(e); return { ok: false, items: [], httpStatus: Number(e.status) || 0, error: '拿不到执行记录，请检查需求权限或后台连接' }; }
+      } catch (e) { return { ok: false, items: [], httpStatus: Number(e.status) || 0,
+        code: e.code || '', retryable: e.retryable, error: e.detail || '会话同步暂时不可用，已有内容已保留，请稍后重试' }; }
     },
     /*
      * Queue a message on the execution record rather than attaching to a TTY. Pending work
@@ -2163,6 +2874,10 @@
         { method: 'POST', body: JSON.stringify({ note: note || '' }) });
       mark(true); return acceptTaskResult(r);
     },
+    async setReviewRecipient(tid, userId) {
+      return jfetch('/tasks/' + encodeURIComponent(tid) + '/review-recipient',
+        {method:'PUT', body:JSON.stringify({userId}), taskScope:taskStorageKey('ops')});
+    },
     /* Evaluate the frozen delivery evidence under server-side reviewer permissions and quality gates. */
     async autoReviewTask(tid, note) {
       var r = await jfetch('/tasks/' + encodeURIComponent(tid) + '/auto-review', {
@@ -2195,16 +2910,16 @@
     },
 
     async publishDelivery(payload) {
-      var requestScope = taskStorageKey('ops');
+      var requestScope = taskStorageKey('ops'), auth = requestAuth();
       if (!payload?.manifest || typeof payload.data !== 'string') throw new Error('成果内容尚未准备好');
       var raw = atob(payload.data), bytes = new Uint8Array(raw.length);
       for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
       var form = new FormData(); form.append('manifest', JSON.stringify(payload.manifest));
       form.append('file', new Blob([bytes], { type: payload.contentType }), payload.filename);
-      var res = await fetch(apiUrl('/deliveries'), { method: 'POST', headers: authHeaders(false), body: form, signal: _abortSignal(120000) });
+      var res = await hubFetch(apiUrl('/deliveries'), { method: 'POST', headers: authHeaders(false), body: form, signal: _abortSignal(120000) });
       assertLibraryScope(requestScope);
       var text = await res.text(); assertLibraryScope(requestScope);
-      if (!res.ok) { var error = httpError(res, text); handleAuthError(error); throw error; }
+      if (!res.ok) { var error = httpError(res, text); handleAuthError(error, auth); throw error; }
       /*
        * Reject empty responses with a clear error instead of JSON.parse's generic end-of-input
        * message.
@@ -2227,7 +2942,7 @@
     },
     async readDeliveryFile(id, path) {
       var requestScope = taskStorageKey('ops');
-      var res = await fetch(apiUrl('/deliveries/' + encodeURIComponent(id) + '/files/' + String(path).split('/').map(encodeURIComponent).join('/')), {
+      var res = await hubFetch(apiUrl('/deliveries/' + encodeURIComponent(id) + '/files/' + String(path).split('/').map(encodeURIComponent).join('/')), {
         headers: authHeaders(false), signal: _abortSignal(120000), redirect: 'error'
       });
       assertLibraryScope(requestScope);
@@ -2316,7 +3031,7 @@
       catch (e) { markFromError(e); throw e; }
     },
     async uploadLibraryFile(file, folderId, storage, source) {
-      var requestScope = taskStorageKey('ops');
+      var requestScope = taskStorageKey('ops'), auth = requestAuth();
       if (!file) throw new Error('请选择文件');
       var form = new FormData(); form.append('file', file); form.append('folderId', folderId || ''); form.append('storage', storage || '');
       var meta = source && typeof source === 'object' ? source : {};
@@ -2325,13 +3040,13 @@
       if (meta.conversationTitle) form.append('conversationTitle', String(meta.conversationTitle));
       if (meta.rejectDuplicateName === true) form.append('rejectDuplicateName', 'true');
       try {
-        var res = await fetch(apiUrl('/library/items/upload'), {
+        var res = await hubFetch(apiUrl('/library/items/upload'), {
           method: 'POST', headers: authHeaders(false), body: form, signal: _abortSignal(120000)
         });
         assertLibraryScope(requestScope);
         mark(true); var txt = await res.text();
         assertLibraryScope(requestScope);
-        if (!res.ok) { var err = httpError(res, txt); handleAuthError(err); throw err; }
+        if (!res.ok) { var err = httpError(res, txt); handleAuthError(err, auth); throw err; }
         return parseJSON(txt);
       } catch (e) { markFromError(e); throw e; }
     },
@@ -2344,7 +3059,7 @@
       const timer = setTimeout(abort, 30000);
       let reader;
       try {
-        const res = await fetch(apiUrl('/library/items/' + encodeURIComponent(id) + '/thumbnail'), {
+        const res = await hubFetch(apiUrl('/library/items/' + encodeURIComponent(id) + '/thumbnail'), {
           headers: authHeaders(false), signal: controller.signal, cache: 'no-store'
         });
         assertLibraryScope(requestScope);
@@ -2369,9 +3084,9 @@
       }
     },
     async readLibraryBinary(id) {
-      var requestScope = taskStorageKey('ops');
+      var requestScope = taskStorageKey('ops'), auth = requestAuth();
       try {
-        var res = await fetch(apiUrl('/library/items/' + encodeURIComponent(id) + '/download'), {
+        var res = await hubFetch(apiUrl('/library/items/' + encodeURIComponent(id) + '/download'), {
           method: 'GET', headers: authHeaders(false), signal: _abortSignal(120000)
         });
         if (requestScope !== taskStorageKey('ops')) {
@@ -2381,7 +3096,7 @@
         mark(true);
         if (!res.ok) {
           var text = await res.text(); assertLibraryScope(requestScope);
-          var err = httpError(res, text); handleAuthError(err); throw err;
+          var err = httpError(res, text); handleAuthError(err, auth); throw err;
         }
         var limit = 64 * 1024 * 1024;
         if (Number(res.headers.get('content-length') || 0) > limit) { await res.body?.cancel(); throw new Error('文件超过 64MB，请下载后使用'); }
@@ -2415,7 +3130,7 @@
       } catch (error) { markFromError(error); throw error; }
     },
     async readLibraryArchiveFile(id, path, options) {
-      var requestScope = taskStorageKey('ops');
+      var requestScope = taskStorageKey('ops'), auth = requestAuth();
       var route = '/library/items/' + encodeURIComponent(id) + '/archive/file?path=' + encodeURIComponent(libraryArchivePath(path));
       try {
         if (options?.preview) {
@@ -2424,7 +3139,7 @@
           });
           mark(true); return preview;
         }
-        var res = await fetch(apiUrl(route), {
+        var res = await hubFetch(apiUrl(route), {
           method: 'GET', headers: authHeaders(false), signal: _abortSignal(120000), redirect: 'error', cache: 'no-store'
         });
         if (requestScope !== taskStorageKey('ops')) {
@@ -2434,7 +3149,7 @@
         mark(true);
         if (!res.ok) {
           var text = await res.text(); assertLibraryScope(requestScope);
-          var error = httpError(res, text); handleAuthError(error); throw error;
+          var error = httpError(res, text); handleAuthError(error, auth); throw error;
         }
         var cap = 64 * 1024 * 1024;
         if (Number(res.headers.get('content-length') || 0) > cap) {
@@ -2558,10 +3273,10 @@
       catch (e) { markFromError(e); throw e; }
     },
     async downloadLibraryItem(id, filename, member) {
-      var requestScope = taskStorageKey('ops');
+      var requestScope = taskStorageKey('ops'), auth = requestAuth();
       try {
         var memberBlob = member?.path ? await (member.archive === true ? this.readLibraryArchiveFile(id, member.path) : this.readDeliveryFile(id, member.path)) : null;
-        var res = memberBlob ? new Response(memberBlob) : await fetch(apiUrl('/library/items/' + encodeURIComponent(id) + '/download'), {
+        var res = memberBlob ? new Response(memberBlob) : await hubFetch(apiUrl('/library/items/' + encodeURIComponent(id) + '/download'), {
           method: 'GET', headers: authHeaders(false), signal: _abortSignal(120000)
         });
         if (requestScope !== taskStorageKey('ops')) {
@@ -2571,7 +3286,7 @@
         mark(true);
         if (!res.ok) {
           var text = await res.text(); assertLibraryScope(requestScope);
-          var err = httpError(res, text); handleAuthError(err); throw err;
+          var err = httpError(res, text); handleAuthError(err, auth); throw err;
         }
         var blob = await res.blob(); assertLibraryScope(requestScope);
         var url = URL.createObjectURL(blob), a = document.createElement('a');
@@ -2586,6 +3301,8 @@
      * user-supplied name, otherwise system username and hostname.
      */
     async registerClient(options) {
+      if (!options?.recheckAuth && ['pending', 'quota'].includes(_deviceAuthState)) return { ok: true, stored: true,
+        authState: _deviceAuthState, activationRequired: true, clientId: device() };
       var startedAt = options && options.startedAt != null ? options.startedAt : Date.now();
       var restoration = restoreSavedHub(); if (restoration) await restoration;
       var registration = registrationContext(startedAt);
@@ -2614,13 +3331,12 @@
         var wr = (typeof workRoot === 'function') ? String(workRoot() || '').trim() : '';
         if (wr) body.workRoot = wr;
       } catch (e) { /* A missing workspace value must not prevent registration. */ }
-      /* Start the Runner with an existing local secret while Hub is offline; refresh after initial registration and let it reconnect. */
-      await syncRunnerConfig(body.workRoot || '', registration);
       try {
         if (window.soduWorkAPI && window.soduWorkAPI.deviceAuthBootstrap) {
           var secure = await registration.step(function () { return window.soduWorkAPI.deviceAuthBootstrap({
             hub: base(), clientId: device(), legacySecret: secret(),
             staleSession: options && options.staleSession || '',
+            recheckAuth: options?.recheckAuth === true,
             name: body.name, platform: body.platform, version: body.version,
             workRoot: body.workRoot || ''
           }); });
@@ -2629,9 +3345,19 @@
              * After secure storage takes ownership, remove long-lived secrets from the renderer even
              * before device activation.
              */
-            try { if (readLocal(LEGACY_AUTH_HUB_KEY) === base()) localStorage.removeItem('soduwork_work_device_secret'); } catch (e) {}
+            if (window.soduWorkAPI.deviceAuthMigrateLegacy) {
+              if (secret()) await registration.step(function () { return migrateLegacyCredential(window.soduWorkAPI); });
+            } else {
+              try { if (readLocal(LEGACY_AUTH_HUB_KEY) === base()) localStorage.removeItem('soduwork_work_device_secret'); } catch (e) {}
+            }
+            // Existing signed-in profiles may predate the explicit account preference.
+            if (secure.ok && secure.session && secure.user?.id && !secure.activationRequired && !SoduWorkAPI.rememberedLoginAccount()) {
+              rememberLoginAccount(loginAccount(secure.user.email) || loginAccount(secure.user.username), secure);
+            }
             rememberSession(secure);
-            await syncRunnerConfig(body.workRoot || '', registration);
+            if (secure.ok && secure.session && !secure.activationRequired) {
+              await syncRunnerConfig(body.workRoot || '', registration);
+            }
             registration.check();
             if (secure.ok) mark(true);
             return secure;
@@ -2644,7 +3370,7 @@
         }
         var r = await registration.step(function () { return jfetch('/clients/register', { method: 'POST', body: JSON.stringify(body) }); });
         if (r && r.secret) setSecret(r.secret);  // Persist the initial device binding for subsequent requests.
-        await syncRunnerConfig(body.workRoot || '', registration);
+        if (r?.authState === 'active') await syncRunnerConfig(body.workRoot || '', registration);
         registration.check();
         mark(true); return r;
       }
@@ -2662,11 +3388,13 @@
     },
 
     async clientLogin(credentials) {
+      var account = loginAccount(credentials && credentials.account);
       var restoration = restoreSavedHub(); if (restoration) await restoration;
       if (!window.soduWorkAPI || !window.soduWorkAPI.deviceAuthLogin) {
         return { ok: false, error: '\u5f53\u524d\u5ba2\u6237\u7aef\u7248\u672c\u4e0d\u652f\u6301\u5b89\u5168\u767b\u5f55' };
       }
       invalidateRegistrations();
+      rememberSession({ activationRequired: true });
       var loginEpoch = _registrationEpoch, loginHub = base();
       function checkLogin() { if (loginEpoch !== _registrationEpoch || loginHub !== base()) throw staleTaskScope(); }
       var version = '1.2.0', sysInfo = null, root = '';
@@ -2675,7 +3403,7 @@
       try { root = typeof workRoot === 'function' ? String(workRoot() || '').trim() : ''; } catch (e) {}
       checkLogin();
       var result = await window.soduWorkAPI.deviceAuthLogin({
-        hub: loginHub, clientId: device(),
+        hub: loginHub, clientId: device(), preserveLegacyIdentity: !!secret(),
         account: String(credentials && credentials.account || '').trim(),
         password: String(credentials && credentials.password || ''),
         displayName: String(credentials && credentials.displayName || '').trim(),
@@ -2685,9 +3413,12 @@
       });
       checkLogin();
       invalidateRegistrations();
-      rememberSession(result || {});
+      var acceptedEpoch = _registrationEpoch;
+      rememberLoginAccount(account, result);
+      rememberSession(result || {}, { interactiveLogin: true });
       if (result && result.ok) {
         await syncRunnerConfig(root);
+        if (acceptedEpoch !== _registrationEpoch || loginHub !== base()) throw staleTaskScope();
         mark(true);
       } else if (result && (result.code === 'TOKEN_QUOTA_EXCEEDED' || result.status === 401)) {
         requireClientAuth(result.code || 'LOGIN_FAILED', result);
@@ -2696,12 +3427,13 @@
     },
 
     async clientAccountAction(action, payload) {
+      var account = loginAccount(payload && payload.email);
       var restoration = restoreSavedHub(); if (restoration) await restoration;
       if (!window.soduWorkAPI || !window.soduWorkAPI.deviceAccountAction)
         return { ok: false, error: '请更新客户端后使用邮箱账号功能' };
       var signsIn = ['password', 'emailCode', 'register'].includes(action);
       var changesIdentity = signsIn || action === 'resetPassword';
-      if (changesIdentity) invalidateRegistrations();
+      if (changesIdentity) { invalidateRegistrations(); rememberSession({ activationRequired: true }); }
       var epoch = _registrationEpoch, hub = base();
       var version = '', info = null, root = '';
       if (signsIn) {
@@ -2711,15 +3443,18 @@
       }
       if (epoch !== _registrationEpoch || hub !== base()) throw staleTaskScope();
       var result = await window.soduWorkAPI.deviceAccountAction(Object.assign({}, payload || {}, {
-        action: action, hub: hub, clientId: device(), version: version, workRoot: root,
+        action: action, hub: hub, clientId: device(), version: version, workRoot: root, preserveLegacyIdentity: !!secret(),
         name: [info && info.username, info && info.hostname].filter(Boolean).join(' · '),
         platform: info && info.platform || ''
       }));
       if (epoch !== _registrationEpoch || hub !== base()) throw staleTaskScope();
       if (signsIn && result && result.ok) {
         invalidateRegistrations();
-        rememberSession(result);
+        var acceptedEpoch = _registrationEpoch;
+        rememberLoginAccount(account, result);
+        rememberSession(result, { interactiveLogin: true });
         await syncRunnerConfig(root);
+        if (acceptedEpoch !== _registrationEpoch || hub !== base()) throw staleTaskScope();
         mark(true);
       }
       return result || { ok: false, error: '服务没有返回结果' };
@@ -2758,7 +3493,7 @@
       var epoch = _registrationEpoch, hub = base();
       await SoduWorkAPI.clientAuthMe();
       if (epoch !== _registrationEpoch || hub !== base()) throw staleTaskScope();
-      var response = await fetch(apiUrl('/client-auth/me/exports/' + encodeURIComponent(String(id)) + '/download'),
+      var response = await hubFetch(apiUrl('/client-auth/me/exports/' + encodeURIComponent(String(id)) + '/download'),
         { headers: authHeaders(true), signal: _abortSignal(DEFAULT_TIMEOUT) });
       if (!response.ok) throw httpError(response, await response.text());
       var blob = await response.blob();
@@ -2781,6 +3516,7 @@
         return { ok: false, error: '\u5f53\u524d\u5ba2\u6237\u7aef\u7248\u672c\u4e0d\u652f\u6301\u9000\u51fa' };
       }
       invalidateRegistrations();
+      rememberSession({ activationRequired: true });
       var logoutEpoch = _registrationEpoch, logoutHub = base();
       var result = await window.soduWorkAPI.deviceAuthLogout({ hub: logoutHub, clientId: device() });
       if (logoutEpoch !== _registrationEpoch || logoutHub !== base()) throw staleTaskScope();
@@ -2794,10 +3530,25 @@
 
     async clientAuthMe() {
       var epoch = _registrationEpoch, hub = base();
-      var result = await jfetch('/client-auth/me');
-      if (epoch !== _registrationEpoch || hub !== base()) throw staleTaskScope();
-      rememberSession({ user: result && result.user, quota: result && result.quota });
-      return result;
+      if (_clientAuthMeFlight?.epoch === epoch && _clientAuthMeFlight.hub === hub) {
+        _clientAuthMeFlight.pending = true;
+        return _clientAuthMeFlight.promise;
+      }
+      var flight = { epoch: epoch, hub: hub, pending: false, promise: null };
+      _clientAuthMeFlight = flight;
+      flight.promise = (async function () {
+        var result;
+        do {
+          flight.pending = false;
+          result = await jfetch('/client-auth/me');
+          if (epoch !== _registrationEpoch || hub !== base()) throw staleTaskScope();
+          // An overlapping refresh can follow an administrator changing quota.
+          // Read again before publishing or returning a potentially older result.
+        } while (flight.pending);
+        rememberSession({ user: result && result.user, quota: result && result.quota });
+        return result;
+      })().finally(function () { if (_clientAuthMeFlight === flight) _clientAuthMeFlight = null; });
+      return flight.promise;
     },
 
     /* After a password change, all account sessions are revoked; the caller must sign out immediately. */
@@ -2821,7 +3572,7 @@
 
     async clientAuthPolicy() {
       var restoration = restoreSavedHub(); if (restoration) await restoration;
-      var res = await fetch(apiUrl('/client-auth/policy'), { signal: _abortSignal(DEFAULT_TIMEOUT) });
+      var res = await hubFetch(apiUrl('/client-auth/policy'), { signal: _abortSignal(DEFAULT_TIMEOUT) });
       var text = await res.text();
       if (!res.ok) throw httpError(res, text);
       return text ? parseJSON(text) : {};
@@ -2829,7 +3580,10 @@
 
     clientAuthSnapshot() {
       return { state: _deviceAuthState, user: _clientUser, quota: _clientQuota,
-        clientId: device(), online: _online };
+        clientId: device(), online: _online, requestsAllowed: requestsAllowed() };
+    },
+    rememberedLoginAccount() {
+      return loginAccount(readLocal(loginAccountKey()));
     },
     im: {
       catalog: opts => jfetch('/im', Object.assign({cache: 'no-store'}, opts)),
@@ -2861,10 +3615,56 @@
     },
     /* Synchronize configuration through saveCfg(). */
     async syncConfig(cfg) {
-      var scope = domainScope();
-      try { await jfetch('/config', { method: 'PUT', body: JSON.stringify(cfg || {}) });
+      var scope = domainScope(), taskScope = taskStorageKey('ops');
+      configWriteGeneration++;
+      try {
+        var patch = Object.assign({}, cfg);
+        var initial = activeConfigSnapshot(scope);
+        if (!initial) {
+          var snapshot = await jfetch('/config?withRevision=true', { taskScope });
+          if (!sameDomainScope(scope)) return false;
+          // Without an editing base, only a new or unchanged field can be written unconditionally.
+          if (Array.isArray(snapshot?._configKeys)) {
+            for (var key of Object.keys(patch)) if (!snapshot._configKeys.includes(key)) delete patch[key];
+          }
+        }
+        if (initial) {
+          for (var key of Object.keys(patch)) {
+            if ((Array.isArray(initial.keys) && !initial.keys.includes(key)) ||
+                JSON.stringify(patch[key]) === JSON.stringify(initial.cfg[key])) delete patch[key];
+          }
+          patch._configRevision = initial.revision;
+        }
+        var saved = await jfetch('/config?withRevision=true', { method: 'PUT', taskScope, body: JSON.stringify(patch) });
+        configWriteGeneration++;
+        rememberConfig(scope, saved, Object.assign({}, cfg));
         await invalidateDomain('config', scope); mark(true); return true; }
-      catch (e) { markFromError(e); return false; }
+      catch (e) {
+        markFromError(e);
+        if (e?.status === 409 || e?.status === 428) {
+          // Return the actual conflict to the store. It can reconcile its live copy and
+          // keep unrelated local edits rather than repeatedly uploading an obsolete snapshot.
+          var latest = await jfetch('/config?withRevision=true', { taskScope });
+          if (!sameDomainScope(scope) || !latest?._configRevision) return false;
+          var remote = rememberConfig(scope, latest, null, false);
+          var previous = initial?.remote || {};
+          var agreed = {};
+          for (var key of Object.keys(remote)) {
+            if (!Object.prototype.hasOwnProperty.call(patch || {}, key) ||
+                JSON.stringify(previous[key]) !== JSON.stringify(remote[key])) agreed[key] = remote[key];
+          }
+          return { conflict: true, current: agreed, accept(local) {
+            if (!sameDomainScope(scope)) return;
+            // Advance only after the store applied this response to the same edit. Local-only
+            // preferences (e.g. an explicit locale) must not replay over the winning Hub value.
+            var base = Object.assign({}, remote);
+            for (var key of Object.keys(agreed)) base[key] = local[key];
+            configWriteGeneration++;
+            rememberConfig(scope, latest, base);
+          } };
+        }
+        return false;
+      }
     },
 
     /*
@@ -2918,12 +3718,12 @@
         return base().replace(/^http/, 'ws') + '/api/v1/ws?device=' + encodeURIComponent(device());
       }
       function open() {
-        if (!currentSource()) return;
+        if (!currentSource() || !requestsAllowed()) return;
         /*
          * Wait locally for registration and a valid session before connecting; an unauthenticated
          * first frame would produce 4401.
          */
-        if (!_deviceSession && !secret()) { timer = setTimeout(open, 800); return; }
+        if (!_deviceSession && !secret()) return;
         try {
           ws = new WebSocket(wsUrl());
           ws.onopen = function () {
@@ -2944,7 +3744,7 @@
         } catch (e) { retry(); }
       }
       /* Reconnect with exponential backoff from three seconds, capped at thirty seconds. */
-      function retry() { if (closed) return; clearTimeout(timer); timer = setTimeout(open, delay); delay = Math.min(delay * 2, 30000); }
+      function retry() { if (closed || !requestsAllowed()) return; clearTimeout(timer); timer = setTimeout(open, delay); delay = Math.min(delay * 2, 30000); }
       open();
       return function () { closed = true; clearTimeout(timer); try { ws && ws.close(); } catch (e) {} };
     }

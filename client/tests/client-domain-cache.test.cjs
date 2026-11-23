@@ -118,6 +118,11 @@ test('model metadata is shared only under its confirmed topic and invalidation r
   f.confirm(true); await read(); assert.equal(f.calls(), 2);
   model = 'second'; await f.cache.invalidate('models', f.scope());
   assert.equal((await read()).usable[0].name, 'second');
+  model = 'first-chat';
+  const before = f.calls();
+  await Promise.all([1, 2].map(() => f.cache.read('models', f.scope(), undefined, true)));
+  assert.equal((await read()).usable[0].name, 'first-chat', 'the chat sees the composer’s fresh directory');
+  assert.equal(f.calls(), before + 1, 'concurrent fresh reads share the request and update the cache');
 });
 test('configuration keeps its exact shape and personal caches cannot cross devices', async t => {
   const f = fixture(t, async () => ({theme: 'dark', dockVisible: false}));
@@ -241,5 +246,29 @@ test('notification responses without valid revisions retain body change detectio
     assert.equal(f.changes.length, 2, 'adding a valid revision retains body comparison');
     currentRevision = revision; await read(); await f.advance(50);
     assert.equal(f.changes.length, 3, 'losing the valid revision retains body comparison');
+  }
+});
+
+test('quota wake-ups reach the current account without creating a competing cached snapshot', async t => {
+  const f = fixture(t);
+  for (let i = 0; i < 20; i++) f.wake.get('quota')({quota: {exceeded: false}});
+  await settle(); await f.advance(50);
+  assert.deepEqual(f.changes, [['quota', f.scope()]]);
+  assert.equal(f.calls(), 0, 'quota wake-ups never read or cache an account response in main');
+  await assert.rejects(f.cache.read('quota', f.scope()), /\u4e0d\u652f\u6301/);
+  await f.advance(120000);
+  assert.equal(f.calls(), 0, 'a hint-only domain does not start background HTTP polling');
+});
+
+test('quota hints discard an obsolete account, device, Hub or authorization version before delivery', async t => {
+  for (const next of [identity('bob'), identity('alice', 'other'), identity('alice', 'desktop', 2),
+    {...identity(), hub: 'https://other-hub.invalid'}]) {
+    const f = fixture(t);
+    f.wake.get('quota')(); await settle();
+    f.setIdentity(next); await f.advance(50);
+    assert.equal(f.changes.length, 0, 'the old scheduled hint must not be delivered under a new identity');
+    f.wake.get('quota')(); await settle(); await f.advance(50);
+    assert.deepEqual(f.changes, [['quota', f.scope()]]);
+    assert.equal(f.calls(), 0);
   }
 });

@@ -4,26 +4,27 @@ const contextWindow = require('./context-window');
 const thinkingCapabilities = require('./thinking-capabilities');
 const { replaceFileSync } = require('../verified-file-replace.cjs');
 const localPrivacy = require('../pi-session/local-model-runtime-privacy.cjs');
+const { DEFAULT_OUTPUT_TOKENS } = require('../model-capability-contract.cjs');
 
 function canonicalName(name, model) {
-  if (model?.localOnly) return localPrivacy.reference(model);
+  if (model?.localOnly) {
+    const reference = localPrivacy.reference(model);
+    if (model.modality === 'image' && require('../../core/model-choice').imageChoice(name)?.name === reference) return name;
+    return reference;
+  }
   if (!String(name || '').startsWith('local:') || localPrivacy.OPAQUE_REFERENCE.test(name)) return name;
   const canonical = require('../local-model-store.cjs').canonicalReference(name, { rememberMissing: true });
   if (!canonical) throw new Error('Local model reference is unavailable');
   return canonical;
 }
 
-// The previous fallback (16k/32k) was routinely consumed by hidden reasoning on
-// coding models before they emitted a tool call or a final answer. Keep an
-// explicit server supplied limit authoritative, but give models with missing
-// metadata a usable default. This is still bounded by the model context below.
-const DEFAULT_OUTPUT_TOKENS = 65536;
-
 function publicModel(model) {
   const m = model || {};
   const resolved = contextWindow.resolveContextWindow(m);
   return { id: String(m.id || ''), label: String(m.label || m.name || m.id || '默认模型'),
     ...(m.localOnly === true ? { localOnly: true } : {}),
+    ...(m.historicalLocal === true ? { historicalLocal: true, unavailable: true,
+      label: '原本地模型已删除或不可用' } : {}),
     ...(m.modality ? { modality: m.modality } : {}),
     ...(m.quotaVersion === 2 && ['personal', 'platform'].includes(m.quotaScope)
       ? { quotaVersion: 2, quotaScope: m.quotaScope } : {}),
@@ -126,10 +127,12 @@ function preference(app, ref) {
 }
 
 function piProvider(next) {
+  require('../model-capability-contract.cjs').assertRequired(next, ['streaming']);
   const thinking = thinkingCapabilities.profile(next);
   const localNoAuth = next?.localOnly === true && !String(next?.key || '').trim();
   const compat = {
     supportsDeveloperRole: false,
+    ...require('../model-capability-contract.cjs').piCompatibility(next),
     supportsReasoningEffort: thinking.supportsReasoningEffort,
     ...(thinking.format ? { thinkingFormat: thinking.format } : {}),
   };
