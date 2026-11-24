@@ -483,6 +483,79 @@ class AcceptanceReviewTests(unittest.IsolatedAsyncioTestCase):
         refs = (await self.context())["evidenceRefOptions"]
         self.assertEqual(refs, [{"kind": "commit", "ref": "artifact:artifact-1:commit", "fingerprint": "c" * 40}])
 
+    async def test_direct_retry_accepts_omitted_refs_then_empty_arrays(self):
+        await self.session.delete(self.request)
+        await self.session.commit()
+        body = self.body()
+        body["approvalId"] = (await self.context())["approvalId"]
+        first = await api.auto_review_task_artifact(self.task.id, body, self.client, self.session)
+        self.assertTrue(first["closed"])
+        request = await self.session.get(am.ApprovalRequest, first["request"]["id"])
+        original_report = deepcopy(request.context["aiAcceptanceReports"][self.actor.id]["report"])
+        repeated_body = deepcopy(body)
+        for check in repeated_body["report"]["checks"]:
+            check["evidenceRefs"] = []
+        repeated = await api.auto_review_task_artifact(self.task.id, repeated_body, self.client, self.session)
+        self.assertTrue(repeated["already"])
+        self.assertEqual(len((await self.session.scalars(select(am.ApprovalDecision))).all()), 1)
+        request = await self.session.get(am.ApprovalRequest, first["request"]["id"])
+        saved = request.context["aiAcceptanceReports"][self.actor.id]["report"]
+        self.assertEqual(saved, original_report)
+        self.assertNotIn("evidenceRefs", saved["checks"][0])
+
+    async def test_direct_retry_accepts_empty_arrays_then_omitted_refs(self):
+        await self.session.delete(self.request)
+        await self.session.commit()
+        body = self.body()
+        body["approvalId"] = (await self.context())["approvalId"]
+        for check in body["report"]["checks"]:
+            check["evidenceRefs"] = []
+        first = await api.auto_review_task_artifact(self.task.id, body, self.client, self.session)
+        self.assertTrue(first["closed"])
+        request = await self.session.get(am.ApprovalRequest, first["request"]["id"])
+        original_report = deepcopy(request.context["aiAcceptanceReports"][self.actor.id]["report"])
+        repeated_body = deepcopy(body)
+        for check in repeated_body["report"]["checks"]:
+            check.pop("evidenceRefs")
+        repeated = await api.auto_review_task_artifact(self.task.id, repeated_body, self.client, self.session)
+        self.assertTrue(repeated["already"])
+        self.assertEqual(len((await self.session.scalars(select(am.ApprovalDecision))).all()), 1)
+        request = await self.session.get(am.ApprovalRequest, first["request"]["id"])
+        saved = request.context["aiAcceptanceReports"][self.actor.id]["report"]
+        self.assertEqual(saved, original_report)
+        self.assertEqual(saved["checks"][0]["evidenceRefs"], [])
+
+    async def test_direct_retry_still_rejects_changed_reference_or_evidence(self):
+        await self.session.delete(self.request)
+        self.artifact.checksum = "a" * 64
+        await self.session.commit()
+        body = self.body()
+        body["approvalId"] = (await self.context())["approvalId"]
+        body["report"]["checks"][0]["evidenceRefs"] = [
+            {"kind": "text", "ref": "artifact:artifact-1:text", "fingerprint": "a" * 64}]
+        first = await api.auto_review_task_artifact(self.task.id, body, self.client, self.session)
+        self.assertTrue(first["closed"])
+        request = await self.session.get(am.ApprovalRequest, first["request"]["id"])
+        original_report = deepcopy(request.context["aiAcceptanceReports"][self.actor.id]["report"])
+        changed_refs = deepcopy(body)
+        changed_refs["report"]["checks"][0]["evidenceRefs"][0]["fingerprint"] = "b" * 64
+        removed_refs = deepcopy(body)
+        removed_refs["report"]["checks"][0]["evidenceRefs"] = []
+        changed_evidence = deepcopy(body)
+        changed_evidence["report"]["checks"][0]["evidence"] = "Changed substantive evidence."
+        changed_summary = deepcopy(body)
+        changed_summary["report"]["summary"] = "Changed acceptance summary."
+        changed_verdict = deepcopy(body)
+        changed_verdict["report"]["verdict"] = "reject"
+        changed_verdict["report"]["checks"][0]["result"] = "fail"
+        for changed in (changed_refs, removed_refs, changed_evidence, changed_summary, changed_verdict):
+            with self.subTest(report=changed["report"]):
+                with self.assertRaises(HTTPException) as caught:
+                    await api.auto_review_task_artifact(self.task.id, changed, self.client, self.session)
+                self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(len((await self.session.scalars(select(am.ApprovalDecision))).all()), 1)
+        self.assertEqual(request.context["aiAcceptanceReports"][self.actor.id]["report"], original_report)
+
     async def test_committed_countersign_retry_keeps_its_report_after_cited_attachment_is_removed(self):
         row = models.Attachment(id="reviewed-file", task_id=self.task.id, filename="Essay.md",
             content_type="text/plain", role="output", size=7,

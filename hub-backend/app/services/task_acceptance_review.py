@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import weakref
+from copy import deepcopy
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -167,6 +168,19 @@ def validate_report(body, criteria):
     return {"verdict": verdict, "summary": summary.strip(), "checks": normalized}
 
 
+def _canonical_report(report):
+    value = deepcopy(report)
+    if isinstance(value, dict) and isinstance(value.get("checks"), list):
+        for check in value["checks"]:
+            if isinstance(check, dict) and check.get("evidenceRefs") == []:
+                check.pop("evidenceRefs")
+    return value
+
+
+def _same_report(saved, incoming):
+    return _canonical_report(saved) == _canonical_report(incoming)
+
+
 async def apply(session, client, tid, body):
     # Serialize same-process decisions for SQLite, which lacks row-level locking.
     # Production task and approval row locks also protect decisions across processes.
@@ -203,7 +217,7 @@ async def _apply(session, client, tid, body):
     report = validate_report(body, _criteria(task, request))
     if report["verdict"] == "approve" and gate_contract.requires_manual_confirmation(artifact):
         raise HTTPException(422, "本轮没有可自动核验的交付物，请使用手动验收确认实际结果")
-    if direct_retry and saved.get("report") != report:
+    if direct_retry and not _same_report(saved.get("report"), report):
         raise HTTPException(409, "本次直验已有其他结论，请刷新后查看")
     if (prior is None and (request is None or request.status == "pending")
             and any(check.get("evidenceRefs") for check in report["checks"])):

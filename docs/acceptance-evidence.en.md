@@ -55,6 +55,10 @@ cross-task, mismatched and malformed references receive HTTP 422 with
 Each check allows 20 references and an optional note of at most 1,000 characters;
 each report and choice list are bounded to 200 references.
 
+For a committed direct-acceptance retry, omitting `evidenceRefs` and an empty
+array are equivalent. Comparison preserves the stored report; changes to actual
+references, fingerprints, evidence text, summary or verdict still conflict.
+
 Existing text-only reports, stored approval reports and attachments without
 reliable historical digests retain their existing behavior. Such evidence
 remains available in the normal gate, without an invented fingerprint. An empty
