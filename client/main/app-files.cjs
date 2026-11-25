@@ -4,7 +4,7 @@ const fs = require('node:fs'), fsp = fs.promises, path = require('node:path'), c
 const {Readable} = require('node:stream');
 const contract = require('../core/app-files-contract.cjs');
 const settings = require('./app-settings-store.cjs');
-const uploads = new Map(), starting = new Map(), completed = new Map(),copies=new Map();
+const uploads = new Map(), starting = new Map(), completed = new Map(),copies=new Map(),deleting=new Map();
 const sources=require('./app-local-sources.cjs');
 const hash = text => crypto.createHash('sha256').update(text).digest('hex');
 const projectKey = value => 'p_' + hash(value);
@@ -21,23 +21,55 @@ async function directory(app, scope, parts, create) {
   return dir;
 }
 function url(binding, file) { return new URL('/_app-files/'+projectKey(file.projectId)+'/'+file.id+'/'+encodeURIComponent(file.name),binding.origin).href; }
-async function metadata(app, scope, project, id) {
+async function metadata(app, scope, project, id, allowMissingBinary=false) {
   const dir = await directory(app,scope,['projects',project,'files'],false);
   const metaPath=path.join(dir,id+'.json'),st=await fsp.lstat(metaPath);
   if(!st.isFile()||st.isSymbolicLink()||st.size>4096)throw Error('文件记录无效');
   const file=JSON.parse(await fsp.readFile(metaPath,'utf8'));
   if(file.id!==id || projectKey(file.projectId)!==project || !contract.ID.test(file.id) || !Number.isSafeInteger(file.size) || file.size<0 || file.size>contract.MAX_BYTES || !/^[a-f0-9]{64}$/.test(file.sha256))throw Error('文件记录无效');
-  const binary=path.join(dir,id+'.'+extension(file.type)),stat=await fsp.lstat(binary);
-  if(!stat.isFile()||stat.isSymbolicLink()||stat.size!==file.size)throw Error('文件缺失或大小不一致');
-  return {file,binary};
+  const binary=path.join(dir,id+'.'+extension(file.type));let stat;
+  try{stat=await fsp.lstat(binary);}catch(error){if(!allowMissingBinary||error.code!=='ENOENT')throw error;}
+  if(stat&&(!stat.isFile()||stat.isSymbolicLink()||stat.size!==file.size))throw Error('文件缺失或大小不一致');
+  return {file,binary,metadataPath:metaPath};
+}
+function forgetFileReceipts(scope,project,id) {
+  const matches=file=>file?.id===id&&projectKey(file.projectId)===project;
+  for(const [key,file] of completed)if(key.startsWith(scope+':')&&matches(file))completed.delete(key);
+  for(const [key,row] of copies)if(key.startsWith(scope+':')&&matches(row.file))copies.delete(key);
+}
+async function unlinkKnown(file) {
+  try{await fsp.unlink(file);}catch(error){if(error.code!=='ENOENT')throw error;}
+}
+async function removeFile(app,scope,project,id,current) {
+  const key=scope+':'+project+':'+id,previous=deleting.get(key);
+  if(previous){const result=await previous;current();return result;}
+  const work=(async()=>{
+    let saved;
+    try{saved=await metadata(app,scope,project,id,true);}
+    catch(error){
+      if(error.code!=='ENOENT')throw error;
+      current();forgetFileReceipts(scope,project,id);return {ok:true,deleted:false};
+    }
+    current();
+    // Keep validated metadata until the bytes are removed, so a failed second
+    // unlink can be retried without inventing a filename or deleting an orphan.
+    await unlinkKnown(saved.binary);
+    forgetFileReceipts(scope,project,id);
+    current();
+    await unlinkKnown(saved.metadataPath);
+    current();return {ok:true,deleted:true};
+  })();
+  deleting.set(key,work);
+  try{return await work;}finally{if(deleting.get(key)===work)deleting.delete(key);}
 }
 async function execute(app,binding,method,input,assertCurrent=()=>{},options={}) {
   const p=contract.normalize(method,input),scope=settings.scope(binding);
   const current=()=>{assertCurrent();if(settings.scope(binding)!==scope)throw Error('文件账号已变化');};current();
   if(method==='files.pickLocal')return sources.select(scope,binding,current,options);
+  if(method==='files.delete')return removeFile(app,scope,projectKey(p.projectId),p.id,current);
   if(method==='files.copyLocal'){
     const source=await sources.resolve(scope,binding,p.sourceId);current();const tag=scope+':'+p.projectId+':'+p.sourceId;
-    if(copies.has(tag))return copies.get(tag);
+    if(copies.has(tag))return copies.get(tag).promise;
     const work=(async()=>{const dir=await directory(app,scope,['projects',projectKey(p.projectId),'files'],true);current();const id=uuid('file_'),temp=path.join(dir,id+'.part'),binary=path.join(dir,id+'.'+extension(source.type));let published=false;
       try{await fsp.copyFile(source.path,temp,fs.constants.COPYFILE_EXCL);await sources.resolve(scope,binding,p.sourceId);current();
         const digest=crypto.createHash('sha256');for await(const chunk of fs.createReadStream(temp,{highWaterMark:contract.CHUNK_BYTES})){digest.update(chunk);current();}
@@ -46,7 +78,9 @@ async function execute(app,binding,method,input,assertCurrent=()=>{},options={})
         const file={id,projectId:p.projectId,name:source.name,type:source.type,size:source.size,sha256:digest.digest('hex'),createdAt:new Date().toISOString()};
         const meta=await fsp.open(path.join(dir,id+'.json'),'wx',0o600);try{await meta.writeFile(JSON.stringify(file));await meta.sync();}finally{await meta.close();}current();published=true;return {ok:true,file:{...file,url:url(binding,file)}};
       }finally{if(!published){await fsp.rm(temp,{force:true});await fsp.rm(binary,{force:true});await fsp.rm(path.join(dir,id+'.json'),{force:true});}}
-    })();copies.set(tag,work);work.catch(()=>copies.delete(tag));return work;
+    })();const receipt={promise:work};copies.set(tag,receipt);
+    work.then(result=>{if(copies.get(tag)===receipt)receipt.file=result.file;},
+      ()=>{if(copies.get(tag)===receipt)copies.delete(tag);});return work;
   }
   if(method==='files.getUrl') {const {file}=await metadata(app,scope,projectKey(p.projectId),p.id);current();return {ok:true,file:{...file,url:url(binding,file)}};}
   const key=scope+':'+p.id;
