@@ -9,7 +9,7 @@ function policy(conf) {
   const profile = thinking.profile(config), always = config.thinkingMode === 'always' || config.thinkingAlwaysOn === true ||
     profile.reasoning && profile.thinkingLevelMap?.off === null;
   const outputLimit = Math.min(Number(config.maxOutputTokens) || DEFAULT_OUTPUT_TOKENS,
-    Number(conf.ctxWindow || conf.contextWindow) || 128000);
+    Number(conf.ctxWindow || conf.contextWindow || conf.advertisedContextWindow) || 128000);
   return { variants: new Set(), compatibility: { maxTokensField: 'max_tokens', toolChoice: 'auto', streamOptions: true,
     ...compatibility(conf.compatibility), ...compatibility(conf.config?.compatibility) },
   config, profile, always, outputLimit, budget: Math.min(always ? 2048 : 512, outputLimit) };

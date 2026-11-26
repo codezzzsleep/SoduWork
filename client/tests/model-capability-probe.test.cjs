@@ -18,8 +18,13 @@ async function fixture(t, mode = '', reasoningOptions = {}) {
         param: 'max_tokens', code: 'unsupported_parameter' } }));
     }
     const budget = body.max_completion_tokens ?? body.max_tokens;
+    const contextLimit = reasoningOptions.contextLimit;
+    if (contextLimit && budget > contextLimit) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: 'Output exceeds model context', code: 'invalid_value' } }));
+    }
     if (mode === 'reasoning-limit' && (!body.stream || !reasoningOptions.onlyNonstream) &&
-        (reasoningOptions.alwaysTruncated || budget < 4096)) {
+        (reasoningOptions.alwaysTruncated || budget < (contextLimit ?? 4096))) {
       const message = { role: 'assistant', content: '',
         [reasoningOptions.reasoningKey || 'reasoning_content']: 'synthetic reasoning before the final answer',
         ...reasoningOptions.message };
@@ -339,6 +344,19 @@ test('reasoning retries preserve default limits and mandatory thinking settings'
       assert.deepEqual(f.requests.map(({ body }) => body.max_tokens), budgets);
       assert.deepEqual(f.requests[1].body.thinking, f.requests[0].body.thinking);
       assert.equal(f.requests[1].body.reasoning_effort, f.requests[0].body.reasoning_effort);
+    });
+  }
+});
+
+test('reasoning retry uses the advertised context when the user leaves the window automatic', async t => {
+  for (const [label, configured, limit] of [['automatic', undefined, 2048], ['override', 3072, 3072]]) {
+    await t.test(label, async t => {
+      const f = await fixture(t, 'reasoning-limit', { contextLimit: limit });
+      Object.assign(f.conf, { advertisedContextWindow: 2048, ctxWindow: configured,
+        config: { maxOutputTokens: 8192 } });
+      const report = await probe().run(f.conf, ['imageInput'], { challenge });
+      assert.deepEqual(f.requests.map(({ body }) => body.max_tokens), [512, limit]);
+      assert.equal(report.checks.imageInput.status, 'passed');
     });
   }
 });
