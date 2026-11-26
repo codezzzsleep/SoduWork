@@ -67,16 +67,20 @@ async def _dispatched_ids(session: AsyncSession) -> set[str]:
 
 
 async def _busy_repos(session: AsyncSession) -> set[str]:
-    """Find repositories with unfinished automatic batches. Resolve each batch shell's repository
-    through its source-task milestones.
-    """
+    """Prefer an unfinished batch's execution repository, with a fallback for older batches."""
     source = aliased(models.Task)
-    repo_ids = await session.scalars(select(source.repo_id).select_from(models.Task)
+    repositories = await session.execute(select(models.Task.repo_id, source.repo_id).select_from(models.Task)
         .join(models.Milestone, models.Milestone.task_id == models.Task.id)
-        .join(source, source.id == models.Milestone.src_task_id)
-        .where(models.Task.status.in_(("todo", "doing")), models.Task.origin == "local")
+        .outerjoin(source, source.id == models.Milestone.src_task_id)
+        .where(models.Task.status.in_(("todo", "doing")), models.Task.origin == "local",
+               models.Milestone.src_task_id != "")
         .distinct())
-    return {repo_id.strip() for repo_id in repo_ids if repo_id and repo_id.strip()}
+    busy = set()
+    for batch_repo, source_repo in repositories:
+        repo_id = (batch_repo or "").strip() or (source_repo or "").strip()
+        if repo_id:
+            busy.add(repo_id)
+    return busy
 
 
 async def group(session: AsyncSession) -> list[dict]:

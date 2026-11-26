@@ -482,6 +482,39 @@ class AdminRequirementDispatchTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(next_batch["taskIds"], waiting["taskIds"])
         self.assertEqual(len(self.calls), 2)
 
+    async def test_autobatch_uses_the_existing_batch_execution_repository(self):
+        async with self.sessions() as session:
+            session.add_all(models.Repo(id=rid, project_id="project", ai_work_dir="runner-work")
+                            for rid in ("execution-repo", "source-repo"))
+            await session.commit()
+        common = {"project_id": "project", "integration_id": "import"}
+        sources = [await self.create(tid, repo_id="source-repo", **common) for tid in ("a", "b")]
+        waiting = [await self.create(tid, repo_id="execution-repo", **common) for tid in ("c", "d")]
+        route = {"id": "runner:current:pi", "runnerId": "current", "clientId": "owner",
+                 "cli": "pi", "online": True}
+        settings = SimpleNamespace(autobatch_enabled=True, autobatch_min=2, autobatch_wait_min=60,
+                                   autobatch_assignee="", autobatch_plugin_key="")
+        with patch.object(autobatch, "get_settings", return_value=settings), \
+             patch.object(ai_exec, "list_assignees_sync", return_value={"agents": [route]}), \
+             patch.object(ai_exec, "resolve_requested_sync", return_value=route), \
+             patch.object(tasks, "_push_task", new=AsyncMock()), \
+             patch.object(tasks, "_settle_work_dir", new=AsyncMock(return_value={"ok": True})), \
+             patch.object(tasks, "_attach_skills", new=AsyncMock()):
+            manual = await self.http.post("/api/v1/tasks/batch-dispatch", json={
+                "taskIds": sources, "repo": {"id": "execution-repo"},
+            })
+            self.assertEqual(manual.status_code, 200, manual.text)
+            async with self.sessions() as session:
+                batch = await session.get(models.Task, manual.json()["batchId"])
+                self.assertEqual((batch.repo_id, batch.status), ("execution-repo", "doing"))
+                result = await autobatch.run_once(session)
+                group, = result["all"]
+                self.assertEqual(group["taskIds"], waiting)
+                self.assertFalse(group["ready"])
+                self.assertIn("没干完的批次", group["reason"])
+                self.assertEqual(result["results"], [])
+        self.assertEqual(len(self.calls), 1)
+
     async def test_autobatch_plugin_preflight_failure_leaves_sources_ready_for_retry(self):
         async with self.sessions() as session:
             session.add_all([
