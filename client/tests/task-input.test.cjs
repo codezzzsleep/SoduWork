@@ -412,6 +412,14 @@ test('request preserves a structured validation message and code without treatin
  } finally {global.fetch=previous;}
 });
 
+test('request preserves a structured conflict message while keeping the general request code', async t => {
+ const detail = {message:'需求附件已变更，请重新预览',error_code:'unbound_or_changed'};
+ t.mock.method(global,'fetch',async()=>Response.json({detail},{status:409}));
+ await assert.rejects(request({hub:'http://fixture'},'/tasks/t/ai-preview',{inputManifest:[]}), {
+  message:detail.message, code:'REQUEST_FAILED', status:409, retryable:false,
+ });
+});
+
 test('model recovery refreshes only the receipt attempt, retaining original task text and attachments', async t => {
  const calls=[];
  t.mock.method(global,'fetch',async(url,options)=>{
