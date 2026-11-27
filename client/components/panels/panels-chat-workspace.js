@@ -66,7 +66,7 @@
     autoPreviewed: false, autoPreviewKey: '',
     active: '', files: [], summaryFiles: [], changes: [], services: [], tabs: [], states: Object.create(null),
     signature: '', seq: 0, epoch: 0, previewKey: '', previewText: '', previewError: '', previewLoading: false,
-    fileChanges: null, editor: null, editorDrafts: Object.create(null), editorDirty: false,
+    fileChanges: null, editor: null, editorDrafts: Object.create(null),
     observer: null, visibilityObserver: null, unlisten: null, unlistenElement: null, nativeShown: '', nativePending: false, frame: 0, nativeRequest: 0,
   };
   const READ_IMAGE_CACHE_BYTES = 64 * 1024 * 1024, READ_IMAGE_CACHE_TABS = 4;
@@ -281,9 +281,8 @@
     // change links still use the editor/diff surface.
     const deliverablePreview = file.primary !== false && ['web', 'markdown', 'image', 'video', 'pdf'].includes(kind);
     const editorFile = !deliverablePreview && (isCodeFile(file) || (kind === 'markdown' && Boolean(change)));
-    const tabKind = editorFile && kind === 'markdown' ? 'text' : kind;
     return addTab({ key: 'file:' + workScope() + ':' + id,
-      kind: tabKind, label: kind === 'web' ? file.title || file.name : file.name, file,
+      kind, label: kind === 'web' ? file.title || file.name : file.name, file,
       // A newly created source file has no meaningful "before" side; open it
       // directly in CodeMirror. Existing edits still open in Diff by default.
       view: editorFile ? (change && change.action !== 'created' ? 'diff' : 'code') : 'preview' }, activate);
@@ -392,7 +391,8 @@
       kind: 'browser', label: '新标签页', url: '' }, true);
   }
   function openFiles() {
-    if (!WB.files.length) return null;
+    if (!WB.files.length && !WB.changes.length) return null;
+    WB.manualClosed = false;
     return addTab({ key: 'files:' + workScope(), kind: 'files', label: '文件' }, true);
   }
   // A settled delivery can refresh its artifact index more than once (for
@@ -478,9 +478,8 @@
     WB.manualClosed = false;
     if (!WB.open) { resetSplit(WB.root); WB.open = true; }
     const change = fileChangeFor(file);
-    const editorFile = isCodeFile(file) || Boolean(change) || kind === 'text';
     addTab({ key: 'file:' + workScope() + ':' + fileKey(file),
-      kind: editorFile && kind === 'markdown' ? 'text' : kind, label: file.name, file,
+      kind, label: file.name, file,
       view: change && change.action !== 'created' ? 'diff' : 'code', autoPreview: false }, true);
     paint();
     return true;
@@ -732,13 +731,14 @@
     }
     if (global.ChatChrome) ChatChrome.workbenchState({
       open: Boolean(WB.open), maximized: Boolean(WB.open && WB.maximized), count, has: Boolean(has),
+      canOpenFiles: Boolean(WB.files.length || WB.changes.length),
       summary: {
         // Pass the full file list; the overlay owns progressive display and its twelve-item initial limit.
         // This keeps list expansion consistent with the total badge.
         files: WB.summaryFiles.map((item) => ({ name: item.name, path: artifactKey(item), size: size(item.size),
           workspace: previewKind(item) !== 'external' })),
         services: WB.services.filter((item) => item.url),
-        changes: WB.changes.slice(-8),
+        changes: WB.changes,
       },
     });
     if (WB.open) scheduleNative(); else hideNative();
@@ -794,7 +794,7 @@
     const signature = scope + '::' + nextFiles.map((item) => artifactKey(item) + ':' + item.at + ':' + item.size + ':' + (item.title || '') + ':' + (item.change?.action || '')).join('|') + '::' +
       nextSummaryFiles.map(artifactKey).join('|') + '::' +
       selection.images.map(item => artifactKey(item) + ':' + Boolean(item.changedInTurn)).join('|') + '::' +
-      nextChanges.map((item) => item.id + ':' + item.state).join('|') + '::' +
+      JSON.stringify(nextChanges.map(item => [item.id, item.action, item.path, item.state])) + '::' +
       (WB.fileChanges?.capturedAt || 0) + '::' +
       nextServices.map((item) => item.id + ':' + item.state + ':' + item.url).join('|');
     if (signature === WB.signature) { scheduleNative(); return; }
@@ -914,7 +914,7 @@
       active: '', files: [], summaryFiles: [], changes: [], services: [],
       tabs: [], states: Object.create(null), signature: '', previewKey: '', previewText: '', previewError: '',
       previewRequest: null, cloudOpenRequest: null, openingTaskFiles: new Set(),
-      previewLoading: false, fileChanges: null, editor: null, editorDrafts: Object.create(null), editorDirty: false,
+      previewLoading: false, fileChanges: null, editor: null, editorDrafts: Object.create(null),
       nativeShown: '', nativePending: false, frame: 0, ...keep,
     });
     if (previousRoot) {
@@ -933,7 +933,10 @@
     _hasVisibleTabs: hasVisibleTabs, _outputMentions: outputMentions, linkifyOutputs,
   });
   function toggleWorkbench() {
-    if (!hasVisibleTabs(WB.tabs)) return;
+    if (!hasVisibleTabs(WB.tabs)) {
+      if (openFiles()) paint();
+      return;
+    }
     WB.open = !WB.open;
     if (!WB.open) WB.maximized = false;
     WB.manualClosed = !WB.open;

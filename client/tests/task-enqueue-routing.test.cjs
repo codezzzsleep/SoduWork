@@ -203,6 +203,16 @@ for (const selection of [{agentId:'local:qwen',model:'shared-model'}, {agentId:'
   });
 }
 
+test('desktop dispatch preserves an explicitly confirmed empty manifest across conversation binding', async () => {
+  const task = ownPendingTask();
+  const f = sameOwnerCreationFixture(task);
+  const inputManifest = [];
+  const result = await f.api.enqueueTask(task.id, {source: 'task-dispatch', agentId: 'local:pi', inputManifest});
+  assert.equal(result.ok, true);
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].options.taskExecution.inputManifest, inputManifest);
+});
+
 for (const kind of ['agent','model']) for (const failure of ['rejected','thrown','wrong-ack','owner','view','request']) {
   test(`${kind} selection ${failure} never creates another conversation or admits the task`, async () => {
     const task = ownPendingTask();

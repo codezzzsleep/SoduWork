@@ -4,12 +4,14 @@ import asyncio
 import errno
 from pathlib import Path
 import stat
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from app.services.runner_admission import AdmissionQueue, INTERACTIVE, MANUAL
+from app.services.runner_admission import AdmissionQueue, INTERACTIVE, MANUAL, ResourceSnapshot
 from app.services.runner_admission_journal import Journal
 from app.services import durable_file
 
@@ -154,8 +156,97 @@ class JournalTests(unittest.TestCase):
         with self.assertRaises(OSError):
             Journal(self.tmp.name, "leased", exclusive=True)
         first.close()
-        replacement = Journal(self.tmp.name, "leased", exclusive=True)
+        replacement = Journal(self.tmp.name, "leased", exclusive=True, boot_id="b" * 32)
+        first.close()
+        with self.assertRaisesRegex(BlockingIOError, f"bootId={'b' * 32}"):
+            Journal(self.tmp.name, "leased", exclusive=True)
         replacement.close()
+
+    def test_cli_and_queue_contention_report_the_same_runner_owner(self):
+        import runner_main
+
+        command = ["runner_main.py", "--id", "owner-probe", "--client", "test-device",
+                   "--hub", "ws://127.0.0.1:1", "--data-root", self.tmp.name]
+        locks = []
+
+        async def check(runner):
+            owner = f"pid={os.getpid()} bootId={runner.boot_id}"
+            journal = runner._admission._journal
+            locks.extend([Path(runner_main._lock_path(runner.id)), journal.root / "owner.lock"])
+            for path in locks:
+                with path.open("rb", buffering=0) as handle:
+                    handle.seek(1)  # The live process holds byte zero on Windows.
+                    self.assertEqual(handle.read().decode().strip(), owner)
+            duplicate = subprocess.run([sys.executable, *command], cwd=Path(__file__).parent,
+                                       capture_output=True, timeout=15)
+            self.assertEqual(duplicate.returncode, 3, duplicate.stderr)
+            self.assertIn(owner.encode(), duplicate.stderr)
+            with self.assertRaisesRegex(BlockingIOError, owner):
+                Journal(Path(self.tmp.name) / "runner-queue", f"{runner.url}|{runner.id}|{runner.client_id}",
+                        exclusive=True)
+
+        with patch.dict(os.environ), patch.object(sys, "argv", command), \
+                patch("app.services.runner_lifecycle.run_until_stopped", check):
+            runner_main.main()
+        for path in locks:
+            self.assertEqual(path.stat().st_size, 1)
+
+    def test_crashed_queue_owner_can_be_replaced_without_stale_identity(self):
+        child = subprocess.run([sys.executable, "-c",
+            "import os, sys; from app.services.runner_admission_journal import Journal; "
+            "q=Journal(sys.argv[1], 'restart', exclusive=True, boot_id='a'*32); os._exit(0)",
+            self.tmp.name], cwd=Path(__file__).parent, capture_output=True, timeout=15)
+        self.assertEqual(child.returncode, 0, child.stderr)
+        replacement = Journal(self.tmp.name, "restart", exclusive=True, boot_id="b" * 32)
+        self.addCleanup(replacement.close)
+        with self.assertRaisesRegex(BlockingIOError, f"pid={os.getpid()} bootId={'b' * 32}"):
+            Journal(self.tmp.name, "restart", exclusive=True)
+
+    def test_legacy_and_malformed_lock_details_remain_private(self):
+        lock_path = Journal(self.tmp.name, "details").root / "owner.lock"
+        lock_path.touch()
+        if os.name != "nt":
+            lock_path.chmod(0o644)
+        holder = Journal(self.tmp.name, "details", exclusive=True)
+        self.addCleanup(holder.close)
+        lock_path = holder.root / "owner.lock"
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
+        for contents in (b"", b"private content\n", b"pid=1 bootId=" + b"a" * 32 + b"\nother"):
+            with lock_path.open("r+b", buffering=0) as record:
+                record.seek(1)
+                record.write(contents)
+                record.truncate()
+            with self.assertRaisesRegex(BlockingIOError, "^Runner lock is already held$"):
+                Journal(self.tmp.name, "details", exclusive=True)
+
+    def test_registration_failure_releases_lock_and_does_not_claim_a_duplicate(self):
+        fdopen = os.fdopen
+
+        def short_write(*args, **kwargs):
+            handle = Mock(wraps=fdopen(*args, **kwargs))
+            handle.write.return_value = 0
+            return handle
+
+        with patch("app.services.runner_admission_journal.os.fdopen", short_write):
+            with self.assertRaisesRegex(OSError, "Incomplete Runner lock registration"):
+                Journal(self.tmp.name, "failed", exclusive=True)
+        Journal(self.tmp.name, "failed", exclusive=True).close()
+
+    @unittest.skipUnless(hasattr(os, "fork"), "POSIX fork inheritance")
+    def test_closing_inherited_handle_leaves_parent_registration(self):
+        holder = Journal(self.tmp.name, "fork", exclusive=True, boot_id="a" * 32)
+        self.addCleanup(holder.close)
+        child = os.fork()
+        if child == 0:
+            try:
+                holder.close()
+            except OSError:
+                os._exit(1)
+            os._exit(0)
+        self.assertEqual(os.waitpid(child, 0)[1], 0)
+        with self.assertRaisesRegex(BlockingIOError, f"pid={os.getpid()} bootId={'a' * 32}"):
+            Journal(self.tmp.name, "fork", exclusive=True)
 
     def test_pruned_terminal_receipt_still_fences_replay_after_restart(self):
         queue = self.queue()
@@ -235,6 +326,168 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(restored.ref, item.ref)
 
 
+class AdmissionStatusTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from app.services import local_base
+        from runner_main import Runner
+        storage = self.enterContext(tempfile.TemporaryDirectory())
+        with patch.object(local_base, "_data_root", return_value=storage):
+            self.runner = Runner("http://127.0.0.1:1", "", "device", "runner", work_root=storage)
+        self.queue = self.runner._admission
+        self.addCleanup(self.queue._journal.close)
+
+    async def test_ten_independent_local_text_turns_reach_native_launch_before_any_reply(self):
+        from app.services import ai_local, runner_local_rpc
+        self.runner._resource_budget.sampler = lambda: {
+            "cpuCount": 8, "cpuPercent": 20, "memoryTotalBytes": 16 << 30, "memoryAvailableBytes": 8 << 30}
+        self.enterContext(patch.dict(ai_local._RUNS, {}, clear=True))
+        self.enterContext(patch.object(ai_local, "reclaim"))
+        self.enterContext(patch("runner_main._capability_gate", return_value=None))
+        self.enterContext(patch("runner_main._busy_count", return_value=0))
+        all_started, release = asyncio.Event(), asyncio.Event()
+        prompts = ["你好", "Create a playable arcade game", "Build an interactive offline website"]
+        started = {}
+        to_thread = runner_local_rpc.to_thread
+
+        async def native_boundary(function, *args, **kwargs):
+            if function is ai_local.dispatch_sync:
+                started[args[1].id] = args[4]["conversationUserText"]
+                if len(started) == 10:
+                    all_started.set()
+                await release.wait()
+                return {"ok": True, "issueId": args[1].id}
+            return await to_thread(function, *args, **kwargs)
+
+        self.enterContext(patch.object(runner_local_rpc, "to_thread", native_boundary))
+        try:
+            receipts = await asyncio.gather(*(self.runner._local_rpc_dispatch({
+                "op": "job.dispatch", "dispatchId": f"chat:{i}", "task": {"id": f"chat-{i}"},
+                "ctx": {"conversationMode": "adaptive", "conversationUserText": prompts[i % len(prompts)]}
+            }) for i in range(10)))
+            self.assertTrue(all(receipt["ok"] for receipt in receipts), receipts)
+            await asyncio.wait_for(all_started.wait(), timeout=5)
+            self.assertEqual(set(started.values()), set(prompts))
+            self.assertEqual(self.queue.metrics()["queueDepth"], 0)
+        finally:
+            release.set()
+            if self.runner._admission_task:
+                self.runner._admission_task.cancel()
+                await asyncio.gather(self.runner._admission_task, return_exceptions=True)
+            await asyncio.gather(*self.runner._admission_workers)
+
+    def test_plain_chat_can_pass_a_busy_preparation_but_never_its_own_earlier_turn(self):
+        from app.services.runner_event_scope import ingress
+        def submit(key, ref, local=True, **extra):
+            payload = ingress({"op": "job.comment", "text": "hello", **extra}, local=local)
+            return self.queue.submit(key, ref, INTERACTIVE, "comment", payload)[2]
+
+        def claim(active):
+            return self.queue.claim_next(active, limit=1, can_start=True, local_chat_limit=3)
+
+        first = submit("file-1", "one", localFiles=[{"filename": "one.txt"}])
+        self.assertIs(claim(0), first)
+        remote = submit("hub", "hub", local=False)
+        second = submit("file-2", "two", localFiles=[{"filename": "two.txt"}])
+        submit("followup", "two")
+        plain = submit("plain", "three")
+        self.assertIs(claim(1), plain)
+        self.assertIsNone(claim(2))
+        self.assertEqual(self.queue.wait_reason(second, 2, 1, True, local_chat_limit=3), "execution_slot")
+        self.assertEqual(self.queue.wait_reason(remote, 2, 1, True, local_chat_limit=3), "execution_slot")
+        self.queue.mark_running(first.key)
+        self.assertIs(claim(2), second)
+        submit("extra", "four")
+        self.assertIsNone(claim(3))
+
+    def test_start_budget_keeps_pressure_guards_and_configured_ceiling(self):
+        healthy = ResourceSnapshot(limit=4, memory_available=8 << 30)
+        self.assertEqual(healthy.local_chat_limit(3, 10), 3)
+        self.assertGreaterEqual(healthy.local_chat_limit(20, 0), 10)
+        self.assertEqual(ResourceSnapshot(limit=4).local_chat_limit(20, 3), 7)
+        for pressure, can_start in (("busy", True), ("critical", True), ("critical", False)):
+            sample = ResourceSnapshot(limit=1, pressure=pressure, can_start=can_start)
+            self.assertEqual(sample.local_chat_limit(20, 10), 1)
+
+    async def test_pressure_logs_once_while_the_same_backlog_remains_blocked(self):
+        from app.services import ai_local
+        self.queue.submit("dispatch:waiting", "waiting", MANUAL, "dispatch", {})
+        memory_pressure = ResourceSnapshot(cpu_percent=98, memory_available=700 * 1024 ** 2,
+                                           pressure="critical", can_start=False)
+        with patch.object(self.runner._resource_budget, "snapshot", return_value=memory_pressure), \
+                patch.object(ai_local, "reclaim"), patch.dict(ai_local._RUNS, {}, clear=True), \
+                patch.object(self.runner._admission_wake, "wait", side_effect=[True, asyncio.CancelledError]), \
+                self.assertLogs("runner", level="WARNING") as logged:
+            with self.assertRaises(asyncio.CancelledError):
+                await self.runner._admission_loop()
+        self.assertEqual([r.getMessage() for r in logged.records],
+                         ["admission paused: pressure=critical cpu=98.0 mem_available_mib=700 queued=1"])
+
+    def test_budget_logs_changes_in_start_permission_under_critical_pressure(self):
+        budget = self.runner._resource_budget
+        sample = {"cpuPercent": 100, "memoryTotalBytes": 16 * 1024 ** 3,
+                  "memoryAvailableBytes": 8 * 1024 ** 3}
+        budget.sampler = lambda: sample
+        with patch("app.services.runner_admission.time.monotonic", side_effect=[100, 101, 102, 103, 104]), \
+                self.assertLogs("app.services.runner_admission", level="INFO") as captured:
+            for available in (8 * 1024 ** 3,) * 3 + (64 * 1024 ** 2,) * 2:
+                sample["memoryAvailableBytes"] = available
+                budget.snapshot(force=True)
+        messages = [record.getMessage() for record in captured.records]
+        self.assertEqual(len(messages), 3, messages)
+        for message, allowed in zip(messages, (False, True, False)):
+            self.assertIn(f"pressure=critical canStart={allowed} limit=1", message)
+
+    async def test_only_first_durable_dispatch_logs_its_ref_and_position(self):
+        from app.services import dispatch_identity
+        message = {"op": "job.dispatch", "dispatchId": "private-business-id", "brief": "private prompt"}
+        ref = dispatch_identity.execution_ref(message["dispatchId"])
+        with patch.object(self.runner, "_ensure_admission_loop"), patch("runner_main._capability_gate", return_value=None):
+            with self.assertLogs("runner", level="INFO") as logged:
+                first = await self.runner._job(message)
+                replay = await self.runner._job(message)
+        self.assertEqual([record.getMessage() for record in logged.records],
+                         [f"dispatch accepted ref={ref} queuePosition=1"])
+        self.assertEqual(first["data"]["queuePosition"], 1)
+        self.assertTrue(replay["data"]["duplicate"])
+        self.assertEqual(AdmissionQueue(journal=self.queue._journal).get("dispatch:" + ref).ref, ref)
+
+    async def test_status_and_info_report_only_the_current_admission_gate(self):
+        from app.services import ai_local
+        item = self.queue.submit("dispatch:first", "first", MANUAL, "dispatch", {})[2]
+        resource = ResourceSnapshot(limit=2, can_start=False)
+        self.enterContext(patch.object(self.runner._resource_budget, "snapshot", return_value=resource))
+        busy = self.enterContext(patch("runner_main._busy_count", return_value=0))
+        self.enterContext(patch.dict(ai_local._RUNS, {}, clear=True))
+
+        async def check(reason=None):
+            for op in ("job.status", "job.info"):
+                data = (await self.runner._job({"op": op, "ref": item.ref}))["data"]
+                if reason is None:
+                    self.assertNotIn("waitReason", data, op)
+                else:
+                    self.assertEqual(data.get("waitReason"), reason, op)
+
+        await check("resource_pressure")
+        resource.can_start = True
+        await check()
+        busy.return_value = 1  # Only the slot reserved for interactive work is free.
+        await check("execution_slot")
+        self.runner._outbox_blocked = True
+        await check()
+        self.runner._outbox_blocked = False
+        ai_local._RUNS[item.ref] = {"state": "running"}
+        await check()
+        ai_local._RUNS.clear()
+        self.queue.submit("chat", "other", INTERACTIVE, "comment", {})
+        await check()
+        self.queue.finish("chat", "completed")
+        self.assertEqual(self.queue.claim_next(0, 2, True).key, item.key)
+        resource.can_start = False
+        await check()
+        self.queue.finish(item.key, "completed")
+        await check()
+
+
 class ConcurrentCommentTests(unittest.IsolatedAsyncioTestCase):
     async def test_same_id_different_input_cannot_both_pass_async_validation(self):
         from app.services import local_base, runner_comments, runner_turn_selection
@@ -306,7 +559,8 @@ class RunnerStopReceiptTests(unittest.IsolatedAsyncioTestCase):
     async def test_restart_failed_stop_keeps_same_session_fence(self):
         from app.services import ai_local
         stop = Mock(return_value={"ok": False, "error": "kill denied"})
-        self.runner._resource_budget = SimpleNamespace(snapshot=lambda: SimpleNamespace(limit=1, can_start=False))
+        self.runner.concurrency_ceiling = 1
+        self.runner._resource_budget = SimpleNamespace(snapshot=lambda: ResourceSnapshot(limit=1, can_start=False))
         with patch.object(ai_local, "reclaim"), patch.dict(ai_local._RUNS, {
             "session": {"state": "running", "admissionKey": "first"}}, clear=True), \
                 patch("app.services.local_stream.stop_sync", stop):

@@ -101,6 +101,55 @@ if (typeof electron === 'string') {
     await sleep(180);
     assert.equal(await js('document.querySelectorAll("[data-chat-summary-body] button").length'), 0, 'opening history must not relabel it as current work');
     fs.writeFileSync(path.join(out, 'historical-preview.png'), (await win.webContents.capturePage()).toPNG());
+    const reads = [
+      { id: 'first-attempt', name: 'read', args: { path: 'docs/image.png' }, state: 'error', isError: true, result: 'ENOENT: file missing' },
+      { id: 'different-file', name: 'read', args: { path: 'other/image.png' }, state: 'done' },
+      { id: 'second-attempt', name: 'read_file', args: { file_path: 'docs/image.png' }, state: 'done' },
+      { id: 'write-only', name: 'write', args: { path: 'docs/image.png' }, state: 'done' },
+    ];
+    await js('fixtureContext.snapshot={tools:' + JSON.stringify(reads) + '};ChatChrome.setWorkspace({dir:' + JSON.stringify(cwd) + '});ChatChrome.openSummary()');
+    await click('[data-chat-read-log] summary');
+    await click('[data-chat-read-filter]');
+    await win.webContents.insertText('docs/image.png');
+    const readRows = () => js('Array.from(document.querySelectorAll("[data-chat-read-results] li"), row => row.textContent)');
+    assert.deepEqual(await readRows(), ['docs/image.png读取成功 second-attempt', 'docs/image.png读取失败 ENOENT first-attempt']);
+    assert.equal(await js('document.querySelector("[data-chat-read-cwd]").textContent'), cwd);
+    await win.webContents.insertText('.absent');
+    assert.deepEqual(await readRows(), []);
+    assert.equal(await js('document.querySelector("[data-chat-read-empty]").hidden'), false);
+    await js('ChatChrome.identify("next-chat");fixtureContext.snapshot={tools:[]};ChatChrome.openSummary()');
+    assert.equal(await js('document.querySelector("[data-chat-read-filter]").value'), '');
+    assert.deepEqual(await readRows(), []);
+    report.cases.push('Path filtering shows separate failed and successful read receipts and clears evidence on a chat switch.');
+    const modifications = Array.from({length: 10}, (_, index) => ({
+      id: 'change-' + index, after: 0, name: index ? 'edit' : 'write',
+      args: { path: index + '/notes.txt' }, state: index === 3 ? 'cancelled' : index === 7 ? 'error' : 'done',
+    }));
+    const changeTurn = {messages: [{role: 'user', text: 'Update the project'}], tools: modifications};
+    await js(`ChatWorkbench.reset();ChatWorkbench.bind(fixtureRoot,contextValue);
+      const transcript = fixtureRoot.querySelector('.nchat-content-area');
+      for(const tool of ${JSON.stringify(modifications)}) {
+        const row=document.createElement('div'), button=document.createElement('button');
+        row.dataset.toolNode=tool.id;button.dataset.tool=tool.id;button.textContent=tool.args.path;
+        button.onclick=()=>window.selectedTool=tool.id;row.append(button);transcript.append(row);
+      }
+      ChatWorkbench.render(fixtureRoot,${JSON.stringify(changeTurn)},[]);ChatChrome.openSummary();void 0`);
+    assert.equal(await js('ChatWorkbench.state().has'), false);
+    assert.equal(await js('document.querySelector("[data-chat-summary-pop] [data-wb-files]")'), null);
+    assert.equal(await js('document.querySelector("[data-chat-changes]")'), null);
+    const latest = '[data-chat-summary-body] [data-wb-tool="change-9"]';
+    assert.match(await js('document.querySelector(' + JSON.stringify(latest) + ').textContent'), /10 处/);
+    await click(latest);
+    assert.equal(await js('selectedTool'), 'change-9');
+    await click('[data-chat-pane]');
+    assert.equal(await js('ChatWorkbench.state().open'), true);
+    assert.equal(await js('document.querySelector(".ncw-files-empty")?.textContent'), '本次对话还没有可查看的文件。');
+    await js('ChatWorkbench.reset();ChatWorkbench.bind(fixtureRoot,contextValue);ChatWorkbench.render(fixtureRoot,' +
+      JSON.stringify(changeTurn) + ',files);void 0');
+    assert.equal(await js('ChatWorkbench.state().has'), false);
+    await click('[data-chat-pane]');
+    assert.equal(await js('document.querySelectorAll(".ncw-files [data-wb-file]").length'), 2);
+    report.cases.push('The original summary count navigates to the latest modification. The existing pane toggle opens the file index without a tab, including its empty state.');
     assert.deepEqual(report.errors, []);
     report.ok = true;
   }).catch(error => { report.error = String(error.stack || error); }).finally(() => {

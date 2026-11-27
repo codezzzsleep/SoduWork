@@ -24,6 +24,48 @@ const agent = (key, extra = {}) => ({key, name: key, available: true, ...extra})
 const flow = (bindingId, extra = {}) => ({bindingId, name: bindingId, runnable: true,
   selectionSource: 'installed', workflow: [{type: 'ai', route: {agentSource: 'runtime'}}], ...extra});
 
+test('a previously confirmed preview blocks direct dispatch when a fallback Hub cannot verify it', async () => {
+  const manifest = [{id: 'a', name: 'brief.txt', size: 0, sha256: 'fixture'}];
+  const h = fixture({}, {SoduWorkAPI: {aiPreview: async () => ({
+    carried: {files: [], inputManifest: manifest, confirmedDispatch: true}})}});
+  const box = {style: {}};
+  h.nodes.set('fwdPrev', box);
+  h.run("_fwdTaskId = 'task'");
+  h.ctx._pickedRepo = () => null;
+
+  await h.ctx._fwdPreview('task');
+  assert.equal(box.confirmedInputs.manifest, manifest);
+  h.ctx.SoduWorkAPI.aiPreview = async () => ({carried: {files: ['brief.txt']}});
+  await h.ctx._fwdPreview('task');
+  assert.equal(box.confirmedInputs.manifest, undefined);
+  assert.match(box.confirmedInputs.error, /重新预览/);
+
+  delete box.confirmedInputs;
+  h.ctx.SoduWorkAPI.aiPreview = async () => ({carried: {files: ['brief.txt'], inputManifest: manifest}});
+  await h.ctx._fwdPreview('task');
+  assert.equal(box.confirmedInputs, undefined);
+  assert.match(box.innerHTML, /你可以直接派发/);
+});
+
+test('a delayed attachment preview cannot overwrite a newer confirmation', async () => {
+  let finishFirst;
+  const before = new Promise(resolve => { finishFirst = resolve; });
+  const h = fixture({}, {SoduWorkAPI: {aiPreview: () => before}});
+  const box = {style: {}};
+  h.nodes.set('fwdPrev', box);
+  h.run("_fwdTaskId = 'task'");
+  h.ctx._pickedRepo = () => null;
+  const first = h.ctx._fwdPreview('task');
+  const manifest = [];
+  h.ctx.SoduWorkAPI.aiPreview = async () => ({carried: {files: [], inputManifest: manifest, confirmedDispatch: true}});
+  await h.ctx._fwdPreview('task');
+  const rendered = box.innerHTML;
+  finishFirst({carried: {files: ['stale']}});
+  await first;
+  assert.equal(box.confirmedInputs.manifest, manifest);
+  assert.equal(box.innerHTML, rendered);
+});
+
 test('assignment picker renders untrusted catalog names, identifiers and diagnostics as escaped text', () => {
   const definition = fs.readFileSync(path.join(__dirname, '../core/store.js'), 'utf8')
     .split(/\r?\n/).find(line => line.startsWith('const esc='));

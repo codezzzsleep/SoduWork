@@ -39,12 +39,17 @@ async function _dispatchAITo(tid, who, name) {
   _fwdSetStatus('正在等待执行端接单…');
   try {
     const repo = _pickedRepo();
+    const preview = document.getElementById('fwdPrev')?.confirmedInputs;
+    if (preview && (preview.taskId !== _fwdId(tid) || !Array.isArray(preview.manifest))) {
+      throw new Error(preview.error || '请先重新预览需求附件');
+    }
     const executionContext = window.TaskExecutionClient
       ? TaskExecutionClient.context({...(_fwdOptions || {}), substrates:_fwdDirectAgents()}, {
         strategy: 'direct', agentId: who.id, substrateKey: who.id,
         repoId: repo && repo.id, model: model,
-      }) : null;
-    const result = await SoduWorkAPI.dispatchToAI(tid, who, brief.trim(), repo, model, executionContext, _fwdSubmissionMode());
+      }) : preview ? {strategy: 'direct'} : null;
+    const result = await SoduWorkAPI.dispatchToAI(tid, who, brief.trim(), repo, model, executionContext,
+      _fwdSubmissionMode(), preview?.manifest);
     if (!window.RequirementAssignment.inScope(scope)) return;
     if (!result || result.ok === false) {
       const error = new Error((result && (result.reason || result.error || result.message)) ||

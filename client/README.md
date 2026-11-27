@@ -6,6 +6,10 @@ Command examples use `sh start.sh` on macOS/Linux. On Windows, use `.\start.cmd`
 
 The desktop uses Electron and native HTML/CSS/JavaScript. The React management UI is a separate application.
 
+Before your first message, the composer checks the selected runtime and chat model. Use the action beside a missing setting, then return to your draft. The Hub overview can open runtime and model settings in the installed desktop app. While the composer is open, it reports whether those selections are ready for the signed-in account.
+
+The chat model picker retries a timed-out catalog read once and shows a reload action if loading fails or no models are available. A send timeout preserves your input; a later catalog response can update the picker but never sends the message automatically. Reload the list, select an available model, and send again.
+
 ## Build a different default Hub
 
 Normal builds still default to `https://service.soduwork.ai`. To build for another
@@ -33,7 +37,7 @@ Keep downloads from different environments in separate directories. Deployment
 uploads the original installers with signed update manifests to the selected Hub;
 see [the release workflow](../.github/RELEASE.md#on-demand-client-packages).
 
-Local library imports retain file extensions and reserve room for duplicate-name counters. For files saved by older versions, a **Check file name** hint identifies duplicate, invalid, or potentially truncated names; the hint does not mean the file contents are damaged. In the item's menu, choose **Repair file name** and confirm the full name, including the correct extension. This replaces an incorrect suffix as well as a missing one, while preserving the item's ID, contents, source, and folder. Ordinary **Rename** continues to preserve the existing extension. The repair action is available for all local files, including entries whose names were already changed manually, and is not available for remote storage.
+Local library imports retain extensions and reserve room for duplicate-name counters. To correct a truncated legacy file name, choose **Rename** and enter the complete name, including its extension. Confirmed corrections preserve the item's ID, contents, source and folder. Renaming an ordinary file continues to preserve its extension.
 
 The original extension cannot always be recovered from old metadata, so the client never guesses it or rewrites names automatically. Consult the original file or source before confirming. If the correct name is unknown, export a copy for inspection. Duplicate entries retain independent contents and can be repaired to distinct names. Repairing a name does not convert the file format or allow executables to bypass the system-open restrictions.
 
@@ -163,7 +167,7 @@ npm start
 
 Use Node.js 22.19+. A separately started client retains its own profile and Hub connection settings. See the [developer guide](../docs/development.en.md) for service addresses and profile isolation.
 
-The root source launcher prepares both Hub and Runner dependencies in its private `venv/` and explicitly binds the generated desktop to that Python interpreter. For independent `npm start` development, activate `../hub-backend/.venv` and run `python -m pip install -r ../hub-backend/requirements-runner.txt -c ../hub-backend/requirements.txt Pillow` from `client/`. Pillow validates generated images before the desktop publishes them. Both paths execute the current backend source; do not substitute a Runner copied from an old release.
+The root source launcher prepares both Hub and Runner dependencies in its private `venv/` and explicitly binds the generated desktop to that Python interpreter. For independent `npm start` development, activate `../hub-backend/.venv` and run `python -m pip install -r ../hub-backend/requirements-runner.txt -r ../hub-backend/requirements-image.txt` from `client/`. Pillow validates generated images before the desktop publishes them. Both paths execute the current backend source; do not substitute a Runner copied from an old release.
 
 Run `npm test` for unit/contract tests and `npm run check:layout` for source boundaries. Inspect the requirements of each `e2e/` script before using it. Fixture success does not establish real-model or production acceptance.
 

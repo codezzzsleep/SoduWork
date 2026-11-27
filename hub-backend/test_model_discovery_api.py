@@ -72,23 +72,63 @@ class ModelDiscoveryEndpointTests(unittest.IsolatedAsyncioTestCase):
         from app.services import model_discovery
         calls = []
 
-        async def fake_discover(base, key, kind="openai-compat"):
-            calls.append((base, key, kind))
-            return {"ok": True, "models": ["known-model", "fresh-a", "fresh-b"],
-                    "path": "/models", "detail": ""}
+        def upstream_response(request):
+            calls.append((request.method, str(request.url), request.headers["Authorization"]))
+            return httpx.Response(200, json={"data": [
+                {"id": "known-model", "output": "text"}, {"id": "fresh-a"},
+                {"id": "fresh-b", "output": "decision"}]})
 
-        original = model_discovery.discover
-        model_discovery.discover = fake_discover
-        try:
+        upstream = httpx.AsyncClient(transport=httpx.MockTransport(upstream_response))
+        with patch.object(model_discovery.httpx, "AsyncClient", return_value=upstream):
             resp = await self.request("POST", "/model-providers/good/discover")
-        finally:
-            model_discovery.discover = original
         self.assertEqual(resp.status_code, 200, resp.text)
         body = resp.json()
         self.assertTrue(body["ok"])
         self.assertEqual(body["models"], ["fresh-a", "fresh-b"])
         self.assertEqual(body["known"], ["known-model"])
-        self.assertEqual(calls, [("https://gw.example/v1", "k", "openai-compat")])
+        self.assertEqual(body["candidates"], [{"id": "fresh-a", "purposes": [], "status": "unknown"},
+                                             {"id": "fresh-b", "purposes": [], "status": "unsupported"}])
+        self.assertEqual(body["counts"], {"total": 3, "chat": 1, "unknown": 1})
+        self.assertEqual(calls, [("GET", "https://gw.example/v1/models", "Bearer k")])
+
+    async def test_automatic_window_keeps_manual_and_provider_values_separate(self):
+        from app.services import model_catalog, model_discovery
+        name = "known-model"
+        upstream = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(
+            200, json={"data": [{"id": name, "context_length": "1048576"}]})))
+        with patch.object(model_discovery.httpx, "AsyncClient", return_value=upstream):
+            found = (await self.request("POST", "/model-providers/good/discover?model=" + name)).json()
+        advertised = found["candidates"][0]["advertisedContextWindow"]
+        self.assertEqual(advertised, 1048576)
+
+        async def catalog_row():
+            rows = (await self.request("GET", "/model-catalog")).json()["models"]
+            return next(row for row in rows if row["id"] == "good:" + name)
+
+        async def save(**fields):
+            row = await catalog_row()
+            return await self.request("PUT", "/model-defs", json={
+                "providerId": "good", "name": name, "expectedRevision": row["revision"], **fields})
+
+        self.assertEqual((await save(advertisedContextWindow=advertised,
+                                     discoveryProviderRevision="stale")).status_code, 409)
+        self.assertEqual((await save(ctxWindow=0, advertisedContextWindow=advertised,
+                                     discoveryProviderRevision=found["providerRevision"])).status_code, 200)
+        self.assertEqual((await save(label="renamed")).status_code, 200)
+        row = await catalog_row()
+        self.assertEqual((row["configuredContextWindow"], row["ctxWindow"], row["contextWindowSource"]),
+                         (0, advertised, "upstream"))
+        async with self.sessions() as session:
+            runtime = await model_catalog.resolve(session, None, name, provider_id="good")
+            self.assertEqual((runtime["contextWindow"], runtime["contextWindowSource"]), (advertised, "upstream"))
+        self.assertEqual((await save(ctxWindow=64000)).status_code, 200)
+        row = await catalog_row()
+        self.assertEqual((row["ctxWindow"], row["contextWindowSource"]), (64000, "configured"))
+        changed = await self.request("PUT", "/model-providers/good", json={
+            "baseUrl": "https://changed.example/v1", "expectedRevision": found["providerRevision"]})
+        self.assertEqual(changed.status_code, 200, changed.text)
+        row = await catalog_row()
+        self.assertEqual((row["configuredContextWindow"], row["advertisedContextWindow"]), (64000, None))
 
     async def test_discovery_never_writes_model_rows(self):
         from app.services import model_discovery
@@ -103,7 +143,9 @@ class ModelDiscoveryEndpointTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unsaved_connection_uses_draft_values_without_writing(self):
         from app.services import model_discovery
-        result = {"ok": True, "models": ["fixture-model"], "path": "/v1/models", "detail": ""}
+        result = {"ok": True, "models": ["fixture-model"], "path": "/v1/models", "detail": "",
+                  "candidates": [{"id": "fixture-model", "purposes": [], "status": "unknown"}],
+                  "counts": {"total": 1, "chat": 0, "unknown": 1}}
         draft = {"kind": "anthropic", "baseUrl": "https://draft.example", "apiKey": "draft-key"}
         with patch.object(model_discovery, "discover", AsyncMock(return_value=result)) as discover:
             response = await self.request("POST", "/model-providers/test-connection", json=draft)

@@ -1,8 +1,8 @@
 """Public module behavior and service contracts."""
 from __future__ import annotations
 
-import json
 import copy
+import json
 import logging
 import os
 import re
@@ -12,34 +12,69 @@ import time
 import uuid
 from types import SimpleNamespace
 
-# Re-export the same shared objects imported from local_base.
-# ai_exec uses ai_local._RUNS for routing, so object identity must be preserved.
-from .local_base import (_CTX_WINDOW_DEFAULT, _LOCK, _PROFILES, _RUNS, _STORE,  # noqa: F401
-                         _cfg_profile, _data_root, _env_for, _workspace_root,
-                         _opencode_bin)
-from .local_base import (_load_baseline, _read_events, _record_event, _save_baseline, _save_meta,  # noqa: F401
-                         _pid_alive, _store_dir, raw_tail_sync, reclaim,
-                         _friendly, ctx_pct)
-from .local_stream import _kill_tree, _spawn, _window_for  # noqa: F401
-from .local_stream import _OVERFLOW_PAT, _learn_window  # noqa: F401 - Overflow detection is also used by audit scripts.
-from .local_stream import comment_sync, is_running, stop_sync  # noqa: F401 - Part of the provider contract.
-from . import agent_naming, declared_outputs, dispatch_identity, execution_policy, conversation_plugins, access_policy
-from .local_ctx import _note, _try_compact  # noqa: F401
-from . import ai_prompts   # Product instructions shared across execution providers.
-from . import local_artifacts, runner_usage_receipts
+from . import (
+    access_policy,
+    agent_naming,
+    ai_prompts,  # Product instructions shared across execution providers.
+    artifact_bytes,
+    conversation_plugins,
+    declared_outputs,
+    dispatch_identity,
+    execution_policy,
+    local_artifacts,
+    runner_usage_receipts,
+)
 from .local_artifacts import (
+    _ART_CAP,
+    _BUNDLE_MAX_BYTES,
+    _BUNDLE_PREFIX,
     _SKIP_DIRS,
     _SKIP_NAMES,
     _SKIP_PREFIX,
     _SKIP_SUFFIX,
-    _is_noise,
-    _snapshot,
-    _ART_CAP,
-    _BUNDLE_PREFIX,
-    _BUNDLE_MAX_BYTES,
     _fresh_entries,
-    _safe_work_file,
+    _is_noise,
     _rel_name,
+    _safe_work_file,
+    _snapshot,
+)
+
+# Re-export the same shared objects imported from local_base.
+# ai_exec uses ai_local._RUNS for routing, so object identity must be preserved.
+# Audit scripts use overflow detection, and stream controls are part of the provider contract.
+from .local_base import (  # noqa: F401
+    _CTX_WINDOW_DEFAULT,
+    _LOCK,
+    _PROFILES,
+    _RUNS,
+    _STORE,
+    _cfg_profile,
+    _data_root,
+    _env_for,
+    _friendly,
+    _load_baseline,
+    _opencode_bin,
+    _pid_alive,
+    _read_events,
+    _record_event,
+    _save_baseline,
+    _save_meta,
+    _store_dir,
+    _workspace_root,
+    ctx_pct,
+    raw_tail_sync,
+    reclaim,
+)
+from .local_ctx import _note, _try_compact  # noqa: F401
+from .local_stream import (  # noqa: F401
+    _OVERFLOW_PAT,
+    _kill_tree,
+    _learn_window,
+    _spawn,
+    _window_for,
+    comment_sync,
+    is_running,
+    stop_sync,
 )
 
 log = logging.getLogger("uvicorn.error")
@@ -824,15 +859,37 @@ def _bundle_artifact(run: dict, entries: list[tuple[str, float]]) -> dict | None
 
 
 
-def status_sync(cfg: dict, ref: str) -> dict:
+def status_sync(cfg: dict, ref: str, *, read_only: bool = False) -> dict:
     from . import local_task_goal
     with _LOCK:
         run = _RUNS.get(ref)
-        metadata = ({runner_usage_receipts.PRIVACY_MARKER: runner_usage_receipts.private_model(run),
+        if not run:
+            return {"ok": False, "error": "本地会话不在了"}
+        # Capture the displayed messages with their round before reading files.
+        lines = run.get("lines") or []
+        comments = len(lines)
+        last = " / ".join(item.get("text", "")[:80] for item in lines[-3:])
+        final_text = ""
+        for item in reversed(lines):
+            if item.get("kind") == "say":
+                final_text = str(item.get("full") or item.get("text") or "").strip()[:20000]
+                if final_text:
+                    break
+        metadata = {runner_usage_receipts.PRIVACY_MARKER: runner_usage_receipts.private_model(run),
+                     'status': access_policy.visible_state(run),
+                     'running': run['state'] == 'running', 'done': run['state'] != 'running',
+                     'access': access_policy.snapshot(run),
+                     'segment': int(run.get('segment') or 1),
+                     'round': int(run.get('round') or 1),
+                     'admissionKey': str(run.get('admissionKey') or ''),
                      'error': run.get('error') or '',
-                     'contextReport': copy.deepcopy(run.get('contextReport') or {})} if run else {})
-    if not run:
-        return {"ok": False, "error": "本地会话不在了"}
+                     'failureKind': run.get('failureKind') or '',
+                     'failurePath': run.get('failurePath') or '',
+                     'goal': copy.deepcopy({'taskGoal': local_task_goal.snapshot(run)}
+                         if run.get('goalContract') and run.get('cli') != 'pi' else {}),
+                     'policyGuard': execution_policy.guard_status(run.get('executionPolicy'),
+                         run.get('executionPolicyState'), run.get('executionPolicyViolation')),
+                     'contextReport': copy.deepcopy(run.get('contextReport') or {})}
     artifact_mode = str(run.get("artifactMode") or ("git" if run.get("codeTask") else "files"))
     code_task = artifact_mode == "git"
     # When the remote branch is authoritative, skip full repository snapshots and ZIP creation.
@@ -845,51 +902,52 @@ def status_sync(cfg: dict, ref: str) -> dict:
             by_path[str(rel).replace("\\", "/")] = (rel, mtime)
         entries = sorted(by_path.values(), key=lambda item: (-(item[1] or 0), item[0]))
     files = [rel for rel, _m in entries]
-    bundle = _bundle_artifact(run, entries) if entries else None
+    bundle = _bundle_artifact(run, entries) if entries and not read_only else None
     room = _ART_CAP - (1 if bundle else 0)
     shown = files[:max(0, room)]
     hidden = max(0, len(files) - len(shown))
-    with _LOCK:
-        run["artDropped"] = 0 if bundle else hidden
+    dropped = 0 if bundle else hidden
+    if not read_only:
+        with _LOCK:
+            run["artDropped"] = dropped
     # Office/files tasks have no branch delivery. Running Git in their temp folders
     # only adds latency and used to trigger the Runner worker-pool storm.
-    git_delivery = _git_delivery(run) if artifact_mode in {"git", "mixed"} else {}
+    git_delivery: dict = {}
+    if artifact_mode in {"git", "mixed"}:
+        git_delivery = (run.get("gitDelivery") or {}) if read_only else _git_delivery(run)
     from . import workspace_guard
     guard = workspace_guard.evaluate(run["ws"], run.get("workspaceGuard"))
-    says = [str(item.get("full") or item.get("text") or "").strip()
-            for item in (run.get("lines") or []) if item.get("kind") == "say"]
-    final_text = next((text for text in reversed(says) if text), "")[:20000]
     attachments = ([{"id": bundle["id"], "filename": bundle["filename"]}] if bundle else [])
     attachments += [{"id": f, "filename": _rel_name(f)} for f in shown]
     return {
-        "ok": True, "status": access_policy.visible_state(run), "title": run.get("title") or "",
-        **access_policy.snapshot(run),
+        "ok": True, "status": metadata['status'], "title": run.get("title") or "",
+        **metadata['access'],
         "identifier": "LOCAL-" + ref[:8],
         # Context segments and semantic work rounds are different: compression may
         # open a segment, while every accepted follow-up starts a new artifact round.
-        "segment": int(run.get("segment") or 1),
-        "round": int(run.get("round") or 1),
-        "admissionKey": str(run.get("admissionKey") or ""), "turnCorrelationVersion": 1,
-        "running": run["state"] == "running",
+        "segment": metadata['segment'],
+        "round": metadata['round'],
+        "admissionKey": metadata['admissionKey'], "turnCorrelationVersion": 1,
+        "running": metadata['running'],
         # Expose the provider completion signal used to advance the plugin DAG.
         # Otherwise a successfully exited session can remain stuck in running state.
-        "done": run["state"] != "running",
-        "comments": len(run.get("lines") or []),
-        "last": " / ".join(x.get("text", "")[:80] for x in (run.get("lines") or [])[-3:]),
+        "done": metadata['done'],
+        "comments": comments,
+        "last": last,
         # Stable cross-CLI result contract: only the last completed assistant message
         # counts as text delivery. Tool output and progress lines never satisfy it.
         "finalText": final_text,
         "error": metadata['error'],
         runner_usage_receipts.PRIVACY_MARKER: metadata[runner_usage_receipts.PRIVACY_MARKER],
-        "failureKind": run.get("failureKind") or "",
-        "failurePath": run.get("failurePath") or "",
-        **({"taskGoal": local_task_goal.snapshot(run)} if run.get("goalContract") and run.get("cli") != "pi" else {}),
+        "failureKind": metadata['failureKind'],
+        "failurePath": metadata['failurePath'],
+        **metadata['goal'],
         # Identify outputs by paths relative to this execution's workspace.
         # Keep relative paths in filenames as well.
         # Preserve website directory structure so extracted HTML can resolve styles and assets.
         "attachments": attachments,
         # Report the number of outputs omitted by the cap.
-        "artifactsDropped": int(run.get("artDropped") or 0),
+        "artifactsDropped": dropped,
         "artifactsBundled": int(bundle.get("files") or 0) if bundle else 0,
         "artifactsHidden": hidden if bundle else 0,
         "artifactUrl": "",
@@ -901,9 +959,7 @@ def status_sync(cfg: dict, ref: str) -> dict:
         "gitDeliveryPending": bool(git_delivery.get("_pending")),
         "contextReport": metadata['contextReport'],
         "workspaceGuard": guard,
-        "executionPolicyGuard": execution_policy.guard_status(
-            run.get("executionPolicy"), run.get("executionPolicyState"),
-            run.get("executionPolicyViolation")),
+        "executionPolicyGuard": metadata['policyGuard'],
     }
 
 
@@ -950,6 +1006,9 @@ def session_sync(cfg: dict, ref: str, since: int = 0, limit: int = 400) -> dict:
         if run:
             mem = list(run.get("lines") or [])
             state, seq = run.get("state"), int(run.get("seq") or 0)
+            # Archive hydration may overlap settlement or a new turn. Keep the
+            # response's status, diagnostics and controls on this captured turn.
+            visible_state, access = access_policy.visible_state(run), access_policy.snapshot(run)
             pct, seg = ctx_pct(run), run.get("segment", 1)
             round_no = int(run.get("round") or 1)
             admission_key = str(run.get("admissionKey") or "")
@@ -964,6 +1023,13 @@ def session_sync(cfg: dict, ref: str, since: int = 0, limit: int = 400) -> dict:
             cli = run.get("cli") or ""
             cli_name = (_PROFILES.get(cli) or {}).get("name") or cli
             cli_sid, model = run.get("cliSid") or "", run.get("model") or ""
+            reasoning_effort = str(run.get("reasoningEffort") or "")
+            usage = copy.deepcopy(dict(run.get("usage") or {}))
+            started, ended = run.get("started") or 0, run.get("ended") or 0
+            first_started = run.get("firstStarted") or started
+            execution_started = run.get("executionStartedAt") or 0
+            goal = copy.deepcopy({'taskGoal': local_task_goal.snapshot(run)}
+                if run.get('goalContract') and cli != 'pi' else {})
             # Ownership belongs to these captured fields, not a later turn.
             metadata_private = runner_usage_receipts.private_model(run)
             event_destination = ({"eventDestination": run["eventDestination"]}
@@ -979,25 +1045,25 @@ def session_sync(cfg: dict, ref: str, since: int = 0, limit: int = 400) -> dict:
         items = [x for x in mem if x["seq"] > since][:limit]
     else:
         items = _read_events(ref, since, limit)      # Read the archive when the requested history predates the memory buffer.
-    return {"ok": True, "ref": ref, "taskId": task_id, "items": items, "status": access_policy.visible_state(run) if run else state,
-            **(access_policy.snapshot(run) if run else {}),
+    return {"ok": True, "ref": ref, "taskId": task_id, "items": items, "status": visible_state,
+            **access,
             "last": items[-1]["seq"] if items else since,
             "seq": seq, "segment": seg, "round": round_no, "detached": detached,
             "admissionKey": admission_key, "admissionStartSeq": admission_start, "turnCorrelationVersion": 1,
             "tokens": tokens, "ctxPct": round(pct, 1), "ctxWindow": win,
             "ctxWindowKnown": known, "error": err, "workDir": ws,
             "failureKind": failure_kind, "failurePath": failure_path,
-            **({"taskGoal": local_task_goal.snapshot(run)} if run.get("goalContract") and cli != "pi" else {}),
+            **goal,
             "cli": cli, "cliName": cli_name, "cliSid": cli_sid, "model": model,
             runner_usage_receipts.PRIVACY_MARKER: metadata_private,
             **event_destination,
             "activeExecutionSelection": {"agentId": cli, "modelName": model,
-                "reasoningEffort": str(run.get("reasoningEffort") or "")},
+                "reasoningEffort": reasoning_effort},
             # Report cumulative usage separately from current context occupancy.
-            "usage": dict(run.get("usage") or {}) if run else {},
-            "firstStarted": (run.get("firstStarted") or run.get("started") or 0) if run else 0,
-            "started": run.get("started") or 0, "ended": run.get("ended") or 0,
-            "executionStartedAt": run.get("executionStartedAt") or 0,
+            "usage": usage,
+            "firstStarted": first_started,
+            "started": started, "ended": ended,
+            "executionStartedAt": execution_started,
             "canStop": state == "running"}
 
 
@@ -1073,10 +1139,8 @@ def _read_in(run: dict, att_id: str) -> bytes | None:
     if not p:
         return None
     try:
-        if os.path.getsize(p) > _BUNDLE_MAX_BYTES:
-            return None
         with open(p, "rb") as f:
-            return f.read()
+            return artifact_bytes.read(f, _BUNDLE_MAX_BYTES)
     except OSError:
         return None
 
@@ -1097,13 +1161,11 @@ def fetch_attachment_sync(cfg: dict, att_id: str) -> bytes | None:
     with _LOCK:
         runs = list(_RUNS.values())
     for run in runs:
-        p = os.path.join(run["ws"], att_id)
-        if os.path.isfile(p) and os.path.abspath(p).startswith(os.path.abspath(run["ws"])):
+        p = _safe_work_file(run, att_id)
+        if p:
             try:
-                if os.path.getsize(p) > 20 * 1024 * 1024:
-                    return None
                 with open(p, "rb") as f:
-                    return f.read()
+                    return artifact_bytes.read(f, 20 * 1024 * 1024)
             except OSError:
                 return None
     return None

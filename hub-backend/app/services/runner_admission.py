@@ -7,17 +7,17 @@ restart. Unit callers may omit storage; scheduling rules remain identical.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
 import ctypes
-from ctypes import wintypes
 import hashlib
 import json
+import logging
 import os
 import platform
 import threading
 import time
+from ctypes import wintypes
+from dataclasses import dataclass, field, replace
 from typing import Callable
-
 
 INTERACTIVE = "interactive"
 MANUAL = "task"
@@ -29,6 +29,9 @@ DEFAULT_TASK_CAPACITY = 100
 MIN_CONCURRENCY = 1
 MAX_CONCURRENCY = 20
 _GIB = 1024 ** 3
+_MEMORY_FLOOR = 768 * 1024 ** 2
+_CPU_CONFIRM_SECONDS = 1.0
+log = logging.getLogger(__name__)
 
 
 def standard_state(value) -> str:
@@ -71,6 +74,19 @@ def classify(message: dict) -> str:
     return MANUAL
 
 
+def prepares_materials(payload: dict) -> bool:
+    """Work which can retain bulk input bytes or create a checkout during native startup."""
+    ctx = payload.get("ctx") or {}
+    cfg = payload.get("cfg") or {}
+    if not isinstance(ctx, dict) or not isinstance(cfg, dict):
+        return True  # Leave malformed input to the job's normal validation path.
+    packets = (payload.get("files"), payload.get("skills"))
+    return bool(payload.get("localFiles") or any(p.get("items") for p in packets if isinstance(p, dict))
+                or ctx.get("workspace") or ctx.get("workspaceHandoff") or ctx.get("personalPlugin")
+                or ctx.get("pluginTurn") or payload.get("pluginTurn") or payload.get("turnSkills")
+                or cfg.get("pluginResourceBundles"))
+
+
 @dataclass
 class ResourceSnapshot:
     cpu_percent: float = 0.0
@@ -81,6 +97,15 @@ class ResourceSnapshot:
     pressure: str = "normal"
     can_start: bool = True
     sampled_at: float = field(default_factory=time.time)
+
+    def local_chat_limit(self, ceiling: int, running_chats: int) -> int:
+        """Bound concurrent cold starts separately from chats already generating a reply."""
+        if self.pressure != "normal" or not self.can_start:
+            return self.limit
+        # Keep the emergency reserve. Budget half a GiB per simultaneous plain
+        # native startup. Without a memory reading, stagger starts at the original rate.
+        cold_starts = max(self.limit, (self.memory_available - _MEMORY_FLOOR) // (512 * 1024 ** 2))
+        return min(ceiling, running_chats + cold_starts)
 
     def public(self) -> dict:
         return {
@@ -186,10 +211,11 @@ class AdaptiveResourceBudget:
         self._lock = threading.Lock()
         self._snapshot = ResourceSnapshot(limit=1, cpu_count=max(1, os.cpu_count() or 1))
         self._sampled_mono = 0.0
+        self._high_cpu_since: float | None = None
 
     def snapshot(self, force: bool = False) -> ResourceSnapshot:
-        now = time.monotonic()
         with self._lock:
+            now = time.monotonic()
             if not force and self._sampled_mono and now - self._sampled_mono < self.cache_seconds:
                 return self._snapshot
             try:
@@ -207,13 +233,24 @@ class AdaptiveResourceBudget:
             memory_slots = (max(1, min(MAX_CONCURRENCY, available // int(1.25 * _GIB)))
                             if available else MAX_CONCURRENCY)
             limit = max(1, min(self.ceiling, cpu_slots, memory_slots))
+            if cpu < 95.0:
+                self._high_cpu_since = None
+            elif self._high_cpu_since is None:
+                self._high_cpu_since = now
             pressure, can_start = "normal", True
-            if cpu >= 95.0 or memory >= 92.0 or (available and available < int(0.75 * _GIB)):
+            if memory >= 92.0 or (available and available < _MEMORY_FLOOR):
                 pressure, can_start, limit = "critical", False, 1
+            elif self._high_cpu_since is not None:
+                pressure, limit = "critical", 1
+                can_start = available > 0 and now - self._high_cpu_since >= _CPU_CONFIRM_SECONDS
             elif cpu >= 82.0 or memory >= 84.0 or (available and available < int(1.5 * _GIB)):
                 pressure, limit = "busy", max(1, limit // 2)
             elif cpu >= 70.0 or memory >= 76.0:
                 pressure, limit = "busy", max(1, (limit * 3) // 4)
+            if (pressure, can_start) != (self._snapshot.pressure, self._snapshot.can_start):
+                level = logging.WARNING if pressure == "critical" else logging.INFO
+                log.log(level, "admission: pressure=%s canStart=%s limit=%d cpu=%.1f%% memory=%.1f%% availableMiB=%d",
+                        pressure, can_start, limit, cpu, memory, available // (1024 ** 2))
             self._snapshot = ResourceSnapshot(
                 cpu_percent=cpu, memory_percent=memory, memory_available=available,
                 cpu_count=cpu_count, limit=limit, pressure=pressure,
@@ -363,14 +400,12 @@ class AdmissionQueue:
                 if item.ref == str(ref or "") and item.state in states]
         return max(rows, key=lambda item: item.sequence) if rows else None
 
-    def claim_next(self, active: int, limit: int, can_start: bool,
-                   blocked_refs: set[str] | None = None,
-                   hub_blocked: bool = False,
-                   local_refs: set[str] | None = None) -> AdmissionItem | None:
-        limit = max(MIN_CONCURRENCY, min(MAX_CONCURRENCY, int(limit or 1)))
-        if not can_start or int(active or 0) >= limit:
-            return None
-        waiting = self._ordered_waiting()
+    def _eligible_waiting(self, blocked_refs, hub_blocked, local_refs) -> list[AdmissionItem]:
+        active_refs = {item.ref for item in self._items.values()
+                       if item.state in {"starting", "running"}}
+        active_refs.update(str(ref) for ref in (blocked_refs or ()) if ref)
+        waiting = [item for item in self._items.values()
+                   if item.state == "queued" and item.ref not in active_refs]
         if hub_blocked:
             from .runner_event_scope import payload_destination
             def local_item(item):
@@ -381,27 +416,60 @@ class AdmissionQueue:
                          payload.get("op") == "job.comment" and
                          item.ref in (local_refs or set())))
             waiting = [item for item in waiting if local_item(item)]
+        interactive = [item for item in waiting if item.category == INTERACTIVE]
+        return interactive or waiting
+
+    def _preparations_full(self, limit: int, local_chat_limit: int) -> bool:
+        return (local_chat_limit > limit
+                and sum(1 for row in self._items.values()
+                        if row.state == "starting" and prepares_materials(row.payload or {})) >= limit)
+
+    @staticmethod
+    def _slots_full(active: int, limit: int, item: AdmissionItem, local_chat_limit: int,
+                    preparations_full: bool) -> bool:
+        if local_chat_limit and item.category == INTERACTIVE:
+            from .runner_event_scope import payload_destination
+            if payload_destination(item.payload or {}) == "local":
+                if preparations_full and prepares_materials(item.payload or {}):
+                    return True
+                limit = local_chat_limit
+        limit = max(MIN_CONCURRENCY, min(MAX_CONCURRENCY, int(limit or 1)))
+        if item.category != INTERACTIVE and limit > 1:
+            limit -= 1  # Reserve one slot for a conversation.
+        return int(active or 0) >= limit
+
+    def claim_next(self, active: int, limit: int, can_start: bool,
+                   blocked_refs: set[str] | None = None,
+                   hub_blocked: bool = False,
+                   local_refs: set[str] | None = None,
+                   local_chat_limit: int = 0) -> AdmissionItem | None:
+        if not can_start or active >= max(limit, local_chat_limit):
+            return None
+        waiting = self._eligible_waiting(blocked_refs, hub_blocked, local_refs)
         if not waiting:
             return None
-        active_refs = {item.ref for item in self._items.values()
-                       if item.state in {"starting", "running"}}
-        active_refs |= {str(ref) for ref in (blocked_refs or set()) if str(ref)}
-        # A follow-up waiting behind its own still-running conversation is not runnable.
-        # It must keep that conversation serial, but it must not freeze unrelated
-        # background work when another execution slot is available.
-        interactive_runnable = any(
-            item.category == INTERACTIVE and item.ref not in active_refs
-            for item in waiting)
-        for item in waiting:
-            if item.ref in active_refs:
+        preparations_full = self._preparations_full(limit, local_chat_limit)
+        seen = set()
+        for item in sorted(waiting, key=lambda row: (PRIORITY[row.category], row.sequence)):
+            if item.ref in seen:
                 continue
-            if item.category != INTERACTIVE:
-                if interactive_runnable:
-                    continue
-                if limit > 1 and int(active or 0) >= limit - 1:
-                    continue
-            return self._update(item, state="starting", started_at=time.time())
+            seen.add(item.ref)
+            if not self._slots_full(active, limit, item, local_chat_limit, preparations_full):
+                return self._update(item, state="starting", started_at=time.time())
         return None
+
+    def wait_reason(self, item: AdmissionItem, active: int, limit: int, can_start: bool,
+                    blocked_refs: set[str] | None = None, hub_blocked: bool = False,
+                    local_refs: set[str] | None = None,
+                    local_chat_limit: int = 0) -> str:
+        if item.state != "queued":
+            return ""
+        if can_start and not self._slots_full(active, limit, item, local_chat_limit,
+                                              self._preparations_full(limit, local_chat_limit)):
+            return ""
+        if not any(row.key == item.key for row in self._eligible_waiting(blocked_refs, hub_blocked, local_refs)):
+            return ""
+        return "execution_slot" if can_start else "resource_pressure"
 
     def mark_running(self, key: str, result: dict | None = None) -> AdmissionItem | None:
         item = self.get(key)

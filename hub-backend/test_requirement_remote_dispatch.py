@@ -3,11 +3,17 @@
 Only model configuration and the final Runner transport are isolated fixtures.
 No live database, model, Runner process, or user workspace is accessed.
 """
+import asyncio
+import hashlib
 import importlib
+import io
 import os
 import sqlite3
+import tempfile
+import threading
 import uuid
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -17,15 +23,17 @@ os.environ.update(DATABASE_URL="sqlite+aiosqlite:///:memory:",
                   ADMIN_PASS="requirement-routing-fixture-password")
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app import models, automation_models as am
 from app.api import tasks
+from app.conversation_handoff_models import ConversationHandoff
 from app.db import get_session
 from app.deps import current_client
-from app.services import (ai_exec, ai_remote, conversation_handoffs, dispatch_identity,
-                          runner_hub, task_dispatch, task_execution_options)
+from app.services import (ai_exec, ai_remote, cloud_conversations, conversation_handoffs, dispatch_attempts,
+                          dispatch_identity, dispatch_reconcile, execution_sessions, runner_hub, task_dispatch,
+                          task_execution_model, task_execution_options)
 from test_unified_requirements import _schema_template
 
 for model_file in (Path(__file__).parent / "app").glob("*models.py"):
@@ -72,20 +80,26 @@ class RequirementRemoteDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.runner.dispatch_mode = "accepting"
         self.runner.alive = lambda: True
         self.calls = []
+        self.dispatched_files = []
 
         def dispatch(cfg, task, files, picked, extra):
             self.calls.append((cfg, picked, extra))
+            self.dispatched_files.append(files)
             return {"ok": True, "issueId": dispatch_identity.execution_ref(extra["dispatchId"]),
                     "runnerId": picked["runnerId"], "runnerClientId": picked["clientId"],
                     "host": picked["host"], "assigneeId": picked["id"],
                     "assigneeCli": "pi", "state": "running"}
 
         async def model(session, client, ctx, *args, **kwargs):
-            return ai_exec.with_llm(ctx, {"base": "http://fixture.invalid", "key": "fixture",
-                                          "model": "fixture"}), {}
+            llm = {"base": "http://fixture.invalid", "key": "fixture", "model": "fixture"}
+            out = ai_exec.with_llm(ctx, llm)
+            out["_managedModelSelection"] = {"provider": "fixture", "model": llm["model"],
+                                              "configRevision": "fixture-config", "runtimeRevision": "fixture-runtime"}
+            return out, {}
 
         self.patches = [
             patch.dict(runner_hub._RUNNERS, {"cloud": self.runner}, clear=True),
+            patch.object(dispatch_reconcile, "SessionLocal", self.sessions),
             patch("app.services.execution_host_policy.get_settings",
                   return_value=type("Settings", (), {"cloud_execution_runner_ids": "",
                                                        "hub_local_execution_enabled": False})()),
@@ -154,6 +168,294 @@ class RequirementRemoteDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 409, response.text)
         self.assertFalse(self.calls)
 
+    async def test_cloud_model_change_at_dispatch_requires_confirmation_before_runner_call(self):
+        await self.check_cloud_model_change_at_dispatch("C")
+
+    async def test_cloud_model_unavailable_at_dispatch_can_be_retried_when_restored(self):
+        await self.check_cloud_model_change_at_dispatch(None)
+
+    async def check_cloud_model_change_at_dispatch(self, replacement):
+        body = {"sessionId": "cloud-frozen-model", "agentId": "pi", "text": "Summarize this report",
+                "targetRunnerId": "cloud"}
+        revision = "B"
+        dispatch = task_dispatch.dispatch
+
+        async def prepare(session, client, ctx, *args, **kwargs):
+            if revision is None:
+                raise task_execution_model.ManagedModelUnavailable("fixture model unavailable")
+            llm = {"base": "http://fixture.invalid", "key": "fixture", "model": "fixture-model"}
+            out = ai_exec.with_llm(ctx, llm)
+            out["_managedModelSelection"] = {"provider": "fixture", "model": llm["model"],
+                                              "configRevision": revision, "runtimeRevision": "test-runtime"}
+            return out, {}
+
+        async def launch(*args, **kwargs):
+            nonlocal revision
+            revision = replacement
+            return await dispatch(*args, **kwargs)
+
+        request_id = "frozen-model"
+        row_id = conversation_handoffs.identity(self.client.id, request_id)
+        with patch.object(task_execution_model, "prepare", new=prepare):
+            async with self.sessions() as session:
+                client = await session.get(models.Client, self.client.id)
+                with patch.object(task_dispatch, "dispatch", new=launch), self.assertRaises(HTTPException) as conflict:
+                    await cloud_conversations.create(session, client, request_id, body, [])
+                assert conflict.exception.status_code == 409
+                assert self.calls == []
+                row = await session.get(ConversationHandoff, row_id)
+                state = conversation_handoffs.public(row)
+                assert (state["phase"], state["accepted"], state["canAbort"]) == ("prepared", False, True)
+                assert row.options["managedModelSelection"]["configRevision"] == (replacement or "B")
+            if revision is None:
+                revision = "B"
+            async with self.sessions() as session:
+                client = await session.get(models.Client, self.client.id)
+                accepted = await cloud_conversations.create(
+                    session, client, request_id, body, [], confirmation_generation=state["confirmationGeneration"])
+                assert (accepted["phase"], accepted["accepted"]) == ("committed", True)
+                assert len(self.calls) == 1
+
+    async def test_personal_direct_grant_survives_artifacts_and_expires_on_new_dispatch(self):
+        response = await self.post()
+        self.assertEqual(response.status_code, 200, response.text)
+        ref = response.json()["issueId"]
+        async with self.sessions() as session:
+            now = datetime.now(timezone.utc) + timedelta(seconds=1)
+            session.add(models.TaskEvent(task_id="r3", kind=ai_exec.EV_ARTIFACTS, at=now, detail={"ref": ref}))
+            await session.flush()
+            snapshot = {"taskId": "r3", "ref": ref, "state": "running", "round": 2, "seq": 1}
+            updates = await execution_sessions.ingest_runner_snapshots(session, self.runner, [snapshot])
+            self.assertEqual(updates[0]["session"]["round"], 2)
+            session.add(models.TaskEvent(task_id="r3", kind=ai_exec.EV_DISPATCH_STARTED,
+                        at=now + timedelta(seconds=1), detail={"expectedRef": "next-execution"}))
+            await session.flush()
+            self.assertFalse(await execution_sessions.ingest_runner_snapshots(session, self.runner, [snapshot]))
+
+    async def test_lost_ack_recovers_the_exact_admission_without_restarting_it(self):
+        from runner_main import Runner
+
+        with tempfile.TemporaryDirectory() as root, patch(
+                "app.services.local_base._data_root", return_value=root):
+            runtime = Runner("http://fixture", "", "", "cloud", work_root=root)
+            self.runner.boot_id = runtime.boot_id
+            journal = runtime._admission._journal
+            try:
+                def lose_ack(cfg, task, files, picked, extra):
+                    ref = dispatch_identity.execution_ref(extra["dispatchId"])
+                    accepted, _, _ = runtime._admission.submit(
+                        "dispatch:" + ref, ref, "task", "dispatch", {"task": {"id": task.id}})
+                    self.assertTrue(accepted)
+                    return {"ok": False, "uncertain": True, "runnerId": "cloud",
+                            "runnerBootId": runtime.boot_id, "error": "lost ACK"}
+
+                async def read_receipt(op, payload, timeout):
+                    self.assertEqual(op, "job.has")
+                    self.assertEqual(payload, {"ref": ref, "admissionKey": "dispatch:" + ref})
+                    return await runtime._job({"op": op, **payload})
+
+                with patch.object(ai_remote, "dispatch_sync", side_effect=lose_ack) as dispatch, \
+                        patch.object(self.runner, "call", side_effect=read_receipt):
+                    response = await self.post()
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertTrue(response.json()["pending"])
+                    ref = response.json()["issueId"]
+                    now = datetime.now(timezone.utc) + timedelta(minutes=1)
+                    async with self.sessions() as session:
+                        candidate, = await dispatch_reconcile.candidates(session, now=now)
+                    observed = await dispatch_reconcile.probe(candidate)
+                    # A delayed queued receipt cannot undo a newer heartbeat.
+                    for state in ("running", "done"):
+                        with self.subTest(heartbeat=state):
+                            async with self.sessions() as session:
+                                session.add(am.ExecutionSession(task_id="r3", ref=ref,
+                                    runner_id="cloud", state=state, metadata_={"queuePosition": 0}))
+                                await session.flush()
+                                await dispatch_reconcile.apply_probe(session, candidate, observed)
+                                row = await session.scalar(select(am.ExecutionSession))
+                                self.assertEqual((row.state, row.metadata_["queuePosition"]), (state, 0))
+                                await session.rollback()
+                    async with self.sessions() as session:
+                        await dispatch_reconcile.apply_probe(session, candidate, observed)
+                        await session.commit()
+                        row = await session.scalar(select(am.ExecutionSession))
+                        self.assertEqual((row.state, row.started_at, row.metadata_["queuePosition"],
+                                          row.metadata_["queueClass"]), ("queued", None, 1, "task"))
+                    repeated = await self.post()
+                    self.assertEqual((repeated.json()["issueId"], repeated.json()["state"]), (ref, "queued"))
+                    self.assertEqual(dispatch.call_count, 1)
+            finally:
+                journal.close()
+
+    async def test_already_persisted_queue_heartbeat_recovers_the_http_receipt(self):
+        start = dispatch_attempts.start
+
+        async def heartbeat_before_reply(session, task_id, *args, **kwargs):
+            attempt = await start(session, task_id, *args, **kwargs)
+            session.add(am.ExecutionSession(task_id=task_id, ref=dispatch_identity.execution_ref(attempt),
+                runner_id="cloud", state="queued", metadata_={"queuePosition": 2, "queueClass": "task"}))
+            await session.flush()
+            return attempt
+
+        with patch.object(dispatch_attempts, "start", side_effect=heartbeat_before_reply), \
+                patch.object(ai_remote, "dispatch_sync", return_value={
+                    "ok": False, "uncertain": True, "runnerId": "cloud", "error": "lost ACK"}):
+            response = await self.post()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["pending"])
+        self.assertEqual(response.json()["state"], "queued")
+
+    async def test_standalone_probe_uses_current_organization_and_registration(self):
+        self.runner.owner_user_id = ""
+        self.runner.boot_id = "original"
+        attempt = uuid.uuid4().hex
+        ref = dispatch_identity.execution_ref(attempt)
+        now = datetime.now(timezone.utc) + timedelta(minutes=1)
+        async with self.sessions() as session:
+            node = await session.get(am.RunnerNode, self.runner.id)
+            node.owner_user_id = None
+            session.add(models.OrgUnit(id="new-team", name="New team"))
+            session.add(models.TaskEvent(task_id="r3", kind=ai_exec.EV_DISPATCH_UNCERTAIN,
+                detail={"attemptId": attempt, "expectedRef": ref, "runnerId": self.runner.id,
+                        "runnerClientId": "", "runnerBootId": self.runner.boot_id}))
+            await session.commit()
+            candidate, = await dispatch_reconcile.candidates(session, now=now)
+
+        for exists in (True, False):
+            with self.subTest(exists=exists):
+                data = {"has": exists, "persisted": exists, "inflight": False, "bootId": self.runner.boot_id}
+                with patch.object(self.runner, "call", AsyncMock(return_value={"ok": True, "data": data})) as rpc:
+                    result = await dispatch_reconcile.probe(candidate)
+                    self.assertEqual(result["state"], "confirmed" if exists else "not-started")
+                    async with self.sessions() as session:
+                        node = await session.get(am.RunnerNode, self.runner.id)
+                        node.org_id = "new-team"
+                        await session.commit()
+                        action, _ = await dispatch_reconcile.apply_probe(session, candidate, result)
+                        self.assertEqual(action, "stale")
+                        self.assertEqual((await dispatch_reconcile._latest_state(session, "r3")).kind,
+                                         ai_exec.EV_DISPATCH_UNCERTAIN)
+                        await session.rollback()
+                    # The registry update can precede the next Runner heartbeat.
+                    self.assertEqual((await dispatch_reconcile.probe(candidate))["state"], "ambiguous")
+                    self.runner.org_id = "new-team"
+                    self.assertEqual((await dispatch_reconcile.probe(candidate))["state"], "ambiguous")
+                    rpc.assert_awaited_once()
+                    async with self.sessions() as session:
+                        node = await session.get(am.RunnerNode, self.runner.id)
+                        node.org_id = "team"
+                        await session.commit()
+                        self.runner.org_id = "team"
+                        self.runner.boot_id = "replacement"
+                        action, _ = await dispatch_reconcile.apply_probe(session, candidate, result)
+                        self.assertEqual(action, "stale")
+                        self.runner.boot_id = "original"
+
+    async def test_hub_interrupted_after_routing_reconciles_without_resending(self):
+        self.runner.boot_id = "original-boot"
+        with patch.object(ai_remote, "dispatch_sync", side_effect=asyncio.CancelledError):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.post()
+        now = datetime.now(timezone.utc) + timedelta(seconds=91)
+        async with self.sessions() as session:
+            item, = await dispatch_reconcile.candidates(session, now=now)
+            self.assertEqual((item.runner_id, item.runner_boot_id), ("cloud", "original-boot"))
+            self.assertEqual(item.detail["admissionKey"], "dispatch:" + item.expected_ref)
+            late = await dispatch_reconcile.status_for_uncertain(session, "r3", now=now)
+            self.assertEqual(late, {"ref": item.expected_ref, "queueLeaseStatus": "unconfirmed",
+                                    "queueLeaseReason": "no_runner_ack"})
+            self.assertEqual(await dispatch_reconcile.status_for_uncertain(
+                session, "r3", now=now - timedelta(seconds=30)), {"ref": item.expected_ref})
+        negative = {"has": False, "persisted": False, "bootId": self.runner.boot_id}
+        with patch.object(self.runner, "call", new=AsyncMock(return_value={"ok": True, "data": negative})):
+            result = await dispatch_reconcile.probe(item)
+        async with self.sessions() as session:
+            action, _ = await dispatch_reconcile.apply_probe(session, item, result, now=now)
+            self.assertEqual(action, "pending")  # The original send may still be in progress.
+            event = await dispatch_reconcile._latest_state(session, "r3")
+            self.assertIsNotNone(dispatch_attempts._existing_receipt(
+                event, "todo", None, now + timedelta(hours=1)))
+        preparing = {**negative, "has": True, "inflight": True, "ref": item.expected_ref,
+                     "admissionKey": "dispatch:" + item.expected_ref}
+        with patch.object(self.runner, "call", new=AsyncMock(return_value={"ok": True, "data": preparing})):
+            result = await dispatch_reconcile.probe(item)
+        async with self.sessions() as session:
+            await dispatch_reconcile.apply_probe(session, item, result, now=now)
+            await session.commit()
+            self.assertEqual(await dispatch_reconcile.status_for_uncertain(
+                session, "r3", now=now + timedelta(seconds=89)), {"ref": item.expected_ref})
+            self.assertEqual(await dispatch_reconcile.status_for_uncertain(
+                session, "r3", now=now + timedelta(seconds=90)), late)
+        positive = {**negative, "has": True, "persisted": True, "ref": item.expected_ref,
+                    "admissionKey": "dispatch:" + item.expected_ref, "state": "queued", "queuePosition": 1}
+        with patch.object(self.runner, "call", new=AsyncMock(return_value={"ok": True, "data": positive})):
+            result = await dispatch_reconcile.probe(item)
+        async with self.sessions() as session:
+            action, _ = await dispatch_reconcile.apply_probe(session, item, result, now=now)
+            await session.commit()
+            self.assertEqual(action, "confirmed")
+            self.assertEqual(await dispatch_reconcile.status_for_uncertain(session, "r3", now=now), {})
+        with patch.object(ai_remote, "dispatch_sync") as resend:
+            again = await self.post()
+            self.assertEqual((again.json()["issueId"], again.json()["state"]), (item.expected_ref, "queued"))
+            resend.assert_not_called()
+
+    async def test_late_rpc_reply_keeps_the_confirmation_from_the_worker(self):
+        started = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+
+        def late_reply(*_):
+            loop.call_soon_threadsafe(started.set)
+            if not release.wait(15):
+                raise AssertionError("timed out waiting for the read-only receipt")
+            return {"ok": False, "uncertain": True, "runnerId": "cloud", "error": "lost ACK"}
+
+        with patch.object(ai_remote, "dispatch_sync", side_effect=late_reply) as send:
+            request = asyncio.create_task(self.post())
+            try:
+                await asyncio.wait_for(started.wait(), 10)
+                now = datetime.now(timezone.utc) + timedelta(seconds=91)
+                async with self.sessions() as session:
+                    item, = await dispatch_reconcile.candidates(session, now=now)
+                    data = {"has": True, "persisted": True, "ref": item.expected_ref,
+                            "admissionKey": "dispatch:" + item.expected_ref, "state": "queued",
+                            "queuePosition": 3, "queueClass": "task"}
+                    with patch.object(self.runner, "call", AsyncMock(return_value={"ok": True, "data": data})):
+                        result = await dispatch_reconcile.probe(item)
+                    await dispatch_reconcile.apply_probe(session, item, result, now=now)
+                    await session.commit()
+            finally:
+                release.set()
+            reply = await request
+            self.assertEqual((reply.json()["state"], reply.json()["queuePosition"]), ("queued", 3))
+            send.assert_called_once()
+        async with self.sessions() as session:
+            events = (await session.scalars(select(models.TaskEvent.kind).where(
+                models.TaskEvent.kind.in_(ai_exec.KINDS_DISPATCH_STATE)))).all()
+            self.assertCountEqual(events, [ai_exec.EV_DISPATCH_STARTED, ai_exec.EV_DISPATCHED])
+
+    async def test_only_errors_after_the_route_commit_can_have_an_unknown_ack(self):
+        with patch.object(dispatch_attempts, "pin_runner_route", side_effect=RuntimeError("write failed")), \
+                patch.object(ai_remote, "dispatch_sync") as send:
+            before = await self.post()
+            self.assertEqual(before.status_code, 502, before.text)
+            send.assert_not_called()
+        async with self.sessions() as session:
+            event = await dispatch_reconcile._latest_state(session, "r3")
+            self.assertEqual(event.kind, ai_exec.EV_DISPATCH_FAILED)
+
+        with patch.object(ai_remote, "dispatch_sync", side_effect=RuntimeError("reply processing failed")) as send:
+            after = await self.post()
+            self.assertEqual(after.status_code, 200, after.text)
+            self.assertTrue(after.json()["pending"])
+            repeated = await self.post()
+            self.assertEqual(repeated.json()["issueId"], after.json()["issueId"])
+            send.assert_called_once()
+        async with self.sessions() as session:
+            event = await dispatch_reconcile._latest_state(session, "r3")
+            self.assertEqual((event.kind, event.detail["runnerId"]), (ai_exec.EV_DISPATCH_UNCERTAIN, "cloud"))
+
     async def test_offline_selected_target_never_falls_back_to_another_runner(self):
         async with self.sessions() as session:
             session.add(am.RunnerNode(id="alternative", client_id="desktop", org_id="team"))
@@ -202,6 +504,159 @@ class RequirementRemoteDispatchTests(unittest.IsolatedAsyncioTestCase):
                 response = await self.post(body)
                 self.assertEqual(response.status_code, 409, response.text)
         self.assertFalse(self.calls)
+
+    async def test_confirmed_attachment_identity_survives_same_name_and_bytes(self):
+        digest = hashlib.sha256(b"good").hexdigest()
+        async with self.sessions() as session:
+            session.add(models.Attachment(id="original", task_id="r3", filename="brief.txt",
+                size=4, storage_key="original", evidence_meta={"sha256": digest}))
+            await session.commit()
+
+        preview_path = "/api/v1/tasks/r3/ai-preview"
+        dispatch_path = "/api/v1/tasks/r3/ai-dispatch-confirmed"
+        preview = await self.http.post(preview_path, json={})
+        self.assertEqual(preview.status_code, 200, preview.text)
+        original = {"id": "original", "name": "brief.txt", "size": 4, "sha256": digest}
+        self.assertEqual(preview.json()["carried"]["inputManifest"], [original])
+
+        body = {**self.body(), "inputManifest": [original]}
+        async with self.sessions() as session:
+            await session.delete(await session.get(models.Attachment, "original"))
+            await session.commit()
+        removed = await self.http.post(dispatch_path, json=body)
+        self.assertEqual(removed.status_code, 409, removed.text)
+        self.assertFalse(self.calls)
+        async with self.sessions() as session:
+            task = await session.get(models.Task, "r3")
+            self.assertEqual(task.work_routing, {"requiredAgentCapabilities": ["files", "terminal"]})
+            self.assertIsNone(await dispatch_reconcile._latest_state(session, task.id))
+
+        async with self.sessions() as session:
+            session.add(models.Attachment(id="replacement", task_id="r3", filename="brief.txt",
+                size=4, storage_key="replacement"))
+            await session.commit()
+        with patch("app.services.storage.open_stream", side_effect=lambda *_: io.BytesIO(b"good")):
+            replaced = await self.http.post(dispatch_path, json=body)
+            self.assertEqual(replaced.status_code, 409, replaced.text)
+            self.assertFalse(self.calls)
+            preview = await self.http.post(preview_path, json={})
+        self.assertEqual(preview.status_code, 200, preview.text)
+        body["inputManifest"] = preview.json()["carried"]["inputManifest"]
+        self.assertEqual(body["inputManifest"], [{**original, "id": "replacement"}])
+
+        with patch("app.services.storage.open_stream", side_effect=lambda *_: io.BytesIO(b"edit")):
+            changed = await self.http.post(dispatch_path, json=body)
+        self.assertEqual(changed.status_code, 409, changed.text)
+        self.assertFalse(self.calls)
+
+        with patch("app.services.storage.open_stream", side_effect=lambda *_: io.BytesIO(b"good")):
+            dispatched = await self.http.post(dispatch_path, json=body)
+        self.assertEqual(dispatched.status_code, 200, dispatched.text)
+        self.assertEqual(self.dispatched_files, [[("brief.txt", b"good", "application/octet-stream")]])
+
+    async def test_selected_attachment_storage_failure_prevents_legacy_dispatch(self):
+        async with self.sessions() as session:
+            session.add(models.Attachment(id="file", task_id="r3", filename="brief.txt",
+                size=4, storage_key="file", evidence_meta={"sha256": hashlib.sha256(b"good").hexdigest()}))
+            await session.commit()
+
+        for stored in (OSError("fixture read failure"), b"abc", b"abcde", b"edit"):
+            with self.subTest(stored=stored):
+                read = {"side_effect": stored} if isinstance(stored, OSError) else {
+                    "side_effect": lambda *_, data=stored: io.BytesIO(data)}
+                with patch("app.services.storage.open_stream", **read):
+                    response = await self.post()
+                self.assertEqual(response.status_code, 409, response.text)
+                self.assertFalse(self.calls)
+
+    async def test_confirmed_storage_read_does_not_hold_the_admission_lock(self):
+        digest = hashlib.sha256(b"good").hexdigest()
+        async with self.sessions() as session:
+            session.add(models.Attachment(id="a", task_id="r3", filename="brief.txt",
+                size=4, storage_key="original", evidence_meta={"sha256": digest}))
+            await session.commit()
+        input_manifest = [{"id": "a", "name": "brief.txt", "size": 4, "sha256": digest}]
+        body = {**self.body(), "inputManifest": input_manifest}
+        entered, release = asyncio.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+
+        def read(*_):
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(10):
+                raise TimeoutError("test fixture did not release storage read")
+            return io.BytesIO(b"good")
+
+        async def change_selection():
+            async with self.sessions() as other:
+                task = await other.get(models.Task, "r3", with_for_update=True)
+                task.title = "Updated during attachment read"
+                attachment = await other.get(models.Attachment, "a")
+                attachment.storage_key = "different-object"
+                await other.commit()
+
+        with patch("app.services.storage.open_stream", side_effect=read):
+            request = asyncio.create_task(self.http.post("/api/v1/tasks/r3/ai-dispatch-confirmed", json=body))
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                await asyncio.wait_for(change_selection(), timeout=5)
+            finally:
+                release.set()
+                response = await request
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertFalse(self.calls)
+
+    async def test_confirmed_endpoint_requires_manifest_before_dispatch(self):
+        response = await self.http.post("/api/v1/tasks/r3/ai-dispatch-confirmed", json=self.body())
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertFalse(self.calls)
+
+    async def test_confirmed_endpoint_refuses_workflow_routing_before_any_executor_starts(self):
+        async with self.sessions() as session:
+            task = await session.get(models.Task, "r3")
+            task.work_routing = {**task.work_routing, "outputContract": {"kind": "repository-change"}}
+            await session.commit()
+        bodies = [{"inputManifest": []}, {"inputManifest": [], "executionContext": {"strategy": "workflow"}},
+                  {"inputManifest": [], "executionContext": {"strategy": "direct", "workflowId": "fixture"}}]
+        with patch("app.services.managed_work_route.start", new_callable=AsyncMock) as workflow, \
+                patch("app.services.zero_work_route.try_route", new_callable=AsyncMock) as automatic:
+            for body in bodies:
+                with self.subTest(body=body):
+                    response = await self.http.post("/api/v1/tasks/r3/ai-dispatch-confirmed", json=body)
+                    self.assertEqual(response.status_code, 409, response.text)
+            workflow.assert_not_called()
+            automatic.assert_not_called()
+        self.assertFalse(self.calls)
+
+    async def test_preview_and_runner_use_the_same_order_and_attachment_limits(self):
+        same_time = datetime.now(timezone.utc)
+        digest = hashlib.sha256(b"x").hexdigest()
+        async with self.sessions() as session:
+            for key in ("f", "e", "d", "c", "b", "a"):
+                session.add(models.Attachment(id=key, task_id="r3", filename=key + ".txt",
+                    size=1, storage_key=key, created_at=same_time, evidence_meta={"sha256": digest}))
+            session.add_all([
+                models.Attachment(id="0-large", task_id="r3", filename="large.txt",
+                    size=10 * 1024 * 1024 + 1, storage_key="large", created_at=same_time),
+                models.Attachment(id="0-output", task_id="r3", filename="output.txt", size=1,
+                    storage_key="output", uploaded_by="agent:pi", created_at=same_time),
+            ])
+            await session.commit()
+
+        expected_ids = list("abcde")
+        expected = [{"id": key, "name": key + ".txt", "size": 1, "sha256": digest} for key in expected_ids]
+        preview = await self.http.post("/api/v1/tasks/r3/ai-preview", json={})
+        self.assertEqual(preview.status_code, 200, preview.text)
+        carried = preview.json()["carried"]
+        self.assertTrue(carried["confirmedDispatch"])
+        self.assertEqual(carried["inputManifest"], expected)
+        self.assertEqual(carried["omittedFiles"], ["large.txt", "f.txt"])
+
+        with patch("app.services.storage.open_stream", side_effect=lambda *_: io.BytesIO(b"x")) as read:
+            result = await self.http.post("/api/v1/tasks/r3/ai-dispatch-confirmed",
+                json={**self.body(), "inputManifest": expected})
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual([call.args[0] for call in read.call_args_list], expected_ids)
+        self.assertEqual([entry[0] for entry in self.dispatched_files[0]], carried["files"])
 
     async def test_missing_task_capability_is_rejected(self):
         async with self.sessions() as session:

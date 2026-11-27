@@ -6,21 +6,32 @@ separately authorized operator recorded in audit and workflow receipts.
 """
 import logging
 from types import SimpleNamespace
+
 from fastapi import HTTPException
+from sqlalchemy import select
+
+from ..automation_models import ExecutionSession
 from ..models import Task
 from ..schemas import task_to_api
-from . import audit, task_access, task_requirements, tasks as svc
+from . import audit, task_access, task_requirements
+from . import tasks as svc
 from .task_dispatch_context import (
-    _ext_project_id, _repo_ctx, _resolve_repo, _attach_dev_flow, _attach_skills,
-    _settle_work_dir, _link_task_repo, _stale_runner_hint, _push_task,
+    _attach_dev_flow,
+    _attach_skills,
+    _ext_project_id,
+    _link_task_repo,
+    _push_task,
     _remote_execution_context,
+    _repo_ctx,
+    _resolve_repo,
+    _settle_work_dir,
+    _stale_runner_hint,
 )
 
 log = logging.getLogger("uvicorn.error")
 
 
 async def _active_workflow(session, tid):
-    from sqlalchemy import select
     from ..automation_models import WorkflowRun
     from .workflow_runs import _ACTIVE_RUN_STATES
     return (await session.execute(select(WorkflowRun).where(
@@ -28,24 +39,59 @@ async def _active_workflow(session, tid):
     ).order_by(WorkflowRun.created_at.desc()).limit(1))).scalar_one_or_none()
 
 
-async def dispatch(tid, body, client, session, *, actor=None):
+async def dispatch(tid, body, client, session, *, actor=None, handoff_claim=None):
     import asyncio as _aio
 
-    from ..services import ai_exec, dispatch_attempts
+    from ..services import (
+        ai_exec,
+        client_access,
+        conversation_handoffs,
+        dispatch_attempts,
+        dispatch_identity,
+        managed_work_route,
+    )
     from ..services import task_events as ev
-    from ..services import task_access
+    from ..services.conversation_turns import ensure_available, execution_instruction
+    confirmed_inputs = "inputManifest" in body
+    confirmed_files = confirmed_sources = confirmation_error = None
+    if confirmed_inputs:
+        from sqlalchemy.ext.asyncio import AsyncSession
+        # Freeze bytes outside the task write transaction. Recheck the selected
+        # storage references under the admission lock before recording intent.
+        selected = None
+        async with AsyncSession(session.bind) as preview:
+            candidate = await preview.get(Task, tid)
+            if candidate is None or not task_access.is_owner(candidate, client):
+                raise HTTPException(404, "需求不存在")
+            if not managed_work_route.direct_requested(body):
+                raise HTTPException(409, "附件清单仅用于直接派发，请按当前执行方式重新预览")
+            try:
+                ensure_available(candidate, body.get("conversationTurn"), "dispatch")
+                await client_access.assert_quota(preview, str(candidate.assignee_user_id or client.user_ref or ""))
+            except client_access.ClientAccessError as error:
+                raise HTTPException(error.status, error.detail()) from error
+            except ValueError as error:
+                raise HTTPException(409, str(error)) from error
+            if await dispatch_attempts.existing(preview, tid, candidate.status) is None:
+                selected = await ai_exec.snapshot_task_file_selection(preview, tid)
+        if selected is not None:
+            try:
+                files, manifest, confirmed_sources = await ai_exec.prepare_confirmed_task_files(selected, body["inputManifest"])
+                confirmed_files = (files, manifest)
+            except ai_exec.TaskAttachmentError as error:
+                confirmation_error = str(error)
     await task_access.reserve_task_write(session, tid, client.id)
     t = await session.get(Task, tid, with_for_update=True, populate_existing=True)
     if t is None or not task_access.is_owner(t, client):
         raise HTTPException(status_code=404, detail="需求不存在")
-    from . import client_access
     try:
         await client_access.assert_quota(session, str(t.assignee_user_id or client.user_ref or ""))
     except client_access.ClientAccessError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail()) from exc
-    from ..services.conversation_turns import ensure_available, execution_instruction
-    from ..services import conversation_handoffs
-    handoff, body = await conversation_handoffs.dispatch_body(session, client, t, body)
+    handoff, body = await conversation_handoffs.dispatch_body(session, client, t, body, handoff_claim=handoff_claim)
+    explicit_direct = managed_work_route.direct_requested(body)
+    if confirmed_inputs and (handoff or not explicit_direct):
+        raise HTTPException(409, "附件清单仅用于直接派发，请按当前执行方式重新预览")
     if handoff and actor is not None:
         raise HTTPException(409, "云端交接需由会话本人在原会话中确认，不能从管理端重新派发")
     try:
@@ -69,6 +115,8 @@ async def dispatch(tid, body, client, session, *, actor=None):
     # A settings change or an explicit direct choice cannot create a second executor.
     running = await _active_workflow(session, tid)
     if running is not None:
+        if confirmed_inputs:
+            raise HTTPException(409, "这项需求已有运行中的工作流，请核对当前执行")
         return {"ok": True, "identifier": running.id, "runId": running.id,
                 "provider": "plugin", "reused": True, "assigneeName": "进行中的工作流",
                 "task": await svc.task_to_api_live(session, t)}
@@ -104,8 +152,6 @@ async def dispatch(tid, body, client, session, *, actor=None):
             raise HTTPException(status_code=409, detail=str(error)) from error
     # Project work must enter the approved project workflow. This is the final
     # server-side guard for old clients and pages that forgot to send a binding.
-    from ..services import managed_work_route
-    explicit_direct = managed_work_route.direct_requested(body)
     if managed_work_route.is_managed(t) and not explicit_direct:
         if personal_plugin:
             raise HTTPException(
@@ -165,6 +211,13 @@ async def dispatch(tid, body, client, session, *, actor=None):
     if active_dispatch is not None:
         active_dispatch["task"] = await svc.task_to_api_live(session, t)
         return active_dispatch
+    if confirmed_inputs:
+        if confirmed_files is None:
+            raise HTTPException(409, confirmation_error or "需求执行状态已变化，请重新预览后再派发")
+        try:
+            await ai_exec.verify_task_file_selection(session, tid, confirmed_sources)
+        except ai_exec.TaskAttachmentError as error:
+            raise HTTPException(409, str(error)) from error
     if explicit_direct:
         from ..services.execution_context import public as public_execution_context
         routing = dict(t.work_routing or {})
@@ -178,7 +231,7 @@ async def dispatch(tid, body, client, session, *, actor=None):
     picked = None
 
     async def _fail(stage: str, message, status: int = 502,
-                    retryable: bool = True):
+                    retryable: bool = True, *, model_confirmation=None):
         message = await _stale_runner_hint(session, stage, message, picked)
         detail = await dispatch_attempts.failed(
             session, tid, who, attempt_id, stage, message, aid, picked, retryable)
@@ -194,6 +247,8 @@ async def dispatch(tid, body, client, session, *, actor=None):
                 await _push_task(session, fresh, created=False)
             except Exception as push_error:  # noqa: BLE001 - Push failure must not undo persisted failure facts.
                 log.warning("推送派活失败状态失败：%s", type(push_error).__name__)
+        if model_confirmation is not None:
+            raise model_confirmation
         raise HTTPException(status_code=status, detail={
             "message": detail["error"], "code": "AI_DISPATCH_FAILED",
             "phase": detail["phase"], "phaseName": detail["phaseName"],
@@ -217,6 +272,10 @@ async def dispatch(tid, body, client, session, *, actor=None):
         confirmed_ref = await _es.confirm_uncertain_dispatch(
             session, t, detail["expectedRef"],
             str(detail.get("runnerId") or ""))
+        state = "confirming"
+        if confirmed_ref:
+            state = await session.scalar(select(ExecutionSession.state).where(
+                ExecutionSession.task_id == tid, ExecutionSession.ref == confirmed_ref))
         final_ref = confirmed_ref or detail["expectedRef"]
         if me:
             await audit.log(
@@ -233,7 +292,7 @@ async def dispatch(tid, body, client, session, *, actor=None):
         out.update({
             "ok": True, "pending": not bool(confirmed_ref),
             "uncertain": not bool(confirmed_ref),
-            "state": "running" if confirmed_ref else "confirming",
+            "state": state,
             "retryable": False, "attemptId": attempt_id,
             "issueId": final_ref, "expectedRef": detail["expectedRef"],
             "task": task_api or task_to_api(t),
@@ -249,6 +308,8 @@ async def dispatch(tid, body, client, session, *, actor=None):
         ctx = await ai_exec.with_task_git(session, ctx, t, lock_to_client=not bool(handoff))
         if handoff:
             ctx = await conversation_handoffs.dispatch_scope(session, client, ctx, handoff)
+    except conversation_handoffs.ModelConfirmationRequired as error:
+        await _fail("configuration", error.detail, error.status_code, model_confirmation=error)
     except Exception as error:  # noqa: BLE001
         await _fail("configuration", "读取需求归属人的代码账号失败：" + str(error), 502)
     if personal_plugin:
@@ -288,13 +349,27 @@ async def dispatch(tid, body, client, session, *, actor=None):
             session, client, ctx, picked, str(body.get("model") or ""),
             str(body.get("reasoningEffort") or ""))
     except ValueError as error:
+        if (isinstance(error, task_execution_model.ManagedModelUnavailable)
+                and handoff and handoff.options.get("managedModelSelection")):
+            conflict = conversation_handoffs.ModelConfirmationRequired(
+                handoff.options["managedModelSelection"], unavailable=True)
+            await _fail("configuration", conflict.detail, conflict.status_code, model_confirmation=conflict)
         await _fail("configuration", str(error), 409, False)
     except Exception as error:  # noqa: BLE001 - never launch with an unrelated model
         await _fail("configuration", "读取执行模型配置失败：" + type(error).__name__, 502)
+    if handoff:
+        try:
+            conversation_handoffs.check_prepared_model(handoff.options, ctx.get("_managedModelSelection"))
+        except conversation_handoffs.ModelConfirmationRequired as error:
+            await _fail("configuration", error.detail, error.status_code, model_confirmation=error)
     try:
-        files = await ai_exec.collect_task_files(session, tid)   # Include requirement documents and screenshots in the AI context.
-
+        # Handoffs use their own verified archive or cloud input manifest.
+        files, input_manifest = confirmed_files if confirmed_files is not None else ([], [])
+        if not handoff and not confirmed_inputs:
+            files, input_manifest = await ai_exec.collect_task_files(session, tid)
         extra = await ai_exec.collect_task_context(session, tid)
+    except ai_exec.TaskAttachmentError as error:
+        await _fail("context", str(error), 409, False)
     except Exception as error:  # noqa: BLE001
         await _fail("context", "整理需求说明和附件失败：" + str(error), 502)
     extra["brief"] = conversation_brief
@@ -335,14 +410,54 @@ async def dispatch(tid, body, client, session, *, actor=None):
     try:
         if handoff:
             files, extra = await conversation_handoffs.dispatch_inputs(session, handoff, extra)
+        if _remote and not handoff:
+            await task_access.reserve_task_write(session, tid, client.id)
+            if not await dispatch_attempts.pin_runner_route(session, tid, attempt_id, picked):
+                raise HTTPException(409, "派活请求已被更新，请刷新需求状态")
         # Content reads can retain the personal Runner policy lock in this
         # transaction. Release preparation locks before transport authorization
         # acquires its own lock; the durable attempt above still fences retries.
         # The transport rechecks current ownership and policy before sending.
         await session.commit()
-        r = await _aio.to_thread(ai_exec.dispatch_sync, ctx, t, files, picked, extra)
+    except HTTPException:
+        raise
     except Exception as error:  # noqa: BLE001
-        await _fail("dispatch", "Runner 启动 Agent 失败：" + str(error), 502)
+        await session.rollback()
+        await _fail("dispatch", "准备派活失败：" + str(error), 502)
+    try:
+        r = await _aio.to_thread(ai_exec.dispatch_sync, ctx, t, files, picked, extra)
+    except Exception as error:  # An adapter can fail after the Runner accepted the request.
+        if not picked.get("dispatchIntentAt"):
+            if isinstance(error, HTTPException):
+                raise
+            await _fail("dispatch", "Runner 启动 Agent 失败：" + str(error), 502)
+        r = {"ok": False, "uncertain": True, "code": "RUNNER_ACK_UNKNOWN",
+             "error": "执行机回执处理异常：" + type(error).__name__}
+    confirmed_event = None
+    if picked.get("dispatchIntentAt"):
+        # A read-only probe or heartbeat can confirm this attempt while the HTTP
+        # caller waits for the original RPC. Serialize its reply with the sweep.
+        from . import dispatch_reconcile
+        await task_access.reserve_task_write(session, tid, client.id)
+        t = await session.get(Task, tid, with_for_update=True, populate_existing=True)
+        latest = await dispatch_reconcile._latest_state(session, tid)
+        fact = dict(latest.detail or {}) if latest else {}
+        expected = dispatch_identity.execution_ref(attempt_id)
+        if latest and latest.kind in ai_exec.KINDS_DISPATCHED and fact.get("ref") == expected:
+            confirmed_event = latest
+        if confirmed_event and not r.get("ok"):
+            row = await session.scalar(select(ExecutionSession).where(
+                ExecutionSession.task_id == tid, ExecutionSession.ref == expected))
+            if row:
+                meta = row.metadata_ or {}
+                return {**(r if r.get("ok") else {}), "ok": True, "uncertain": False, "pending": False,
+                        "attemptId": attempt_id, "issueId": expected, "state": row.state, "queued": row.state == "queued",
+                        "queuePosition": meta.get("queuePosition", 0), "queueClass": meta.get("queueClass", ""),
+                        "runnerId": row.runner_id, "provider": "runner", "task": await svc.task_to_api_live(session, t)}
+        if fact.get("attemptId") and fact["attemptId"] != attempt_id:
+            raise HTTPException(409, "派活请求已被更新，请刷新需求状态")
+        if fact.get("lastRunnerReplyAt"):
+            picked["lastRunnerReplyAt"] = fact["lastRunnerReplyAt"]
     if not r.get("ok"):
         if r.get("uncertain"):
             return await _pending(r.get("error") or "执行机回执暂未确认", r)
@@ -355,8 +470,7 @@ async def dispatch(tid, body, client, session, *, actor=None):
     # This supports later diagnosis of incorrect or incomplete outputs.
     _prog = [p for p in (getattr(t, "progress", None) or [])
              if isinstance(p, dict) and (p.get("text") or "").strip()]
-    ev.record(session, tid, ai_exec.EV_DISPATCHED,
-               {**dispatch_attempts.success_detail(attempt_id, aid, picked),
+    dispatch_detail = {**dispatch_attempts.success_detail(attempt_id, aid, picked),
                 **({"conversationTurn": instruction_scope} if instruction_scope else {}),
                 "ref": r.get("issueId", ""), "issueId": r.get("issueId", ""),
                 "identifier": r.get("identifier", ""),
@@ -371,9 +485,18 @@ async def dispatch(tid, body, client, session, *, actor=None):
                            "tags": len(getattr(t, "tags", None) or []),
                            "progress": len(_prog), "comments": len(extra.get("comments") or []),
                            "files": [f[0] for f in files][:r.get("files", 0)],
-                           "brief": "" if handoff and handoff.options.get("contentRef") else extra["brief"].strip()[:300]}}, actor=who)
+                           **({"inputManifest": input_manifest} if input_manifest or confirmed_inputs else {}),
+                           "brief": "" if handoff and handoff.options.get("contentRef") else extra["brief"].strip()[:300]}}
+    if confirmed_event is None:
+        ev.record(session, tid, ai_exec.EV_DISPATCHED, dispatch_detail, actor=who)
+    else:
+        confirmed_event.detail = {**confirmed_event.detail, **dispatch_detail}
     from ..services import execution_sessions as _es
-    await _es.record_dispatch(session, t, r)   # Persist the execution at dispatch so routing does not depend on event details alone.
+    row = await _es.record_dispatch(session, t, r)
+    if row is not None and confirmed_event is not None:
+        meta = row.metadata_ or {}
+        r.update(state=row.state, queued=row.state == "queued",
+                 queuePosition=meta.get("queuePosition", 0), queueClass=meta.get("queueClass", ""))
     await audit.log(session, me, "task.ai_dispatch", "task", tid, t.title,
                     {"identifier": r.get("identifier", "")}) if me else None
     await session.commit()

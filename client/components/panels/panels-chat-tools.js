@@ -22,6 +22,9 @@
     }
     return '';
   }
+  function filePath(args) {
+    return pick(args, ['path', 'file_path', 'filePath', 'filename', 'fileName', 'file', 'target', 'target_path', 'targetPath']);
+  }
   function baseName(p) {
     const s = String(p || '').split(/[\\/]/);
     return s[s.length - 1] || p || '';
@@ -217,7 +220,7 @@
     const item = tool || {};
     const args = (item.args && typeof item.args === 'object') ? item.args : {};
     const kind = toolKind(item);
-    const path = pick(args, ['path', 'file_path', 'filePath', 'filename', 'file', 'target']);
+    const path = filePath(args);
     if (kind === 'command') {
       return render(item).title;
     }
@@ -230,6 +233,9 @@
   }
   function unexecuted(item) {
     return item?.state === 'cancelled' && ['access-change', 'output-limit'].includes(item.cancelReason) && item.isError === false;
+  }
+  function recordOwner(ctx) {
+    return JSON.stringify([ctx._ref, ctx._viewEpoch, ctx._draftScopeEpoch, ctx._draftOwnerScope?.()]);
   }
   function cancellationTitle(item) {
     return item.cancelReason === 'output-limit' ? '输出截断，未执行' : '权限已调整，未执行';
@@ -415,7 +421,7 @@
     const name = String(t.name || '').toLowerCase();
     const kind = toolKind(t);
     const args = (t.args && typeof t.args === 'object') ? t.args : {};
-    const path = pick(args, ['path', 'file_path', 'filePath', 'filename', 'file', 'target']);
+    const path = filePath(args);
     // Read contents are already in the tool receipt; only process them on click.
     if (kind === 'read' && path) return {
       title: '读取', sub: baseName(path), tip: path, file: true, side: true, readSnapshot: true, body: '',
@@ -511,11 +517,12 @@
     // the normal send/stop state instead of exposing a third retry action.
     const showStop = Boolean(canStop || stopping);
     const transient = Boolean(sending || stopping);
+    const modelBlocked = !showStop && root.dataset?.modelCatalogBlocked === 'true';
     const title = stopping ? '\u505c\u6b62\u4e2d\u2026' : sending ? '\u53d1\u9001\u4e2d\u2026' :
-      showStop ? '\u505c\u6b62\u751f\u6210' : '\u53d1\u9001';
+      showStop ? '\u505c\u6b62\u751f\u6210' : modelBlocked ? root.dataset.modelCatalogReason : '\u53d1\u9001';
     send.classList.toggle('stop', showStop && !transient);
     send.classList.toggle('stop-pending', transient);
-    send.disabled = transient;
+    send.disabled = transient || modelBlocked;
     send.setAttribute('aria-busy', String(transient));
     send.title = title;
     send.setAttribute('aria-label', title);
@@ -836,8 +843,8 @@
     const tools = snap?.tools || [], ids = new Set(tools.map(row => row.id));
     return tools.concat((snap?.toolPreparations || []).filter(row => !ids.has(row.id)));
   }
-  global.ChatTools = { displayTools, render, icon, kind: toolKind, diffHtml, esc, patchList, patchContent, mcpView, commandSummary, timeline,
-    isCommandTool, groupConsecutiveCommands, openSide, closeSide,
+  global.ChatTools = { displayTools, render, icon, filePath, kind: toolKind, diffHtml, esc, patchList, patchContent, mcpView, commandSummary, timeline,
+    isCommandTool, groupConsecutiveCommands, recordOwner, openSide, closeSide,
     phaseNarrative, batchSummary, batchHtml, composerHasPayload, paintSendButton, toggleGroup,
     appendTimeline, appendGoalProgress, goalProgressRows, goalPhaseHtml, artifactKey,
     artifactRequest, previewKind, fileUrl, normalizeAddress, currentTurnTools, latestTurnWebFile };

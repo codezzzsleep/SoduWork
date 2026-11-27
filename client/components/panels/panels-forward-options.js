@@ -46,6 +46,8 @@ function _fwdReset(tid, force) {
   const key = _fwdId(tid);
   if (!force && _fwdTaskId === key) return;
   _fwdTaskId = key;
+  const preview = document.getElementById('fwdPrev');
+  if (preview) delete preview.confirmedInputs;
   _fwdLoadSeq++;
   _fwdOptions = null;
   _fwdLocalAgents = [];
@@ -442,6 +444,14 @@ function _fwdSyncConfirm(tid) {
   const button = document.getElementById('fwdConfirm');
   if (!decision || !button) return;
   const busy = !!button.dataset.idleLabel;
+  const previewButton = document.getElementById('fwdPreviewInputs');
+  if (previewButton) {
+    previewButton.hidden = _fwdTab !== 'ai' || _fwdSelection.ai?.type !== 'direct';
+    previewButton.disabled = busy;
+    previewButton.onclick = () => _fwdPreview(tid);
+    const preview = document.getElementById('fwdPrev');
+    if (previewButton.hidden && preview) preview.style.display = 'none';
+  }
   window.ForwardSelect?.destroy(decision);
   if (_fwdLoading[_fwdTab]) {
     decision.innerHTML = '';
@@ -517,7 +527,7 @@ function _fwdSetBusy(on, label) {
   const button = document.getElementById('fwdConfirm');
   if (!button) return;
   const controls = document.getElementById('fwdPop')?.querySelectorAll(
-    '#fwdPluginSelect,#fwdAgentSelect,#fwdRepoSel,#fwdModel,#fwdSubmissionMode,#fwdNote,[data-fwp-model],[data-fwp-kind],.fwd-tab,[data-fwp-toggle],[data-fwd-recheck],[data-material-add],.rq-session-controls') || [];
+    '#fwdPluginSelect,#fwdAgentSelect,#fwdRepoSel,#fwdModel,#fwdSubmissionMode,#fwdNote,#fwdPreviewInputs,[data-fwp-model],[data-fwp-kind],.fwd-tab,[data-fwp-toggle],[data-fwd-recheck],[data-material-add],.rq-session-controls') || [];
   controls.forEach(control => {
     if (on) {
       if (control.dataset.fwdWasDisabled == null) control.dataset.fwdWasDisabled = control.disabled ? '1' : '0';
@@ -893,19 +903,41 @@ async function _fwdCarry(tid) {
 
 async function _fwdPreview(tid) {
   const box = document.getElementById('fwdPrev');
-  if (!box) return;
-  if (box.style.display !== 'none') { box.style.display = 'none'; box.innerHTML = ''; return; }
+  if (!box || _fwdTaskId !== _fwdId(tid)) return;
+  const previous = box.confirmedInputs;
+  const snapshot = { taskId: _fwdTaskId, previous: Array.isArray(previous?.manifest) ? previous : previous?.previous };
+  box.confirmedInputs = snapshot;
+  const current = () => document.getElementById('fwdPrev') === box && box.confirmedInputs === snapshot;
   box.style.display = 'block';
   box.innerHTML = '<div class="fwd-loading"><i></i><span>正在整理派活原文…</span></div>';
   try {
     const brief = (document.getElementById('fwdNote') || {}).value || '';
     const result = await SoduWorkAPI.aiPreview(tid, brief.trim(), _pickedRepo());
-    if (document.getElementById('fwdPrev') !== box) return;
+    if (!current()) return;
+    const carried = result?.carried;
+    if (Array.isArray(carried?.files) && carried.confirmedDispatch !== true) {
+      // A legacy Hub may dispatch without confirmation. Never offer to use a
+      // saved manifest when the current Hub cannot enforce it.
+      const message = snapshot.previous
+        ? '当前 Hub 版本不支持附件清单校验，请升级 Hub 后重新预览，或关闭弹窗重新选择直接派发。'
+        : '当前 Hub 版本不支持附件清单校验。你可以直接派发，或升级 Hub 后重新预览。';
+      if (snapshot.previous) snapshot.error = message;
+      else delete box.confirmedInputs;
+      box.innerHTML = '<div class="fwd-msg is-err">' + esc(message) + '</div>';
+      return;
+    }
+    if (carried?.confirmedDispatch !== true || !Array.isArray(carried.inputManifest))
+      throw new Error('Attachment preview unavailable');
+    delete snapshot.previous;
+    snapshot.manifest = carried.inputManifest;
+    const omitted = Array.isArray(carried.omittedFiles) ? carried.omittedFiles : [];
     box.innerHTML = '<div class="fwd-prev-h">将发送给 Agent 的完整内容</div>' +
       "<div class=\"fwd-prev-t\"" + ((result || {}).title ? ' data-user-content' : '') + '>' + esc((result || {}).title || '') + '</div>' +
-      "<pre class=\"fwd-prev-b\"" + ((result || {}).description ? ' data-user-content' : '') + '>' + esc((result || {}).description || '') + '</pre>';
+      "<pre class=\"fwd-prev-b\"" + ((result || {}).description ? ' data-user-content' : '') + '>' + esc((result || {}).description || '') + '</pre>' +
+      (omitted.length ? '<p><span>未纳入派发的附件</span> <span data-user-content>' +
+        esc(omitted.slice(0, 5).join('、') + (omitted.length > 5 ? '…' : '')) + '</span></p>' : '');
   } catch (error) {
-    box.innerHTML = '<div class="fwd-msg is-err">派活原文暂时无法预览</div>';
+    if (current()) box.innerHTML = '<div class="fwd-msg is-err">派活原文暂时无法预览</div>';
   }
 }
 

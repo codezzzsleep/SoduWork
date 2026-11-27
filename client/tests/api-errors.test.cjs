@@ -116,6 +116,19 @@ test('业务错误保留后端可读原因和 HTTP 状态', async () => {
   assert.equal(api.online, true);
 });
 
+test('confirmed dispatch never retries on an endpoint that cannot verify attachments', async () => {
+  const calls = [];
+  const api = load(async (url, options) => {
+    calls.push({url, body: JSON.parse(options.body)});
+    return response(404, '{"detail":"Not Found"}');
+  });
+  await assert.rejects(() => api.dispatchToAI('task', {id: 'runner:r:pi', type: 'agent'},
+    '', null, '', null, '', []), error => error.status === 404);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /\/tasks\/task\/ai-dispatch-confirmed$/);
+  assert.deepEqual(calls[0].body.inputManifest, []);
+});
+
 test('结构化派活错误保留重试和诊断字段', async () => {
   const detail = {
     message: '当前没有可接这条任务的在线 Runner', code: 'AI_DISPATCH_FAILED',
@@ -209,5 +222,23 @@ test('localized task errors retain the Hub status, code and original diagnostic'
       await assert.rejects(send(api), error => error.message === expected &&
         error.status === 400 && error.code === key && error.detail === 'raw diagnostic');
     }
+  }
+});
+
+test('approval decisions show the selected language and retain the original diagnostic', async () => {
+  const code = 'hub.input.release_environment';
+  for (const [locale, message] of [
+    ['zh-CN', '当前任务在所选环境中没有可用的部署目标，请检查发布链配置'],
+    ['en-US', 'This task has no available deployment target in the selected environment. Check the release pipeline configuration.'],
+    ['ja-JP', '選択した環境には、このタスクで使用できるデプロイ先がありません。リリースパイプラインの設定を確認してください。'],
+    ['ko-KR', '선택한 환경에서 이 작업에 사용할 수 있는 배포 대상이 없습니다. 릴리스 파이프라인 설정을 확인하세요.'],
+  ]) {
+    const api = load(async () => ({
+      ...response(409, JSON.stringify({ detail: 'original Hub diagnostic' })),
+      headers: new Headers({ 'X-Error-Code': code }),
+    }), {}, false, locale);
+    await assert.rejects(api.decideApproval('fixture', 'approve'), {
+      status: 409, code, message, detail: 'original Hub diagnostic',
+    });
   }
 });

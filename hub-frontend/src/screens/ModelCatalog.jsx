@@ -2,9 +2,10 @@ import { translateText as tx, localeMap, useLocale, serverMessage } from '../i18
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState, useId } from 'react'
 import { api } from '../api.js'
 import { useViewportHeight } from '../viewport-height.js'
-import { Loading, ErrorState, Icon, Modal, Confirm, toast, SelectMenu } from '../ui.jsx'
+import { Loading, ErrorState, Icon, Modal, Confirm, toast, SelectMenu, takeNav, navTo } from '../ui.jsx'
 import LlmSettings from './LlmSettings.jsx'
 import ModelRuntime from './ModelRuntime.jsx'
+import ModelProviderDeletion from './ModelProviderDeletion.jsx'
 import './model-catalog-actions.css'
 import { CAPABILITY_LABELS, CAPABILITY_STATES, CapabilityBadges, ModelCapabilityStatus } from './ModelCapabilities.jsx'
 import './model-capabilities.css'
@@ -47,7 +48,7 @@ function checkRevision(provider, model) {
   return JSON.stringify([provider.revision, model.revision, model.configRevision])
 }
 
-export default function ModelCatalog() {
+export default function ModelCatalog({ me }) {
   const viewportRef = useViewportHeight()
   const listRef = useRef(null)
   const bindList = useCallback(element => {
@@ -56,13 +57,21 @@ export default function ModelCatalog() {
   }, [viewportRef])
   const uiLocale = useLocale();
   const [d, setD] = useState(null)
+  const [guide] = useState(() => {
+    const nav = takeNav('models')
+    return me?.id && nav?.accountId === me.id ? nav : null
+  })
+  const openedGuide = useRef(false)
   const [editP, setEditP] = useState(null)     // provider | 'new'
   const [addM, setAddM] = useState(null)       // {providerId, model?}
   const [del, setDel] = useState(null)         // {kind:'p'|'m', id, name}
   const [discover, setDiscover] = useState(null)  // provider whose upstream list to import
   const [defaultOpen, setDefaultOpen] = useState(false)
+  const [defaultDirty, setDefaultDirty] = useState(false)
+  const [defaultSaving, setDefaultSaving] = useState(false)
   // Details do not resize or reorder the service grid.
   const [viewProviderId, setViewProviderId] = useState(null)
+  const [togglingModels, setTogglingModels] = useState([])
   const [capabilityTargets, setCapabilityTargets] = useState({})
   const registerCapabilityTarget = useCallback((id, element) => {
     setCapabilityTargets(current => {
@@ -79,6 +88,19 @@ export default function ModelCatalog() {
   const activeLoad = useRef(null)
   const firstChecks = useRef(new Map())
   const checkQueue = useRef(Promise.resolve())
+  useEffect(() => {
+    if (!guide || openedGuide.current || me?.id !== guide.accountId) return
+    if (guide.firstChat === 'provider') {
+      openedGuide.current = true
+      setEditP('new')
+    } else if (d && ['model', 'discover'].includes(guide.firstChat)) {
+      openedGuide.current = true
+      const p = d.providers.find(p => p.id === guide.providerId && p.enabled && p.baseUrl && p.keySet)
+      if (!p) toast(tx('所选服务已停用或配置不完整，请重新选择。'))
+      else if (guide.firstChat === 'model') setAddM({ providerId: p.id, provider: p })
+      else setDiscover(p)
+    }
+  }, [d, guide, me?.id])
   const load = () => {
     setError(null)
     const request = api.modelCatalog()
@@ -166,12 +188,15 @@ export default function ModelCatalog() {
     catch (e) { toast(e.message || tx("保存失败")); load() }
   }
   async function toggleM(m) {
+    setTogglingModels(ids => [...ids, m.id])
     try { await api.saveModelDef({ providerId: m.providerId, name: m.name, enabled: !m.enabled, expectedRevision: m.revision }); load() }
     catch (e) { toast(e.message || tx("保存失败")); load() }
+    finally { setTogglingModels(ids => ids.filter(id => id !== m.id)) }
   }
 
   const dialogs = <>
-      {defaultOpen && <Modal title={tx("组织默认调用（旧版兼容）")} icon="key" wide onClose={() => setDefaultOpen(false)}><LlmSettings embedded /></Modal>}
+      {defaultOpen && <Modal title={tx("组织默认调用（旧版兼容）")} icon="key" wide dirty={defaultDirty} busy={defaultSaving}
+        onClose={() => { setDefaultOpen(false); setDefaultDirty(false) }}><LlmSettings embedded onDirtyChange={setDefaultDirty} onSavingChange={setDefaultSaving} /></Modal>}
       {editP && <ProviderForm initial={editP === 'new' ? null : editP}
         onClose={() => setEditP(null)} onSaved={(providerId) => {
           if (editP === 'new') { setNewProviderId(providerId); pendingProviderFocus.current = providerId }
@@ -179,17 +204,16 @@ export default function ModelCatalog() {
         }} />}
       {addM && <ModelForm providerId={addM.providerId} initial={addM.model || null}
         onClose={closeAddModel} onSaved={receipts => { closeAddModel(); modelsSaved(addM.provider, receipts) }} />}
-      {discover && <DiscoverForm provider={discover}
+      {discover && <DiscoverForm key={discover.id} provider={discover}
         onClose={closeDiscovery} onSaved={receipts => { closeDiscovery(); modelsSaved(discover, receipts) }} />}
-      {del && <Confirm title={del.kind === 'p' ? tx("删除模型服务") : tx("删除模型")} danger confirmText={tx("删除")}
-        text={del.kind === 'p'
-          ? tx("确定删除「{0}」？它底下的模型会一起删掉，正在用这些模型的人会挑不到。", [del.name])
-          : tx("确定删除「{0}」？正在用它的人会挑不到。", [del.name])}
+      {del?.kind === 'p' && <ModelProviderDeletion key={del.id} providerId={del.id}
+        onClose={() => setDel(null)} onDeleted={() => { setDel(null); toast(tx("已删除")); load() }} />}
+      {del?.kind === 'm' && <Confirm title={tx("删除模型")} danger confirmText={tx("删除")}
+        text={tx("确定删除「{0}」？正在用它的人会挑不到。", [del.name])}
         onClose={() => setDel(null)}
         onConfirm={async () => {
           try {
-            if (del.kind === 'p') await api.deleteModelProvider(del.id, del.revision)
-            else await api.deleteModelDef(del.id, del.revision)
+            await api.deleteModelDef(del.id, del.revision)
             toast(tx("已删除"))
           } catch (e) { toast(tx("删不掉：") + (e.message || e)) }
           setDel(null); load()
@@ -198,6 +222,7 @@ export default function ModelCatalog() {
 
   return (
     <div className="model-catalog">
+      {guide && <button type="button" className="btn first-chat-reopen" onClick={() => navTo('overview')}>{tx('返回首次对话清单')}</button>}
       <ModelRuntime providers={providers} models={models}
         catalogCounts={d ? { providers: providers.length, models: models.length } : null} catalogSummary={
         <section className="model-catalog-summary model-runtime-dimension" aria-label={tx("目录配置")} aria-busy={!d && !error}>
@@ -285,7 +310,7 @@ export default function ModelCatalog() {
           disabled={!p.enabled || !m.enabled || !p.baseUrl || !p.keySet}
           onChecked={result => applyCheck(p, m, result)} />))}
       {viewProvider ? <Modal title={tx("{0}的模型列表", [viewProvider.name || viewProvider.id])}
-        icon="box" wide scope="model-provider-dialog" onClose={() => setViewProviderId(null)}
+        icon="box" wide scope="model-provider-dialog" busy={togglingModels.length > 0} onClose={() => setViewProviderId(null)}
         foot={<>
           <button type="button" className="btn btn-primary" onClick={() => setAddM({ providerId: viewProvider.id, provider: viewProvider })}><Icon name="plus" />{tx("加模型")}</button>
           <button type="button" className="btn btn-ghost" onClick={() => setDiscover({ ...viewProvider })}><Icon name="search" />{tx("发现模型")}</button>
@@ -306,7 +331,7 @@ export default function ModelCatalog() {
                 </div>
                 <div className="model-chip-actions" role="group" aria-label={tx("{0} 操作", [m.label || m.name])}>
                   <button type="button" className="admin-card-action" aria-label={tx("配置模型 {0}", [m.label || m.name])} onClick={() => setAddM({ providerId: viewProvider.id, model: m })}>{tx("配置")}</button>
-                  <button type="button" className="admin-card-action" aria-label={tx("{0}模型 {1}", [m.enabled ? tx("停用") : tx("启用"), m.label || m.name])} title={m.enabled ? tx("停用后将不再供成员选择") : tx("启用模型")} onClick={() => toggleM(m)}>{m.enabled ? tx("停用") : tx("启用")}</button>
+                  <button type="button" className="admin-card-action" aria-label={tx("{0}模型 {1}", [m.enabled ? tx("停用") : tx("启用"), m.label || m.name])} title={m.enabled ? tx("停用后将不再供成员选择") : tx("启用模型")} disabled={togglingModels.includes(m.id)} onClick={() => toggleM(m)}>{m.enabled ? tx("停用") : tx("启用")}</button>
                   {!m.builtin && <span className="model-chip-danger"><button type="button" className="admin-card-action is-danger" aria-label={tx("删除模型 {0}", [m.label || m.name])} onClick={() => setDel({ kind: 'm', id: m.id, name: m.label || m.name, revision: m.revision })}>{tx("删除")}</button></span>}
                 </div>
                 {(m.modality || 'chat') === 'chat' && <CapabilityStatusSlot modelId={m.id} register={registerCapabilityTarget} />}
@@ -431,8 +456,8 @@ function ProviderForm({ initial, onClose, onSaved }) {
   }
 
   return (
-    <Modal title={editing ? tx("配置「{0}」", [initial.name]) : tx("接一个模型服务")} icon="plug" onClose={onClose}
-      foot={<><button className="btn btn-ghost" onClick={onClose}>{tx("取消")}</button>
+    <Modal draft={{ id, name, kind, baseUrl, note, apiKey }} title={editing ? tx("配置「{0}」", [initial.name]) : tx("接一个模型服务")} icon="plug" busy={busy} onClose={onClose}
+      foot={dismiss => <><button className="btn btn-ghost" disabled={busy} onClick={dismiss}>{tx("取消")}</button>
         <button className="btn" disabled={busy || connection?.pending} onClick={testConnection}>
           {connection?.pending ? tx("测试中…") : tx("测试连接")}</button>
         <button className="btn btn-primary" disabled={busy} onClick={save}>{busy ? tx("保存中…") : tx("保存")}</button></>}>
@@ -465,7 +490,8 @@ function ProviderForm({ initial, onClose, onSaved }) {
         <input className="f-in" value={note} onChange={(e) => setNote(e.target.value)} placeholder={tx("一句话")} /></div>
       {connection && !connection.pending && <div role="status" className="hintline" style={{ marginTop: 12, overflowWrap: 'anywhere' }}>
         {connection.ok ? <>
-          {tx("连接成功，本次读取到 {0} 个模型。", [connection.models.length])}
+          {tx("连接成功，本次读取到 {0} 个模型。", [connection.counts?.total ?? connection.models.length])}
+          {tx("其中 {0} 个声明支持对话，{1} 个用途未确认。", [connection.counts?.chat ?? 0, connection.counts?.unknown ?? connection.models.length])}
           {connection.models.length > 0 && tx("示例：{0}。", [connection.models.slice(0, 3).join(', ')])}
           {tx("发消息前还需添加模型并确认额度。")}
         </> : serverMessage({ key: connection.code, params: connection.params, fallback: connection.detail })}
@@ -498,7 +524,9 @@ function ModelForm({ providerId, initial, onClose, onSaved }) {
   const [thinkingFormat, setThinkingFormat] = useState(initial?.config?.thinkingFormat || '')
   const [imageRouting, setImageRouting] = useState(initial?.config?.imageRouting || 'auto')
   const [capabilities, setCapabilities] = useState(initial?.config?.capabilities || {})
-  const [ctxWindow, setCtxWindow] = useState(initial?.contextWindowKnown === false ? '' : initial?.ctxWindow || '')
+  const configuredWindow = initial?.configuredContextWindow ??
+    (initial?.contextWindowEstimated || initial?.contextWindowKnown === false ? 0 : initial?.ctxWindow)
+  const [ctxWindow, setCtxWindow] = useState(configuredWindow || '')
   const [maxOutputTokens, setMaxOutputTokens] = useState(initial?.config?.maxOutputTokens || '')
   const [supportsReasoningEffort, setSupportsReasoningEffort] = useState(
     initial?.config?.supportsReasoningEffort !== false
@@ -566,7 +594,18 @@ function ModelForm({ providerId, initial, onClose, onSaved }) {
     }
     setBusy(true)
     try {
+      let discovered = {}
+      if (modality === 'chat' && !Number(ctxWindow) && (!initial?.advertisedContextWindow || configuredWindow)) {
+        // Discovery is optional and runs outside the catalog write transaction.
+        const result = await api.discoverModels(providerId, name.trim()).catch(() => null)
+        const candidate = result?.candidates?.find(row => row.id === name.trim())
+        if (result?.ok && candidate && result.providerRevision) {
+          discovered = { advertisedContextWindow: candidate.advertisedContextWindow || 0,
+            discoveryProviderRevision: result.providerRevision }
+        }
+      }
       const saved = await api.saveModelDef({
+        ...discovered,
         expectedRevision: initial?.revision || 'new',
         providerId,
         name: name.trim(),
@@ -597,9 +636,10 @@ function ModelForm({ providerId, initial, onClose, onSaved }) {
   }
 
   return (
-    <Modal title={editing ? tx("配置模型") : tx("加一个模型")} icon={editing ? 'pencil' : 'plus'}
-      wide onClose={onClose}
-      foot={<><button className="btn btn-ghost" onClick={onClose}>{tx("取消")}</button>
+    <Modal draft={{ name, label, modality, endpointPath, statusPath, resultPath, defaultsText, thinkingMode,
+        thinkingFormat, imageRouting, capabilities, ctxWindow, maxOutputTokens, supportsReasoningEffort }} title={editing ? tx("配置模型") : tx("加一个模型")} icon={editing ? 'pencil' : 'plus'}
+      wide busy={busy} onClose={onClose}
+      foot={dismiss => <><button className="btn btn-ghost" disabled={busy} onClick={dismiss}>{tx("取消")}</button>
         <button className="btn btn-primary" disabled={busy} onClick={save}>{busy ? tx("保存中…") : tx("保存")}</button></>}>
       <div className="model-config-form"><div><label className="f-lbl">{tx("模型标识（发给网关的那个名字）")}</label>
         <input className="f-in" value={name} disabled={editing}
@@ -685,7 +725,8 @@ function ModelForm({ providerId, initial, onClose, onSaved }) {
 function DiscoverForm({ provider, onClose, onSaved }) {
   const uiLocale = useLocale();
   const [phase, setPhase] = useState('loading')   // loading | ready | empty | error
-  const [rows, setRows] = useState([])            // [{name, checked}]
+  const [rows, setRows] = useState([])
+  const [purpose, setPurpose] = useState('chat')
   const [detail, setDetail] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -695,7 +736,12 @@ function DiscoverForm({ provider, onClose, onSaved }) {
       .then((r) => {
         if (!alive) return
         if (!r.ok) { setDetail(r.code ? serverMessage({ key: r.code, params: r.params, fallback: r.detail }) : (r.detail || tx("读取失败"))); setPhase('error'); return }
-        const list = (r.models || []).map((name) => ({ name, checked: false }))
+        const metadata = new Map((r.candidates || []).map(item => [item.id, item]))
+        const list = (r.models || []).map(name => {
+          const candidate = metadata.get(name)
+          return { name, status: candidate?.status || 'unknown', purposes: candidate?.purposes || [], checked: false,
+            advertisedContextWindow: candidate?.advertisedContextWindow, providerRevision: r.providerRevision }
+        })
         if (list.length === 0) { setPhase('empty'); return }
         setRows(list); setPhase('ready')
       })
@@ -704,10 +750,20 @@ function DiscoverForm({ provider, onClose, onSaved }) {
   }, [provider.id])
 
   const [query, setQuery] = useState('')
-  const matches = row => row.name.toLowerCase().includes(query.trim().toLowerCase())
+  const supportsPurpose = row => row.status === 'declared' && row.purposes.includes(purpose)
+  const matches = row => (supportsPurpose(row) || row.status === 'unknown') && row.name.toLowerCase().includes(query.trim().toLowerCase())
   const filtered = rows.filter(matches)
   const checkedCount = rows.filter((r) => r.checked).length
-  function toggleAll(next) { setRows((current) => current.map(r => matches(r) ? { ...r, checked: next } : r)) }
+  function changePurpose(next) {
+    setPurpose(next)
+    setRows(current => current.map(row => row.checked ? { ...row, checked: false } : row))
+  }
+  function toggleAll(next) {
+    setRows(current => current.map(row => matches(row) && (!next || supportsPurpose(row)) ? { ...row, checked: next } : row))
+  }
+  function checkRow(name, checked) {
+    setRows(current => current.map(row => row.name === name ? { ...row, checked } : row))
+  }
 
   async function importSelected() {
     const picked = rows.filter((r) => r.checked)
@@ -718,7 +774,9 @@ function DiscoverForm({ provider, onClose, onSaved }) {
     for (const row of picked) {
       try {
         const saved = await api.saveModelDef({ providerId: provider.id, name: row.name,
-          label: row.name, expectedRevision: 'new', enabled: true })
+          label: row.name, modality: purpose, expectedRevision: 'new', enabled: true,
+          ...(purpose === 'chat' && row.advertisedContextWindow && row.providerRevision
+            ? { advertisedContextWindow: row.advertisedContextWindow, discoveryProviderRevision: row.providerRevision } : {}) })
         added.push(saved)
       } catch (e) { failed += 1 }
     }
@@ -730,8 +788,8 @@ function DiscoverForm({ provider, onClose, onSaved }) {
   }
 
   return (
-    <Modal title={tx("从服务发现模型")} icon="search" onClose={onClose}
-      foot={<><button className="btn btn-ghost" onClick={onClose}>{tx("关闭")}</button>
+    <Modal dirty={rows.some(row => row.checked)} title={tx("从服务发现模型")} icon="search" busy={busy} onClose={onClose}
+      foot={dismiss => <><button className="btn btn-ghost" disabled={busy} onClick={dismiss}>{tx("关闭")}</button>
         {phase === 'ready' && <button className="btn btn-primary" disabled={busy || checkedCount === 0}
           onClick={importSelected}>{busy ? tx("添加中…") : tx("添加选中的 {0} 个", [checkedCount])}</button>}</>}>
       <div className="model-config-form">
@@ -742,21 +800,33 @@ function DiscoverForm({ provider, onClose, onSaved }) {
         {phase === 'error' && <div className="model-discover-note">{detail}</div>}
         {phase === 'empty' && <div className="model-discover-note">{tx("这个服务的模型都已经在目录里了。")}</div>}
         {phase === 'ready' && <>
+          <label className="f-lbl" htmlFor="discovery-purpose">{tx("模型用途")}</label>
+          <SelectMenu id="discovery-purpose" className="f-in" aria-label={tx("模型用途")} disabled={busy}
+            value={purpose} onChange={event => changePurpose(event.target.value)}>
+            {MODEL_TYPES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          </SelectMenu>
           <input type="search" className="f-in" aria-label={tx("按模型名称筛选")} placeholder={tx("按模型名称筛选")}
             value={query} onChange={event => setQuery(event.target.value)} />
           <div className="model-discover-toolbar">
-            <button type="button" className="admin-card-action" onClick={() => toggleAll(true)}>{tx("选择筛选结果")}</button>
-            <button type="button" className="admin-card-action" onClick={() => toggleAll(false)}>{tx("取消选择筛选结果")}</button>
+            <button type="button" className="admin-card-action" disabled={busy || !filtered.some(supportsPurpose)} onClick={() => toggleAll(true)}>{tx("选择筛选结果")}</button>
+            <button type="button" className="admin-card-action" disabled={busy || !filtered.some(row => row.checked)} onClick={() => toggleAll(false)}>{tx("取消选择筛选结果")}</button>
             <span className="muted">{tx("共 {0} 个", [filtered.length])}</span>
           </div>
           <p aria-live="polite">{tx("将在此服务下添加并启用 {0} 个模型。", [checkedCount])}</p>
           <div className="model-discover-list" role="region" tabIndex={0} aria-label={tx("发现的模型列表")}>
+            {!filtered.length && <p className="muted">{tx("没有符合当前用途和名称的模型。")}</p>}
             {filtered.map((row) => (
-              <label className="model-discover-row" key={row.name}>
-                <input type="checkbox" checked={row.checked}
-                  onChange={(e) => setRows((current) => current.map((r) => r.name === row.name ? { ...r, checked: e.target.checked } : r))} />
-                <code title={row.name}>{row.name}</code>
-              </label>
+              <div className="model-discover-row" key={row.name}>
+                <label>
+                  <input type="checkbox" checked={row.checked} disabled={busy || (row.status === 'unknown' && !row.checked)}
+                    onChange={event => checkRow(row.name, event.target.checked)} />
+                  <code title={row.name}>{row.name}</code>
+                  {row.status === 'unknown' && <span className="muted">{tx("用途未确认")}</span>}
+                </label>
+                {row.status === 'unknown' && !row.checked && <button type="button" className="admin-card-action" disabled={busy}
+                  aria-label={tx("确认 {0} 可用于{1}", [row.name, MODEL_TYPE_LABEL[purpose]])}
+                  onClick={() => checkRow(row.name, true)}>{tx("确认为{0}", [MODEL_TYPE_LABEL[purpose]])}</button>}
+              </div>
             ))}
           </div>
         </>}

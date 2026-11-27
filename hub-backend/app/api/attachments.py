@@ -4,9 +4,18 @@ or local storage.
 import asyncio
 import logging
 import os
-import uuid
 
-from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,7 +25,14 @@ from ..db import get_session
 from ..deps import current_ai_client, current_client
 from ..models import Attachment, Client, Task
 from ..schemas import attachment_to_api
-from ..services import attachment_ownership, resource_access, storage, task_access, task_requirements
+from ..services import (
+    attachment_ownership,
+    resource_access,
+    storage,
+    task_access,
+    task_attachment_uploads,
+    task_requirements,
+)
 
 router = APIRouter(prefix="/api/v1", tags=["attachments"])
 
@@ -28,11 +44,6 @@ def _task_attachment_api(attachment: Attachment, task: Task, client: Client) -> 
     out["canDelete"] = bool(
         task_access.is_owner(task, client) or attachment_ownership.owns_attachment(attachment, client))
     return out
-
-
-def _safe_name(name: str) -> str:
-    name = (name or "file").replace("/", "_").replace("\\", "_").strip()
-    return name[:200] or "file"
 
 
 def _upload_size(file: UploadFile) -> int:
@@ -53,29 +64,9 @@ def _upload_size(file: UploadFile) -> int:
 async def _save_attachment(session: AsyncSession, client: Client, target_id: str,
                            file: UploadFile, *, source_ref: str = "",
                            evidence_meta: dict | None = None) -> Attachment:
-    max_bytes = get_settings().attach_max_mb * 1024 * 1024
-    size = _upload_size(file)
-    if size > max_bytes:
-        raise HTTPException(status_code=413, detail=f"文件超过 {get_settings().attach_max_mb}MB 上限")
-    if size <= 0:
-        raise HTTPException(status_code=400, detail="空文件")
-    fn = _safe_name(file.filename)
-    ct = file.content_type or "application/octet-stream"
-    attachment = Attachment(
-        id=str(uuid.uuid4()), task_id=target_id, filename=fn, content_type=ct,
-        size=size, uploaded_by=client.id, role="input", source_ref=source_ref,
-        evidence_meta=attachment_ownership.metadata(client, evidence_meta))
-    key = f"att/{target_id}/{attachment.id}/{fn}"
-    attachment.storage_key = key
-    # Stream storage writes on a worker thread so large uploads do not block the event loop.
-    # Avoid copying the entire upload into memory.
-    file.file.seek(0)
-    attachment.backend = await asyncio.to_thread(
-        storage.put_stream, key, file.file, size, ct)
-    session.add(attachment)
-    await session.commit()
-    await session.refresh(attachment)
-    return attachment
+    return await task_attachment_uploads.save(
+        session, target_id, file, settings=get_settings(), account_id=str(client.user_ref or ""),
+        uploader=client.id, metadata=attachment_ownership.metadata(client, evidence_meta), source_ref=source_ref)
 
 
 @router.get("/tasks/{tid}/attachments")
@@ -273,15 +264,17 @@ async def delete_attachment(
             raise HTTPException(404, "Attachment not found")
     if a.role == "handoff":
         raise HTTPException(409, "会话交接工作包是恢复凭据，不能单独删除")
-    # Commit metadata deletion before deleting the stored object.
-    # This prevents live metadata from referencing a missing object if the transaction fails.
-    # A leftover storage object can be reclaimed later without breaking user-visible attachment records.
     storage_key, backend = a.storage_key, a.backend
     await session.delete(a)
     await session.commit()
+    await remove_unreferenced_object(session, aid, storage_key, backend)
+    return {"ok": True}
+
+
+async def remove_unreferenced_object(session: AsyncSession, aid: str, storage_key: str, backend: str) -> None:
+    """Clean up the object after the caller commits the metadata deletion."""
     try:
-        await asyncio.to_thread(storage.delete, storage_key, backend)
+        await storage.delete_unreferenced(session, storage_key, backend)
     except Exception as exc:  # noqa: BLE001  Storage cleanup failure does not undo the committed deletion.
         log.warning("attachment object cleanup failed (%s): %s",
                     aid, type(exc).__name__)
-    return {"ok": True}

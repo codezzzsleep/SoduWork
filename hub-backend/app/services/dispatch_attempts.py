@@ -57,6 +57,10 @@ def _agent_detail(requested_id: str, picked: dict | None = None) -> dict:
         "assigneeCli": _CLI_NAMES.get(cli_key, cli)[:80],
         "runnerId": str(selected.get("runnerId") or "")[:80],
         "runnerBootId": str(selected.get("runnerBootId") or "")[:64],
+        **({"runnerClientId": str(selected.get("clientId") or ""),
+            "runnerOrgId": str(selected.get("orgId") or ""),
+            "runnerOwnerUserId": str(selected.get("runnerOwnerUserId") or "")}
+           if selected.get("dispatchIntentAt") else {}),
         "host": str(selected.get("host") or "")[:180],
         "selection": dict(selected.get("selection") or {}),
     }
@@ -64,7 +68,7 @@ def _agent_detail(requested_id: str, picked: dict | None = None) -> dict:
 
 async def start(session: AsyncSession, task_id: str, actor: str,
                 requested_id: str = "", requested_type: str = "",
-                model: str = "", *, stable_id: str = "") -> str:
+                model: str = "", *, stable_id: str = "", runner_route: dict | None = None) -> str:
     """Persist the intent before touching a Runner and return its correlation id."""
     attempt_id = dispatch_identity.clean_dispatch_id(stable_id) or uuid.uuid4().hex
     detail = {
@@ -78,9 +82,32 @@ async def start(session: AsyncSession, task_id: str, actor: str,
         "model": str(model or "")[:180],
         "retryable": True,
     }
+    if runner_route is not None:
+        detail.update(_runner_intent(requested_id, runner_route, detail["expectedRef"]))
     task_events.record(session, task_id, ai_exec.EV_DISPATCH_STARTED, detail, actor=actor)
     await session.commit()
     return attempt_id
+
+def _runner_intent(requested_id: str, picked: dict, expected_ref: str) -> dict:
+    stamp = datetime.now(timezone.utc).isoformat()
+    picked["dispatchIntentAt"] = stamp
+    return {**_agent_detail(requested_id, picked), "phase": "dispatch", "phaseName": PHASE_NAMES["dispatch"],
+            "dispatchIntentAt": stamp, "awaitingDispatchReply": True, "admissionKey": "dispatch:" + expected_ref}
+
+
+async def pin_runner_route(session: AsyncSession, task_id: str, attempt_id: str, picked: dict) -> bool:
+    """Fence the stable ref and selected process before the transport can send."""
+    await session.get(models.Task, task_id, with_for_update=True, populate_existing=True)
+    latest = await session.scalar(select(models.TaskEvent).where(
+        models.TaskEvent.task_id == task_id, models.TaskEvent.kind.in_(ai_exec.KINDS_DISPATCH_STATE)
+    ).order_by(models.TaskEvent.at.desc(), models.TaskEvent.id.desc()).limit(1))
+    if (latest is None or latest.kind != ai_exec.EV_DISPATCH_STARTED
+            or (latest.detail or {}).get("attemptId") != attempt_id):
+        return False
+    latest.detail = {**latest.detail, **_runner_intent(latest.detail.get("requestedId") or "",
+                                                       picked, latest.detail["expectedRef"])}
+    return True
+
 
 async def existing(session: AsyncSession, task_id: str,
                    task_status: str = "") -> dict | None:
@@ -139,7 +166,7 @@ def _existing_receipt(event, task_status: str, execution_state, now: datetime) -
     if isinstance(at, datetime) and at.tzinfo is None:
         at = at.replace(tzinfo=timezone.utc)
     age = now - at if isinstance(at, datetime) else None
-    if (event.kind == ai_exec.EV_DISPATCH_STARTED and age is not None
+    if (event.kind == ai_exec.EV_DISPATCH_STARTED and not detail.get("dispatchIntentAt") and age is not None
             and age > timedelta(minutes=10)):
         return None
     if (event.kind in ai_exec.KINDS_DISPATCHED and task_status == "todo"
@@ -161,7 +188,7 @@ def _existing_receipt(event, task_status: str, execution_state, now: datetime) -
         "ok": True,
         "already": True,
         "pending": pending,
-        "state": "confirming" if pending else "running",
+        "state": "confirming" if pending else execution_sessions.canonical_state(execution_state, "running"),
         "confirmationPending": event.kind == ai_exec.EV_DISPATCH_UNCERTAIN,
         "attentionRaised": bool(detail.get("attentionRaised")),
         "nextAction": str(detail.get("nextAction") or ""),
@@ -202,8 +229,11 @@ def uncertain(session: AsyncSession, task_id: str, actor: str, attempt_id: str,
         "uncertain": True,
         **_agent_detail(requested_id, picked),
     }
-    task_events.record(
-        session, task_id, ai_exec.EV_DISPATCH_UNCERTAIN, detail, actor=actor)
+    if (picked or {}).get("dispatchIntentAt"):
+        detail.update(dispatchIntentAt=picked["dispatchIntentAt"], admissionKey="dispatch:" + detail["expectedRef"])
+        if picked.get("lastRunnerReplyAt"):
+            detail["lastRunnerReplyAt"] = picked["lastRunnerReplyAt"]
+    task_events.record(session, task_id, ai_exec.EV_DISPATCH_UNCERTAIN, detail, actor=actor)
     return detail
 
 
@@ -212,6 +242,14 @@ async def failed(session: AsyncSession, task_id: str, actor: str, attempt_id: st
                  picked: dict | None = None, retryable: bool = True) -> dict:
     """Rollback partial DB mutations, then durably record the failed attempt."""
     await session.rollback()
+    detail = record_failure(session, task_id, actor, attempt_id, phase, error, requested_id, picked, retryable)
+    await session.commit()
+    return detail
+
+
+def record_failure(session, task_id, actor, attempt_id, phase, error, requested_id="", picked=None,
+                   retryable=True) -> dict:
+    """Record a definite rejection with the caller's state changes."""
     key = phase if phase in PHASE_NAMES else "unknown"
     message = public_error(error)
     detail = {
@@ -224,7 +262,6 @@ async def failed(session: AsyncSession, task_id: str, actor: str, attempt_id: st
         **_agent_detail(requested_id, picked),
     }
     task_events.record(session, task_id, ai_exec.EV_DISPATCH_FAILED, detail, actor=actor)
-    await session.commit()
     return detail
 
 

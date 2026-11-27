@@ -327,12 +327,15 @@ def _m_api(m) -> dict:
     modality = normalize_modality(getattr(m, "modality", "chat"))
     resolved = context_window.resolve({
         "contextWindow": getattr(m, "ctx_window", 0),
+        "advertisedContextWindow": getattr(m, "advertised_ctx_window", None),
         "modelName": getattr(m, "name", ""),
         "providerId": getattr(m, "provider_id", ""),
     })
     return {"revision": model_config_guard.revision(m), "id": m.id,
             "providerId": m.provider_id, "name": m.name,
             "label": m.label or m.name, "builtin": bool(m.builtin),
+            "configuredContextWindow": getattr(m, "ctx_window", 0) or 0,
+            "advertisedContextWindow": getattr(m, "advertised_ctx_window", None),
             "enabled": bool(m.enabled), "ctxWindow": resolved["contextWindow"],
             "contextWindowKnown": resolved["contextWindowKnown"],
             "contextWindowEstimated": resolved["contextWindowEstimated"],
@@ -637,6 +640,7 @@ async def resolve(session: AsyncSession, client, model_name: str = "",
     config = model_config(m.get("config"), wanted)
     resolved_window = context_window.resolve({
         "contextWindow": m.get("ctxWindow"), "modelName": m.get("name"),
+        "contextWindowSource": m.get("contextWindowSource"),
         "providerId": m.get("providerId"),
     })
     from . import model_quota
@@ -659,27 +663,35 @@ async def resolve(session: AsyncSession, client, model_name: str = "",
             "runtimeRevision": m.get("runtimeRevision", "")}
 
 
+def agent_choice(client, cli_key: str, override: str = "") -> tuple[str, str]:
+    """Read legacy names and provider-qualified preferences without changing stored data."""
+    table = getattr(client, "agent_models", None) or {}
+    saved = table.get(str(cli_key or "").strip().lower(), "")
+    name = canonical_model_name(saved.get("name") if isinstance(saved, dict) else saved)
+    provider = str(saved.get("providerId") or "") if isinstance(saved, dict) else ""
+    requested = canonical_model_name(override)
+    return requested or name, provider if not requested or requested == name else ""
+
+
 def agent_model(client, cli_key: str) -> str:
-    """Return the client's model preference for an agent runtime, independent of machine or seat
-    identity, or empty when unspecified.
-    """
-    table = dict(getattr(client, "agent_models", None) or {}) if client is not None else {}
-    return canonical_model_name(table.get(str(cli_key or "").strip().lower(), ""))
+    """Return the public wire model name for a runtime preference."""
+    return agent_choice(client, cli_key)[0]
+
+
+def agent_choice_row(rows, name, provider):
+    return next((row for row in rows if row["name"] == name
+                 and (not provider or row.get("providerId") == provider)), None)
 
 
 async def resolve_for_agent(session: AsyncSession, client, cli_key: str,
                             override: str = "") -> dict:
-    """Behavior and constraints for this operation."""
-    want = canonical_model_name(str(override or "").strip() or agent_model(client, cli_key))
-    if not want:
-        return await resolve(session, client, "")
-    # Check that a stored runtime preference remains usable.
-    # Do not rely on implicit model substitution during resolution.
-    # Keep preference validation and any fallback explicit to the caller.
-    if any(m["name"] == want for m in await usable(session, client)):
-        return await resolve(session, client, want)
-    # If the stored preference becomes unavailable, explain any fallback to the default.
-    got = await resolve(session, client, "")
-    if got:
-        got["fellBackFrom"] = want
-    return got
+    want, provider = agent_choice(client, cli_key, override)
+    available = await usable(session, client)
+    selected = await resolve(session, client, want, provider_id=provider, available=available)
+    if selected or not want or provider:
+        return selected
+    # Keep the reported fallback for legacy name-only probe/configuration requests.
+    fallback = await resolve(session, client, "", available=available)
+    if fallback:
+        fallback["fellBackFrom"] = want
+    return fallback

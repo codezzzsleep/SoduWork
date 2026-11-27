@@ -103,8 +103,13 @@ function createWorker({ identityOf, request, journal, conversation, catalog, loc
     // Older Hubs can still grant a takeover; do not keep renewing that grant.
     if (record?.phase === 'adopted' && !jobs.has(key)) return;
     if (jobs.has(key) && record?.workerId && record.workerId !== instanceId) return;
+    const pendingCompletion = jobs.get(key);
+    if (typeof pendingCompletion === 'function') { await pendingCompletion(); return; }
     const claimed = await request(identity, '/automation-conversations/' + encodeURIComponent(row.id) + '/claim', { instanceId });
     record = journal.read(key);
+    if (jobs.has(key) && record?.workerId && record.workerId !== instanceId) return;
+    const completionAfterClaim = jobs.get(key);
+    if (typeof completionAfterClaim === 'function') { await completionAfterClaim(); return; }
     const sameConversation = !!record?.conversationId && record.conversationId === claimed.conversationId;
     if (claimed.terminal) {
       if (claimed.errorCode === 'AUTOMATION_RECEIPT_TIMEOUT' && sameConversation &&
@@ -253,6 +258,9 @@ function createWorker({ identityOf, request, journal, conversation, catalog, loc
       // never detach the accepted turn from its durable completion receipt.
       const runningReceipt = acknowledge(identity, row.id, record);
       const settle = async (state, error = '') => {
+        // A failed disk write must retry this outcome, never renew a completed
+        // execution as running or submit its prompt again.
+        jobs.set(key, () => settle(state, error));
         const settled = save(key, { ...record, state, error });
         jobs.delete(key);
         try {
@@ -321,10 +329,10 @@ function createWorker({ identityOf, request, journal, conversation, catalog, loc
   return { tick, stop() { stopped = true; } };
 }
 
-function install({ app, ipcMain, identityOf, conversation, platformConnections }) {
+function install({ app, ipcMain, identityOf, conversation, platformConnections, safeStorage }) {
   require('./automation-preflight.cjs').install({ app, ipcMain, identityOf, platformConnections });
   const localAutomationModels = require('./local-automation-model-store.cjs');
-  localAutomationModels.configure({ app, safeStorage: require('electron').safeStorage });
+  localAutomationModels.configure({ app, safeStorage: safeStorage || require('electron').safeStorage });
   let worker, poller, unsubscribe, stopped = false;
   ipcMain.handle('automation-conversations-wake', async (event, input) => {
     if (stopped || !require('./platform-connections/index.cjs').trustedSender(event)) return { ok: false };

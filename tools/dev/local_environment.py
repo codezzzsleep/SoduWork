@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 from functools import lru_cache
+import math
 import os
 from pathlib import Path
 import shutil
@@ -25,13 +26,18 @@ ROOT = Path(__file__).resolve().parents[2]
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "outputs", "work"}
 SKIP_SUFFIXES = {".pyc", ".pyo", ".log", ".db", ".db-shm", ".db-wal"}
 BACKEND_FILES = (
-    "requirements.txt", "requirements-runner.txt", "alembic.ini", "runner_main.py", "db_admin.py",
+    "requirements.txt", "requirements-runner.txt", "requirements-image.txt", "alembic.ini", "runner_main.py", "db_admin.py",
     "full_backup.py", "pack_plugin.py", "client-update-trust.json",
 )
 ELECTRON_DOWNLOAD_TIMEOUT = 600
 NPM_PROBE_TIMEOUT = 15
 NPM_VERSION = re.compile(rb"v?\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
                          rb"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?")
+PORTABLE_GIT_NETWORK_FAILURE = re.compile(
+    rb'\[SoduWork shell runtime\] PortableGit download failed: Runtime download '
+    rb'(?:exceeded total time limit|failed: (?:HTTP \d{3}|ECONNREFUSED|ECONNRESET|ETIMEDOUT|'
+    rb'EAI_AGAIN|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|UND_ERR_(?:CONNECT_TIMEOUT|HEADERS_TIMEOUT|BODY_TIMEOUT|SOCKET)))\b'
+)
 
 
 class StartupError(RuntimeError):
@@ -42,9 +48,35 @@ class DiskFullError(StartupError):
     """A storage failure that must not be replaced with download advice."""
 
 
+def electron_download_timeout() -> float:
+    """Electron download deadline in seconds; honor ELECTRON_DOWNLOAD_TIMEOUT.
+
+    docs/getting-started.md documents this variable as a way for slow
+    connections to raise the 600-second deadline, so read it at use time
+    instead of relying on the module constant. Invalid values fail loudly
+    rather than being silently ignored.
+    """
+    raw = os.environ.get('ELECTRON_DOWNLOAD_TIMEOUT', '').strip()
+    if not raw:
+        return float(ELECTRON_DOWNLOAD_TIMEOUT)
+    try:
+        value = float(raw)
+    except ValueError:
+        raise StartupError(
+            'ELECTRON_DOWNLOAD_TIMEOUT must be a positive number of seconds; '
+            'got a non-numeric value'
+        ) from None
+    if not math.isfinite(value) or value <= 0:
+        raise StartupError(
+            'ELECTRON_DOWNLOAD_TIMEOUT must be a positive, finite number of seconds'
+        )
+    return value
+
+
 def command_failure(message: str, log: Path, offset: int) -> StartupError:
     """Classify only this attempt, without echoing potentially private output."""
     prefix = f"{message}. See {log}. "
+    portable_git_download_failed = False
     try:
         with log.open('rb') as output:
             output.seek(offset)
@@ -56,9 +88,17 @@ def command_failure(message: str, log: Path, offset: int) -> StartupError:
                     return DiskFullError(prefix + '磁盘空间不足 / Disk full. '
                                          'Free space on the data, cache or temporary-directory volume '
                                          'and retry; completed steps are reused.')
+                if PORTABLE_GIT_NETWORK_FAILURE.search(text):
+                    portable_git_download_failed = True
                 tail = text[-128:]
     except OSError:
         pass  # Preserve the command failure even if its log cannot be read.
+    if portable_git_download_failed:
+        return StartupError(prefix + 'PortableGit 下载失败。检查代理 HTTP_PROXY / HTTPS_PROXY，'
+                            '或设置镜像 SODUWORK_PORTABLE_GIT_MIRROR。已有离线包时，用 '
+                            'SODUWORK_PORTABLE_GIT_ARCHIVE 指定文件，再运行原启动命令。\n'
+                            'Check your proxy, set a PortableGit mirror, or specify a verified local archive, '
+                            'then rerun the same launcher. See docs/getting-started.en.md.')
     return StartupError(prefix + 'Check the failing step in the log for the cause and retry; '
                         'completed steps are reused.')
 
@@ -402,7 +442,7 @@ def prepare(state: Path, log: Path) -> tuple[Path, Path]:
             raise venv_interpreter_error(python, venv, log)
     requirements = [ROOT / "hub-backend" / name for name in ("requirements.txt", "requirements-runner.txt")]
     py_stamp = state / "python-dependencies.sha256"
-    wanted = digest_files(requirements, ROOT)
+    wanted = digest_files([*requirements, ROOT / "hub-backend" / "requirements-image.txt"], ROOT)
     install = read_stamp(py_stamp) != wanted
     if not install:
         try:
@@ -492,13 +532,13 @@ def prepare_desktop(state: Path, log: Path) -> Path:
         # npm versions differ in install-script policy. Download the locked Electron
         # runtime explicitly without enabling unrelated dependencies' lifecycle scripts.
         if not electron_binary(client).is_file():
-            print("桌面运行环境下载最多等待 10 分钟 / Electron download allows up to 10 minutes. "
+            print(f"桌面运行环境下载最多等待 {electron_download_timeout():.0f} 秒 / Electron download allows up to {electron_download_timeout():.0f} seconds. "
                   "If GitHub is unreachable, configure ELECTRON_MIRROR or your proxy and retry.", flush=True)
             try:
                 run([node, str(client / 'scripts/install-electron.cjs')], cwd=client, log=log,
                     label='[Desktop] 下载桌面运行环境 / Downloading the Electron runtime',
                     env=electron_install_environment(cache_env),
-                    timeout=ELECTRON_DOWNLOAD_TIMEOUT)
+                    timeout=electron_download_timeout())
             except DiskFullError:
                 raise
             except StartupError as exc:

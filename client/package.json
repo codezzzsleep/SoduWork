@@ -46,19 +46,20 @@
   "dependencies": {
     "@earendil-works/pi-coding-agent": "1.4.0",
     "openai": "7.19.0",
-    "ssh2": "1.17.0"
+    "ssh2": "1.17.0",
+    "undici": "7.30.1"
   },
   "devDependencies": {
     "electron": "^44.9.1",
     "electron-builder": "^26.15.3",
-    "typescript": "6.0.3",
-    "undici": "7.30.1"
+    "typescript": "6.0.3"
   },
   "build": {
     "appId": "com.soduwork.app",
     "afterPack": "scripts/prepare-installer.cjs",
     "afterSign": "scripts/prepare-installer.cjs",
     "productName": "SoduWork",
+    "protocols": [{ "name": "SoduWork first chat", "schemes": ["soduwork"] }],
     "directories": {
       "output": "dist"
     },
@@ -97,6 +98,7 @@
     ],
     "extraResources": [
       { "from": "node_modules/openai", "to": "node_modules/openai" },
+      { "from": "node_modules/undici", "to": "node_modules/undici" },
       { "from": "runtime-manifest.json", "to": "runtime-manifest.json" },
       { "from": "../hub-backend/app/services/generated_image.py", "to": "generated_image.py" },
       { "from": ".runtime/node", "to": "node" },

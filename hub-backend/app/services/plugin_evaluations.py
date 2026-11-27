@@ -12,11 +12,18 @@ from sqlalchemy import BigInteger, cast, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import automation_models as am, models
+from .. import automation_models as am
+from .. import models
 from ..db import SessionLocal
-from . import (agent_route_selection, ai_exec, ai_remote, environment_service,
-               plugin_runtime, workflow_inputs)
-
+from . import (
+    agent_route_selection,
+    ai_exec,
+    ai_remote,
+    artifact_bytes,
+    environment_service,
+    plugin_runtime,
+    workflow_inputs,
+)
 
 ACTIVE_STATES = {"queued", "running"}
 FINAL_STATES = {"completed", "failed", "cancelled"}
@@ -377,11 +384,15 @@ async def refresh(session: AsyncSession, row: am.PluginEvaluationRun) -> am.Plug
     elif not status.get("ok"):
         unavailable = str(status.get("error") or "无法取得执行状态")
     elif status.get("done"):
-        result = await _collect_result(session, row, status, provider, ctx, route)
-        if result is None:
-            unavailable = "暂时无法取回执行产物"
+        try:
+            result = await _collect_result(session, row, status, provider, ctx, route)
+        except artifact_bytes.ArtifactTooLarge as exc:
+            changes.update(state="failed", error=str(exc))
         else:
-            changes.update(state="completed", error="", result=result)
+            if result is None:
+                unavailable = "暂时无法取回执行产物"
+            else:
+                changes.update(state="completed", error="", result=result)
     if unavailable:
         since = stamp
         if previous.get("ok") is False:
@@ -469,6 +480,17 @@ async def list_runs(session: AsyncSession, version: am.PluginVersion,
     return {"items": [run_api(row) for row in rows], "gate": gate}
 
 
+async def _record_verdict(session, row, decision, actor, note):
+    model = am.PluginEvaluationRun
+    written = await session.scalar(update(model).where(
+        model.id == row.id, model.state == "completed", model.verdict == "pending",
+    ).values(verdict=decision, reviewed_by=str(actor or "")[:64],
+             review_note=str(note or "")[:1200], reviewed_at=_now())
+      .returning(model.id).execution_options(synchronize_session=False))
+    await session.refresh(row)
+    return written is not None
+
+
 async def review(session: AsyncSession, row: am.PluginEvaluationRun, decision: str,
                  actor: str, note: str = "") -> am.PluginEvaluationRun:
     if row.state in ACTIVE_STATES:
@@ -481,10 +503,8 @@ async def review(session: AsyncSession, row: am.PluginEvaluationRun, decision: s
     contract = dict(dict(row.result or {}).get("contract") or {})
     if decision == "passed" and not contract.get("ok"):
         raise ValueError("产出没有满足结果契约，不能标记为通过")
-    row.verdict = decision
-    row.reviewed_by = str(actor or "")[:64]
-    row.review_note = str(note or "")[:1200]
-    row.reviewed_at = _now()
+    if not await _record_verdict(session, row, decision, actor, note):
+        raise ValueError("评测结论已确定，请重新运行评测后再评审")
     await session.commit()
     return row
 
@@ -510,11 +530,8 @@ async def accept_ready_with_release_review(
         row = latest.get(str(case.get("key") or ""))
         if not _ready_for_release_review(row):
             continue
-        row.verdict = "passed"
-        row.reviewed_by = str(actor or "")[:64]
-        row.review_note = "随插件版本发布审核一并确认"
-        row.reviewed_at = _now()
-        changed += 1
+        if await _record_verdict(session, row, "passed", actor, "随插件版本发布审核一并确认"):
+            changed += 1
     if changed:
         await session.commit()
     return changed
